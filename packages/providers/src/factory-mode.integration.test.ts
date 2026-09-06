@@ -1,8 +1,8 @@
-import { removeTempTree } from '@archon/paths/test-utils';
+import { removeTempTree, openAnonymousFixtureFd } from '@archon/paths/test-utils';
 import { expect, test } from 'bun:test';
 import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
-import { mkdtempSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs';
+import { closeSync, fstatSync, mkdtempSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import type { AddressInfo } from 'node:net';
@@ -86,12 +86,19 @@ for await (const chunk of getAgentProvider('codex').sendQuery('private fixture p
 console.log(JSON.stringify({constructed,fdClosed,capabilityInEnv:JSON.stringify(process.env).includes('FIXTURE_ONLY_NARROW_CAPABILITY'),capabilityInArgv:JSON.stringify(process.argv).includes('FIXTURE_ONLY_NARROW_CAPABILITY')}));
 `
     );
-    const child = spawn(process.execPath, [runner, '--factory-provider-broker-fd', '3'], {
-      cwd: worktree,
-      env: { PATH: process.env.PATH!, HOME: root },
-      stdio: ['ignore', 'pipe', 'pipe', 'pipe'],
-    });
-    (child.stdio[3] as NodeJS.WritableStream).end(JSON.stringify(config));
+    const descriptor = openAnonymousFixtureFd(root, JSON.stringify(config));
+    expect(fstatSync(descriptor).nlink).toBe(0);
+    expect(fstatSync(descriptor).mode & 0o777).toBe(0o600);
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(process.execPath, [runner, '--factory-provider-broker-fd', '3'], {
+        cwd: worktree,
+        env: { PATH: process.env.PATH!, HOME: root },
+        stdio: ['ignore', 'pipe', 'pipe', descriptor],
+      });
+    } finally {
+      closeSync(descriptor);
+    }
     let stdout = '';
     let stderr = '';
     child.stdout!.on('data', chunk => {

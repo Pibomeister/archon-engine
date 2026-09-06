@@ -34,6 +34,14 @@ export function validateFactoryProviderScope(
   if (canonicalRoot(cwd) !== workspaceRoot) throw new Error('factory_provider_workspace_mismatch');
   const writableRoots = [...new Set(scope.writableRoots.map(canonicalRoot))];
   const deniedRoots = [...new Set(scope.deniedRoots.map(canonicalRoot))];
+  // Codex0.150.1's macOS sandbox keeps /tmp writable even when a named
+  // profile explicitly denies a subtree. Never promise protection there.
+  if (process.platform === 'darwin') {
+    const nativeTemp = realpathSync('/tmp');
+    if (deniedRoots.some(path => contains(nativeTemp, path) || contains(path, nativeTemp))) {
+      throw new Error('factory_provider_protected_tmp_root_unqualified');
+    }
+  }
   if (!writableRoots.includes(workspaceRoot) || deniedRoots.length === 0) {
     throw new Error('factory_provider_scope_overlap');
   }
@@ -58,7 +66,7 @@ export function factoryCodexConfig(
   const filesystem: Record<string, string> = { ':minimal': 'read' };
   for (const path of checked.readableRoots ?? []) filesystem[path] = 'read';
   for (const path of checked.writableRoots) filesystem[path] = 'write';
-  for (const path of checked.deniedRoots) filesystem[path] = 'none';
+  for (const path of checked.deniedRoots) filesystem[path] = 'deny';
   return {
     default_permissions: 'archon-factory',
     permissions: { 'archon-factory': { filesystem, network: { enabled: true } } },
@@ -97,6 +105,7 @@ export function factoryClaudeScope(scope: FactoryProviderScope, cwd: string): Pa
         allowWrite: checked.writableRoots,
         denyWrite: checked.deniedRoots,
         denyRead: checked.deniedRoots,
+        allowRead: checked.readableRoots,
       },
     },
     settings: {

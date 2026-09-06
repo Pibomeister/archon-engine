@@ -1,10 +1,10 @@
 import { expect, test } from 'bun:test';
 import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
-import { existsSync, realpathSync } from 'node:fs';
+import { closeSync, existsSync, realpathSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { trackTempRoots } from '@archon/paths/test-utils';
+import { trackTempRoots, openAnonymousFixtureFd } from '@archon/paths/test-utils';
 import { factoryRequestDigest } from '../../../providers/src/factory-digest';
 import golden from '../../../providers/test/fixtures/factory-provider-broker.v1.json';
 
@@ -84,36 +84,37 @@ nodes:
     config?: Config,
     json = true
   ): Promise<{ code: number; stdout: string; stderr: string }> {
-    const child = spawn(
-      process.execPath,
-      [
-        cli,
-        'workflow',
-        ...args,
-        '--cwd',
-        project,
-        '--folder',
-        ...(json ? ['--json'] : []),
-        ...(config ? ['--factory-provider-broker-fd', '3'] : []),
-      ],
-      {
-        cwd: project,
-        env: {
-          PATH: process.env.PATH ?? '/usr/bin:/bin',
-          HOME: home,
-          ARCHON_HOME: home,
-          DATABASE_URL: '',
-          TELEMETRY_DISABLED: '1',
-          ANTHROPIC_BASE_URL: 'http://127.0.0.1:9',
-          OPENAI_BASE_URL: 'http://127.0.0.1:9',
-        },
-        stdio: ['ignore', 'pipe', 'pipe', config ? 'pipe' : 'ignore'],
-      }
-    );
-    if (config) {
-      const fd = child.stdio[3];
-      if (!fd || !('end' in fd)) throw new Error('missing broker descriptor');
-      fd.end(JSON.stringify(config));
+    const descriptor = config ? openAnonymousFixtureFd(root, JSON.stringify(config)) : undefined;
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(
+        process.execPath,
+        [
+          cli,
+          'workflow',
+          ...args,
+          '--cwd',
+          project,
+          '--folder',
+          ...(json ? ['--json'] : []),
+          ...(config ? ['--factory-provider-broker-fd', '3'] : []),
+        ],
+        {
+          cwd: project,
+          env: {
+            PATH: process.env.PATH ?? '/usr/bin:/bin',
+            HOME: home,
+            ARCHON_HOME: home,
+            DATABASE_URL: '',
+            TELEMETRY_DISABLED: '1',
+            ANTHROPIC_BASE_URL: 'http://127.0.0.1:9',
+            OPENAI_BASE_URL: 'http://127.0.0.1:9',
+          },
+          stdio: ['ignore', 'pipe', 'pipe', descriptor ?? 'ignore'],
+        }
+      );
+    } finally {
+      if (descriptor !== undefined) closeSync(descriptor);
     }
     if (!child.stdout || !child.stderr) throw new Error('missing engine output pipes');
     let stdout = '';
@@ -137,6 +138,21 @@ nodes:
     expect(response.code, response.stderr).toBe(0);
     const parsed = JSON.parse(response.stdout) as Run & { run?: Run };
     return parsed.run ?? parsed;
+  }
+  if (process.platform === 'darwin') {
+    const protectedTemp = realpathSync(await mkdtemp(join('/tmp', 'factory-protected-binding-')));
+    temp(protectedTemp);
+    const rejectedScope = structuredClone(base);
+    rejectedScope.providerPolicy.deniedRoots = [protectedTemp];
+    const rejected = await invoke(
+      ['run', 'binding-child', 'Unsupported protected temp root', '--launch-key', 'tmp-rejected'],
+      rejectedScope
+    );
+    expect(rejected.code).not.toBe(0);
+    expect(rejected.stdout + rejected.stderr).toContain(
+      'factory_provider_protected_tmp_root_unqualified'
+    );
+    expect(existsSync(join(project, 'after-successor.txt'))).toBe(false);
   }
   const launched = await invoke(
     ['run', 'binding-parent', 'Parent', '--launch-key', 'binding-parent-one'],

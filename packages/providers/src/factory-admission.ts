@@ -122,6 +122,11 @@ export function createAdmittedProvider(
       if (admittedOptions && getFactoryScope()) admittedOptions.factoryScope = getFactoryScope();
       if (admittedOptions?.factoryScope)
         validateFactoryProviderScope(admittedOptions.factoryScope, cwd);
+      if (admittedOptions?.factoryScope && process.platform === 'darwin') {
+        // Keep native tool caches inside the documented native temporary
+        // allowance, never a project-supplied protected checkout path.
+        admittedOptions.env = { ...admittedOptions.env, TMPDIR: '/tmp' };
+      }
       let transportClosed = false;
       if (admittedOptions)
         admittedOptions.factoryTransportClosed = (): void => {

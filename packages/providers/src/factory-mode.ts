@@ -4,7 +4,7 @@ import { request as httpRequest } from 'node:http';
 import { isAbsolute } from 'node:path';
 import { z } from 'zod';
 import type { AdmissionBroker, AdmissionLease, AdmissionRequest } from './factory-admission';
-import type { FactoryProviderScope } from './factory-sandbox';
+import { validateFactoryProviderScope, type FactoryProviderScope } from './factory-sandbox';
 import { factoryRequestDigest } from './factory-digest';
 
 const text = z.string().min(1).max(4096);
@@ -272,6 +272,8 @@ export function factoryMarkerForConfig(value: BrokerConfig): Record<string, unkn
   };
 }
 export function assertFactoryWorkingPath(cwd: string): void {
+  const scope = getFactoryScope();
+  if (scope) validateFactoryProviderScope(scope, cwd);
   if (
     config &&
     (realpathSync(cwd) !== config.managedRun.worktreePath ||

@@ -106,7 +106,7 @@ describe('CodexProvider', () => {
       expect(MockCodex.mock.calls[0]?.[0]?.config).toMatchObject({
         default_permissions: 'archon-factory',
         permissions: {
-          'archon-factory': { filesystem: { [worktree]: 'write', [manual]: 'none' } },
+          'archon-factory': { filesystem: { [worktree]: 'write', [manual]: 'deny' } },
         },
       });
       expect(mockStartThread.mock.calls[0]?.[0]).toMatchObject({

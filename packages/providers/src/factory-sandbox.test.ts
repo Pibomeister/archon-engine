@@ -6,6 +6,36 @@ import { join } from 'node:path';
 import { factoryClaudeScope, factoryCodexScope, factoryCodexConfig } from './factory-sandbox';
 
 describe('trusted factory provider writable scope', () => {
+  test.skipIf(process.platform !== 'darwin')(
+    'rejects native always-writable temporary protected roots before execution',
+    async () => {
+      const root = realpathSync(mkdtempSync(join('/tmp', 'factory-protected-tmp-')));
+      try {
+        const worktree = join(root, 'worktree');
+        const manual = join(root, 'manual');
+        mkdirSync(worktree);
+        mkdirSync(manual);
+        expect(() =>
+          factoryCodexConfig(
+            { workspaceRoot: worktree, writableRoots: [worktree], deniedRoots: [manual] },
+            worktree
+          )
+        ).toThrow('factory_provider_protected_tmp_root_unqualified');
+        expect(() =>
+          factoryCodexConfig(
+            {
+              workspaceRoot: worktree,
+              writableRoots: [worktree],
+              deniedRoots: [manual.replace('/private/tmp/', '/tmp/')],
+            },
+            worktree
+          )
+        ).toThrow();
+      } finally {
+        await removeTempTree(root);
+      }
+    }
+  );
   test('uses native workspace-write and only explicit extra directories for Codex', async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), 'factory-scope-')));
     try {
@@ -27,7 +57,7 @@ describe('trusted factory provider writable scope', () => {
         default_permissions: 'archon-factory',
         permissions: {
           'archon-factory': {
-            filesystem: { [worktree]: 'write', [artifacts]: 'write', [manual]: 'none' },
+            filesystem: { [worktree]: 'write', [artifacts]: 'write', [manual]: 'deny' },
           },
         },
       });
