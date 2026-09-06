@@ -300,10 +300,10 @@ function policyTemplate(
 
 /** A fresh child attempt may vary its worktree instantiation, never its qualified policy. */
 export function assertFactorySuccessorMode(
-  metadata: Record<string, unknown>,
+  metadata: Record<string, unknown> | undefined,
   parentRunId: string
 ): void {
-  const prior = metadata.factory_provider_admission;
+  const prior = metadata?.factory_provider_admission;
   if (!isFactoryManaged() || offline) {
     assertFactoryRunMode(metadata);
     return;
@@ -341,10 +341,10 @@ export function factorySuccessorParent(): string | undefined {
   return config?.successor?.parentRunId;
 }
 export function assertFactoryRunMode(
-  metadata: Record<string, unknown>,
+  metadata: Record<string, unknown> | undefined,
   allowUnmarked = false
 ): void {
-  const prior = metadata.factory_provider_admission;
+  const prior = metadata?.factory_provider_admission;
   if (prior === undefined) {
     if (isFactoryManaged() && !allowUnmarked)
       throw new Error('factory_provider_unmarked_resume_not_qualified');

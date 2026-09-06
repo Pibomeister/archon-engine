@@ -2465,10 +2465,6 @@ async function runWorkflowWithOwnedSource(
     } else {
       throw new Error('--adopt/--supersedes requires a run id.');
     }
-    const factorySourceRun = await workflowDb.getWorkflowRun(adoptedFromRunId);
-    if (factorySourceRun)
-      assertFactorySuccessorMode(factorySourceRun.metadata, factorySourceRun.id);
-
     if (continuationMode === 'adopt') {
       const { adoptedRun, lane } = await resolveWorkflowAdoption({
         adoptedRunId: adoptedFromRunId,
@@ -2477,6 +2473,7 @@ async function runWorkflowWithOwnedSource(
         codebaseKind: codebase.kind,
         containerRequested: options.container === true,
       });
+      assertFactorySuccessorMode(adoptedRun.metadata, adoptedRun.id);
       if (lane.kind === 'reuse-worktree') {
         workingCwd = lane.workingPath;
         isolationEnvId = lane.envId;
@@ -2502,6 +2499,7 @@ async function runWorkflowWithOwnedSource(
       }
     } else {
       const superseded = await resolveSupersededRun(adoptedFromRunId);
+      assertFactorySuccessorMode(superseded.metadata, superseded.id);
       console.log(`Superseding run ${superseded.id} — fresh lane, provenance recorded.`);
     }
   }
