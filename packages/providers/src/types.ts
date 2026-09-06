@@ -622,6 +622,8 @@ export interface NodeConfig {
  * The workflow path additionally passes nodeConfig and assistantConfig.
  */
 export interface SendQueryOptions extends AgentRequestOptions {
+  /** Engine-owned identity for factory-managed provider admission, never YAML. */
+  factoryInvocation?: import('./factory-admission').FactoryInvocationContext;
   /** Raw YAML node config — provider translates internally to SDK-specific options. */
   nodeConfig?: NodeConfig;
   /** Per-provider defaults from .archon/config.yaml assistants section. */
