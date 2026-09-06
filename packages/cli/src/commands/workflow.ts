@@ -61,6 +61,13 @@ import {
 } from '@archon/paths';
 import { isAbsolute, join, resolve } from 'node:path';
 import { applyWorkflowRunConfigLayer } from '@archon/workflows/run-config';
+import {
+  assertFactoryForeground,
+  assertFactoryRunMode,
+  assertFactorySuccessorMode,
+  factorySuccessorParent,
+  factoryLaunchContext,
+} from '@archon/providers/factory-mode';
 import { mkdirSync, openSync, closeSync, readFileSync, rmSync, writeSync } from 'node:fs';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createWorkflowDeps } from '@archon/core/workflows/store-adapter';
@@ -567,6 +574,7 @@ async function spawnDetachedWorkflowRun(
   extraArgs: string[],
   runConfigPayload?: string
 ): Promise<string | null> {
+  assertFactoryForeground();
   const cmd = buildDetachedRunCmd(
     BUNDLED_IS_BINARY,
     process.execPath,
@@ -1514,7 +1522,16 @@ async function runWorkflowWithOwnedSource(
 
   let continuation: ResolvedContinuation | undefined;
   if (continuationRun !== undefined) {
+    assertFactoryRunMode(continuationRun.metadata);
     continuation = await resolveContinuationWorkflow(createWorkflowDeps(), continuationRun, cwd);
+  }
+  const managedSuccessorParent = factorySuccessorParent();
+  if (managedSuccessorParent && !options.resume) {
+    if ((options.adoptRunId ?? options.supersedesRunId) !== managedSuccessorParent)
+      throw new Error('factory_provider_successor_selection_required');
+    const parent = await workflowDb.getWorkflowRun(managedSuccessorParent);
+    if (!parent) throw new Error('factory_provider_successor_parent_missing');
+    assertFactorySuccessorMode(parent.metadata, parent.id);
   }
 
   // A continuation never captures. With a record it reads that record (above); without
@@ -2044,7 +2061,11 @@ async function runWorkflowWithOwnedSource(
     options.launchPayloadDigest !== undefined ||
     options.launchIntentOnly
   ) {
-    if (isContinuation || options.detach || options.adoptRunId || options.supersedesRunId) {
+    if (
+      isContinuation ||
+      options.detach ||
+      ((options.adoptRunId || options.supersedesRunId) && !managedSuccessorParent)
+    ) {
       throw new Error(
         'Keyed launches require a fresh foreground run; use exact run resume for continuation.'
       );
@@ -2061,6 +2082,13 @@ async function runWorkflowWithOwnedSource(
       inputs: resolvedInputs ?? {},
       modelOverrides: modelOverrides ?? null,
       runConfig: runConfig?.layer ?? null,
+      factoryProviderAdmission: factoryLaunchContext() ?? null,
+      ...(managedSuccessorParent
+        ? {
+            successorParent: managedSuccessorParent,
+            successorMode: options.adoptRunId ? 'adopt' : 'supersede',
+          }
+        : {}),
       config: await loadConfig(cwd),
       branch: options.branchName ?? null,
       from: options.fromBranch ?? null,
@@ -2437,6 +2465,9 @@ async function runWorkflowWithOwnedSource(
     } else {
       throw new Error('--adopt/--supersedes requires a run id.');
     }
+    const factorySourceRun = await workflowDb.getWorkflowRun(adoptedFromRunId);
+    if (factorySourceRun)
+      assertFactorySuccessorMode(factorySourceRun.metadata, factorySourceRun.id);
 
     if (continuationMode === 'adopt') {
       const { adoptedRun, lane } = await resolveWorkflowAdoption({
@@ -2507,6 +2538,7 @@ async function runWorkflowWithOwnedSource(
     if (!resumable) {
       throw buildNoResumableRunError(workflowName, cwd);
     }
+    assertFactoryRunMode(resumable.metadata);
 
     getLog().info(
       {
@@ -4356,6 +4388,7 @@ export async function workflowResumeCommand(
   // + execution, so a reaped launching shell can't wedge the run mid-resume.
   // Composes with --json (structured ack; nothing executes here).
   if (detach) {
+    assertFactoryForeground();
     const resolvedId = await resolveRunIdArg(runId, cwd);
     await runDetachedControlCommand(resolvedId, 'resume', json, cwd, async () => {
       const run = await resumeWorkflowOp(resolvedId);

@@ -45,6 +45,8 @@ import type {
   ProviderCapabilities,
   NodeConfig,
 } from '../types';
+import { factoryClaudeScope } from '../factory-sandbox';
+import { createFactoryClaudeTransport } from './factory-transport';
 import { parseClaudeConfig } from './config';
 import { CLAUDE_CAPABILITIES } from './capabilities';
 import { buildContainerSpawn } from './container-spawn';
@@ -1431,6 +1433,9 @@ export class ClaudeProvider implements IAgentProvider {
     resumeSessionId?: string,
     requestOptions?: SendQueryOptions
   ): AsyncGenerator<MessageChunk> {
+    const factoryTransport = requestOptions?.factoryTransportClosed
+      ? createFactoryClaudeTransport()
+      : undefined;
     let lastError: Error | undefined;
     const assistantDefaults = parseClaudeConfig(requestOptions?.assistantConfig ?? {});
 
@@ -1545,9 +1550,14 @@ export class ClaudeProvider implements IAgentProvider {
         getLog().debug({ cwd, attempt }, 'starting_new_session');
       }
 
+      if (requestOptions?.factoryScope)
+        Object.assign(options, factoryClaudeScope(requestOptions.factoryScope, cwd));
+      if (factoryTransport) options.spawnClaudeCodeProcess = factoryTransport.spawn;
+      let factoryQuery: ReturnType<typeof query> | undefined;
       try {
         // 4. Run query with first-event timeout protection
         const rawEvents = query({ prompt, options });
+        factoryQuery = rawEvents;
         const timeoutMs = getFirstEventTimeoutMs();
         const diagnostics = buildFirstEventHangDiagnostics(
           options.env as Record<string, string>,
@@ -1559,12 +1569,28 @@ export class ClaudeProvider implements IAgentProvider {
         // Claude resumes-or-errors: an invalid resume id throws (and is
         // retried/surfaced), so reaching the result stream means the prior
         // session was restored. Hence `true` whenever a resume was requested.
-        yield* withResumedOutcome(
+        let terminalResult: Extract<MessageChunk, { type: 'result' }> | undefined;
+        for await (const chunk of withResumedOutcome(
           streamClaudeMessages(events, toolResultQueue),
           resumedOutcome(resumeSessionId, true)
-        );
+        )) {
+          if (factoryTransport && chunk.type === 'result') terminalResult = chunk;
+          else yield chunk;
+        }
+        if (factoryTransport) {
+          rawEvents.close();
+          await factoryTransport.waitForClosed();
+          requestOptions?.factoryTransportClosed?.();
+          if (terminalResult) yield terminalResult;
+        }
         return;
       } catch (error) {
+        if (factoryTransport) {
+          factoryQuery?.close();
+          // A retry stays inside the same exclusive lease only after the
+          // previous native child is confirmed closed. Otherwise quarantine.
+          await factoryTransport.waitForClosed();
+        }
         const err = error as Error;
         const { enrichedError, errorClass, shouldRetry } = classifyAndEnrichError(
           err,

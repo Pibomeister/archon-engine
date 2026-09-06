@@ -624,6 +624,10 @@ export interface NodeConfig {
 export interface SendQueryOptions extends AgentRequestOptions {
   /** Engine-owned identity for factory-managed provider admission, never YAML. */
   factoryInvocation?: import('./factory-admission').FactoryInvocationContext;
+  /** Trusted broker writable scope, never accepted from workflow YAML. */
+  factoryScope?: import('./factory-sandbox').FactoryProviderScope;
+  /** Provider-owned proof that its native transport has closed cleanly. */
+  factoryTransportClosed?: () => void;
   /** Raw YAML node config — provider translates internally to SDK-specific options. */
   nodeConfig?: NodeConfig;
   /** Per-provider defaults from .archon/config.yaml assistants section. */

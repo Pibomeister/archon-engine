@@ -5,6 +5,8 @@ type CliArgOptions = NonNullable<ParseArgsConfig['options']>;
 // The single options map for the top-level CLI parse. Kept in its own module
 // so tests can import it without executing cli.ts (whose import runs main).
 export const cliArgOptions: CliArgOptions = {
+  'factory-provider-offline': { type: 'boolean' },
+  'factory-provider-broker-fd': { type: 'string' },
   cwd: { type: 'string', default: process.cwd() },
   help: { type: 'boolean', short: 'h' },
   branch: { type: 'string', short: 'b' },

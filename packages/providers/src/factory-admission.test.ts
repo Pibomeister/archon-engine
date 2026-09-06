@@ -24,6 +24,8 @@ function fixture(run?: () => AsyncGenerator<MessageChunk>) {
         invocationId: request.invocationId,
         requestDigest: request.requestDigest,
         leaseId: 'lease-1',
+        version: 'archon.provider-admission.v1',
+        leaseExpiresAt: '2099-01-01T00:00:00.000Z',
       };
     },
     async settle(_lease, outcome) {
@@ -43,10 +45,11 @@ function fixture(run?: () => AsyncGenerator<MessageChunk>) {
       return {
         getType: () => 'codex',
         getCapabilities: () => CODEX_CAPABILITIES,
-        async *sendQuery() {
+        async *sendQuery(_prompt, _cwd, _resume, opts) {
           executions++;
           if (run) yield* run();
           else yield { type: 'result' };
+          opts?.factoryTransportClosed?.();
         },
       };
     },
@@ -102,6 +105,8 @@ describe('factory provider exclusive stream admission', () => {
       invocationId: 'different',
       requestDigest: request.requestDigest,
       leaseId: 'lease',
+      version: 'archon.provider-admission.v1',
+      leaseExpiresAt: '2099-01-01T00:00:00.000Z',
     });
     await expect(consume(createAdmittedProvider(f.entry, f.broker))).rejects.toThrow(
       'factory_provider_lease_mismatch'
@@ -132,6 +137,7 @@ describe('factory provider exclusive stream admission', () => {
       async *sendQuery(_prompt, _cwd, _resume, opts) {
         actual = opts;
         yield { type: 'result' };
+        opts?.factoryTransportClosed?.();
       },
     });
     await consume(createAdmittedProvider(f.entry, f.broker), mutable);
@@ -192,6 +198,25 @@ describe('factory provider exclusive stream admission', () => {
       break;
     expect(f.settled).toEqual(['quarantined']);
   });
+  test('a DAG consumer may stop on a result already backed by native closure', async () => {
+    const f = fixture();
+    f.entry.factory = () => ({
+      getType: () => 'codex',
+      getCapabilities: () => CODEX_CAPABILITIES,
+      async *sendQuery(_p, _c, _r, opts) {
+        opts?.factoryTransportClosed?.();
+        yield { type: 'result' };
+      },
+    });
+    for await (const _chunk of createAdmittedProvider(f.entry, f.broker).sendQuery(
+      'prompt',
+      '/qualified/worktree',
+      undefined,
+      options
+    ))
+      break;
+    expect(f.settled).toEqual(['released']);
+  });
   test('settlement failure remains an error and never claims a released account', async () => {
     const f = fixture();
     f.broker.settle = async () => {
@@ -201,5 +226,55 @@ describe('factory provider exclusive stream admission', () => {
       'factory_provider_settlement_uncertain'
     );
     expect(f.counts().active).toBe(true);
+  });
+  test('a result without transport-close proof cannot release the account', async () => {
+    const f = fixture();
+    f.entry.factory = () => ({
+      getType: () => 'codex',
+      getCapabilities: () => CODEX_CAPABILITIES,
+      async *sendQuery() {
+        yield { type: 'result' };
+      },
+    });
+    await expect(consume(createAdmittedProvider(f.entry, f.broker))).rejects.toThrow(
+      'factory_provider_transport_uncertain'
+    );
+    expect(f.settled).toEqual(['quarantined']);
+  });
+  test('unfinished background work retains quarantine even after native transport exit', async () => {
+    const f = fixture(async function* () {
+      yield {
+        type: 'background_tasks',
+        tasks: [{ taskId: 'active', taskType: 'agent', description: 'still active' }],
+      };
+      yield { type: 'result' };
+    });
+    await expect(consume(createAdmittedProvider(f.entry, f.broker))).rejects.toThrow(
+      'factory_provider_transport_uncertain'
+    );
+    expect(f.settled).toEqual(['quarantined']);
+  });
+  test('lease expiry aborts the stream and preserves quarantine', async () => {
+    const f = fixture();
+    const acquire = f.broker.acquire;
+    f.broker.acquire = async request => ({
+      ...(await acquire(request)),
+      leaseExpiresAt: new Date(Date.now() + 25).toISOString(),
+    });
+    f.entry.factory = () => ({
+      getType: () => 'codex',
+      getCapabilities: () => CODEX_CAPABILITIES,
+      async *sendQuery(_p, _c, _r, opts) {
+        await new Promise<void>(accept => {
+          opts!.abortSignal!.addEventListener('abort', () => accept(), { once: true });
+        });
+        yield { type: 'result' };
+        opts?.factoryTransportClosed?.();
+      },
+    });
+    await expect(consume(createAdmittedProvider(f.entry, f.broker))).rejects.toThrow(
+      'factory_provider_transport_uncertain'
+    );
+    expect(f.settled).toEqual(['quarantined']);
   });
 });

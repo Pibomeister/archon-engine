@@ -1,0 +1,114 @@
+/** Native SDK scope selected by the trusted factory broker, never workflow YAML. */
+import { realpathSync } from 'node:fs';
+import { isAbsolute, relative, resolve, sep } from 'node:path';
+import type { Options } from '@anthropic-ai/claude-agent-sdk';
+import type { CodexOptions, ThreadOptions } from '@openai/codex-sdk';
+
+export interface FactoryProviderScope {
+  workspaceRoot: string;
+  writableRoots: string[];
+  deniedRoots: string[];
+  readableRoots?: string[];
+}
+
+function contains(parent: string, child: string): boolean {
+  const path = relative(parent, child);
+  return path === '' || (path !== '..' && !path.startsWith('..' + sep) && !isAbsolute(path));
+}
+
+function canonicalRoot(path: string): string {
+  if (!isAbsolute(path) || resolve(path) === '/' || realpathSync(path) !== path) {
+    throw new Error('factory_provider_scope_path_invalid');
+  }
+  return path;
+}
+
+export function validateFactoryProviderScope(
+  scope: FactoryProviderScope,
+  cwd: string
+): FactoryProviderScope {
+  if (process.platform !== 'darwin' && process.platform !== 'linux') {
+    throw new Error('factory_provider_platform_unqualified');
+  }
+  const workspaceRoot = canonicalRoot(scope.workspaceRoot);
+  if (canonicalRoot(cwd) !== workspaceRoot) throw new Error('factory_provider_workspace_mismatch');
+  const writableRoots = [...new Set(scope.writableRoots.map(canonicalRoot))];
+  const deniedRoots = [...new Set(scope.deniedRoots.map(canonicalRoot))];
+  if (!writableRoots.includes(workspaceRoot) || deniedRoots.length === 0) {
+    throw new Error('factory_provider_scope_overlap');
+  }
+  for (const writable of writableRoots) {
+    if (deniedRoots.some(denied => contains(writable, denied) || contains(denied, writable))) {
+      throw new Error('factory_provider_scope_overlap');
+    }
+  }
+  return {
+    workspaceRoot,
+    writableRoots,
+    deniedRoots,
+    readableRoots: [...new Set((scope.readableRoots ?? []).map(canonicalRoot))],
+  };
+}
+
+export function factoryCodexConfig(
+  scope: FactoryProviderScope,
+  cwd: string
+): NonNullable<CodexOptions['config']> {
+  const checked = validateFactoryProviderScope(scope, cwd);
+  const filesystem: Record<string, string> = { ':minimal': 'read' };
+  for (const path of checked.readableRoots ?? []) filesystem[path] = 'read';
+  for (const path of checked.writableRoots) filesystem[path] = 'write';
+  for (const path of checked.deniedRoots) filesystem[path] = 'none';
+  return {
+    default_permissions: 'archon-factory',
+    permissions: { 'archon-factory': { filesystem, network: { enabled: true } } },
+  };
+}
+
+export function factoryCodexScope(
+  scope: FactoryProviderScope,
+  cwd: string
+): Partial<ThreadOptions> {
+  validateFactoryProviderScope(scope, cwd);
+  return {
+    // A --sandbox flag would replace the narrower named permissions profile.
+    sandboxMode: undefined,
+    additionalDirectories: [],
+    approvalPolicy: 'never',
+  };
+}
+
+export function factoryClaudeScope(scope: FactoryProviderScope, cwd: string): Partial<Options> {
+  const checked = validateFactoryProviderScope(scope, cwd);
+  // Read/Edit permission rules use // for absolute paths; sandbox filesystem
+  // paths use ordinary absolute paths. Both layers are required for file tools
+  // and Bash descendants respectively. Do not load mergeable project settings.
+  return {
+    permissionMode: 'dontAsk',
+    allowDangerouslySkipPermissions: false,
+    settingSources: [],
+    additionalDirectories: checked.writableRoots.filter(path => path !== checked.workspaceRoot),
+    sandbox: {
+      enabled: true,
+      failIfUnavailable: true,
+      autoAllowBashIfSandboxed: true,
+      allowUnsandboxedCommands: false,
+      filesystem: {
+        allowWrite: checked.writableRoots,
+        denyWrite: checked.deniedRoots,
+        denyRead: checked.deniedRoots,
+      },
+    },
+    settings: {
+      permissions: {
+        defaultMode: 'dontAsk',
+        disableBypassPermissionsMode: 'disable',
+        allow: [
+          ...checked.writableRoots.map(path => `Edit(/${path}/**)`),
+          ...(checked.readableRoots ?? []).map(path => `Read(/${path}/**)`),
+        ],
+        deny: checked.deniedRoots.flatMap(path => [`Edit(/${path}/**)`, `Read(/${path}/**)`]),
+      },
+    },
+  };
+}

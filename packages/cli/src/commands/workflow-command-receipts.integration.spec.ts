@@ -40,6 +40,7 @@ nodes:
         '--cwd',
         project,
         '--folder',
+        '--factory-provider-offline',
         ...(args[0] === 'resume' ? [] : ['--json']),
       ],
       {

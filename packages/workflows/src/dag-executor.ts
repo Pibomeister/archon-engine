@@ -33,6 +33,7 @@ import type {
   OverlayChangeSummary,
 } from '@archon/providers/types';
 import { CONTAINER_ENV_DENYLIST, mergeTokenUsage } from '@archon/providers/types';
+import { isFactoryManaged } from '@archon/providers/factory-mode';
 import type { ContainerRunContext } from './container-context';
 import { WRITEBACK_GATE_NODE_ID } from './container-context';
 import {
@@ -1817,6 +1818,7 @@ async function resolveNodeProviderAndModel(
 
   // Build universal base options
   const baseOptions: SendQueryOptions = {};
+  if (isFactoryManaged()) baseOptions.factoryInvocation = { runId: workflowRunId, nodeId: node.id };
   if (model) baseOptions.model = model;
   // Only annotate options with the execution context when running in a container
   // (Phase B). Host is the default/absent case, so host runs produce byte-identical
@@ -2970,6 +2972,11 @@ async function executeNodeInternal(
       // the declared source rather than inheriting stale attestation from an earlier pass.
       const reaskResumeSessionId =
         namedResumeSourceNodeId !== undefined || reaskAttempt === 0 ? resumeSessionId : undefined;
+      if (nodeOptionsWithAbort?.factoryInvocation)
+        nodeOptionsWithAbort.factoryInvocation = {
+          ...nodeOptionsWithAbort.factoryInvocation,
+          reask: reaskAttempt,
+        };
       try {
         await runStreamPass(reaskPrompt, reaskResumeSessionId);
       } finally {
@@ -6181,6 +6188,15 @@ async function executeLoopNode(
           const iterationOptions: SendQueryOptions | undefined = {
             ...resolvedOptions,
             abortSignal: iterationAbortController.signal,
+            ...(resolvedOptions?.factoryInvocation
+              ? {
+                  factoryInvocation: {
+                    ...resolvedOptions.factoryInvocation,
+                    iteration: i,
+                    reask: reaskAttempt,
+                  },
+                }
+              : {}),
           };
 
           // Reask attempts start a FRESH session (mirrors runStreamPass in

@@ -1,5 +1,6 @@
+import { removeTempTree } from '@archon/paths/test-utils';
 import { describe, test, expect, mock, beforeEach, type Mock } from 'bun:test';
-import { mkdtemp, rm, writeFile } from 'fs/promises';
+import { mkdtemp, mkdir, realpath, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import type { Codex as SdkCodex, Thread as SdkThread, Usage } from '@openai/codex-sdk';
@@ -87,6 +88,35 @@ describe('CodexProvider', () => {
     test('returns codex', () => {
       expect(client.getType()).toBe('codex');
     });
+  });
+  test('managed source scope reaches the actual SDK options without a broad sandbox override', async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'codex-factory-scope-')));
+    try {
+      const worktree = join(root, 'worktree');
+      const manual = join(root, 'manual');
+      await mkdir(worktree);
+      await mkdir(manual);
+      for await (const _chunk of client.sendQuery('fixture', worktree, undefined, {
+        model: 'gpt-5.4',
+        factoryScope: { workspaceRoot: worktree, writableRoots: [worktree], deniedRoots: [manual] },
+        assistantConfig: { additionalDirectories: [manual] },
+      })) {
+        /* consume the SDK fixture */
+      }
+      expect(MockCodex.mock.calls[0]?.[0]?.config).toMatchObject({
+        default_permissions: 'archon-factory',
+        permissions: {
+          'archon-factory': { filesystem: { [worktree]: 'write', [manual]: 'none' } },
+        },
+      });
+      expect(mockStartThread.mock.calls[0]?.[0]).toMatchObject({
+        sandboxMode: undefined,
+        additionalDirectories: [],
+        approvalPolicy: 'never',
+      });
+    } finally {
+      await removeTempTree(root);
+    }
   });
 
   describe('getCapabilities', () => {

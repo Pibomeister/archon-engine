@@ -9,6 +9,7 @@ import { getAgentProvider } from '@archon/providers';
 import type { SendQueryOptions } from '@archon/providers/types';
 import * as conversationDb from '../db/conversations';
 import { createLogger } from '@archon/paths';
+import { isFactoryManaged } from '@archon/providers/factory-mode';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -42,6 +43,10 @@ export async function generateAndSetTitle(
   assistantConfig?: Record<string, unknown>,
   requestOptions?: SendQueryOptions
 ): Promise<void> {
+  if (isFactoryManaged()) {
+    await conversationDb.updateConversationTitle(conversationDbId, truncateMessage(userMessage));
+    return;
+  }
   try {
     getLog().debug({ conversationDbId, assistantType }, 'title.generate_started');
 
