@@ -1,4 +1,10 @@
-import type { GateCommand, GateCommandBinding, CommandReceipt } from '../db/workflow-commands';
+import type {
+  GateCommand,
+  GateCommandBinding,
+  FactoryHumanInputCommand,
+  FactoryHumanInputCommandBinding,
+  CommandReceipt,
+} from '../db/workflow-commands';
 /**
  * Shared workflow business logic — approve, reject, status, resume, abandon.
  *
@@ -1053,6 +1059,43 @@ export async function respondToWorkflowConditionally(
   const receipt = await gateCommandReceipt(command);
   if (!receipt) throw new Error('Gate resolution did not persist its command receipt.');
   return receipt;
+}
+
+/**
+ * Resolve a factory provider's bounded human-input pause with exact invocation identity.
+ * This is not a workflow gate command: it records text for the same provider context to
+ * resume from and cannot approve/reject a human approval gate or send raw terminal input.
+ */
+export async function respondToFactoryHumanInputConditionally(
+  runId: string,
+  text: string,
+  binding: FactoryHumanInputCommandBinding
+): Promise<CommandReceipt> {
+  const { factoryHumanInputCommandReceipt, resolveFactoryHumanInputWithCommand } =
+    await import('../db/workflow-commands');
+  const command: FactoryHumanInputCommand = { ...binding, runId, text };
+  const prior = await factoryHumanInputCommandReceipt(command);
+  if (prior) return prior;
+  try {
+    if (
+      !binding.commandId ||
+      !binding.expectedNodeId ||
+      !binding.expectedInvocationId ||
+      !binding.expectedRequestDigest ||
+      !binding.expectedLeaseId
+    ) {
+      throw new Error('A command id and exact factory invocation identity are required.');
+    }
+    const respondedAt = new Date().toISOString();
+    return await resolveFactoryHumanInputWithCommand(command, respondedAt);
+  } catch (error) {
+    const receipt = await factoryHumanInputCommandReceipt(command, {
+      code: 'stale_factory_human_input',
+      message: (error as Error).message,
+    });
+    if (receipt) return receipt;
+    throw error;
+  }
 }
 
 /**

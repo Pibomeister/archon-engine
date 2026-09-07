@@ -1008,12 +1008,66 @@ async function* streamClaudeMessages(
         if (block.type === 'text' && block.text) {
           yield { type: 'assistant', content: block.text };
         } else if (block.type === 'tool_use' && block.name) {
+          const toolInput = block.input ?? {};
           yield {
             type: 'tool',
             toolName: block.name,
-            toolInput: block.input ?? {},
+            toolInput,
             ...(block.id !== undefined ? { toolCallId: block.id } : {}),
           };
+          if (block.name === 'AskUserQuestion') {
+            const input = toolInput;
+            const questions = Array.isArray(input.questions)
+              ? input.questions.filter(
+                  (item): item is Record<string, unknown> =>
+                    item !== null && typeof item === 'object' && !Array.isArray(item)
+                )
+              : [];
+            const questionTexts = questions
+              .map(item => {
+                const header =
+                  typeof item.header === 'string' && item.header.trim().length > 0
+                    ? `${item.header.trim()}: `
+                    : '';
+                return typeof item.question === 'string' && item.question.trim().length > 0
+                  ? `${header}${item.question.trim()}`
+                  : '';
+              })
+              .filter(Boolean);
+            const question =
+              questionTexts.length > 0
+                ? questionTexts.join('\n')
+                : typeof input.question === 'string' && input.question.trim().length > 0
+                  ? input.question
+                  : typeof input.prompt === 'string' && input.prompt.trim().length > 0
+                    ? input.prompt
+                    : 'Claude requested human input.';
+            const optionLabels = questions.flatMap(item =>
+              Array.isArray(item.options)
+                ? item.options
+                    .map(choice =>
+                      choice !== null &&
+                      typeof choice === 'object' &&
+                      !Array.isArray(choice) &&
+                      typeof (choice as { label?: unknown }).label === 'string'
+                        ? (choice as { label: string }).label
+                        : undefined
+                    )
+                    .filter((choice): choice is string => choice !== undefined)
+                : []
+            );
+            const legacyOptions = Array.isArray(input.options)
+              ? input.options.filter((choice): choice is string => typeof choice === 'string')
+              : [];
+            const options = optionLabels.length > 0 ? optionLabels : legacyOptions;
+            yield {
+              type: 'human_input_request',
+              message: question,
+              reason: 'claude_ask_user_question',
+              ...(options.length > 0 ? { choices: options } : {}),
+              ...(questions.length > 0 ? { questions } : {}),
+            };
+          }
         }
       }
     } else if (event.type === 'system') {

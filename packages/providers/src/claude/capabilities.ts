@@ -54,6 +54,7 @@ export const CLAUDE_CAPABILITIES: ProviderCapabilities = {
   hooks: true,
   skills: true,
   agents: true,
+  humanInputRequests: true,
   toolRestrictions: true,
   knownToolNames: CLAUDE_KNOWN_TOOL_NAMES,
   renamedTools: CLAUDE_RENAMED_TOOLS,

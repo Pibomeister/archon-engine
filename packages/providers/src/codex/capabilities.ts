@@ -10,6 +10,7 @@ export const CODEX_CAPABILITIES: ProviderCapabilities = {
   // invoke installed skills explicitly with `$skill-name` in the node body.
   skills: false,
   agents: false,
+  humanInputRequests: false,
   toolRestrictions: false,
   structuredOutput: 'enforced', // SDK outputSchema grammar-constrains decoding
   envInjection: true,

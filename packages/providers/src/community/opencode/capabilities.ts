@@ -28,6 +28,7 @@ export const OPENCODE_CAPABILITIES: ProviderCapabilities = {
   hooks: false,
   skills: false, // top-level nodeConfig.skills has no OpenCode request translation yet
   agents: true,
+  humanInputRequests: false,
   toolRestrictions: true,
   structuredOutput: 'enforced', // sends format:{json_schema}; reads info.structured_output
   envInjection: true,

@@ -7,11 +7,27 @@ import {
 import type { IAgentProvider, MessageChunk, ProviderRegistration } from './types';
 import { CODEX_CAPABILITIES } from './codex/capabilities';
 
-const context = { runId: 'run-1', nodeId: 'implement' };
-const options = { model: 'qualified-model', factoryInvocation: context };
+const context = {
+  runId: 'run-1',
+  nodeId: 'implement',
+  launchId: 'launch-1',
+  attemptId: 'attempt-1',
+};
+const options = {
+  model: 'qualified-model',
+  factoryInvocation: context as {
+    runId: string;
+    nodeId: string;
+    launchId?: string;
+    attemptId?: string;
+    iteration?: number;
+    reask?: number;
+  },
+};
 function fixture(run?: () => AsyncGenerator<MessageChunk>) {
   const requests: AdmissionRequest[] = [];
   const settled: string[] = [];
+  const settledSignals: unknown[][] = [];
   let active = false;
   let constructions = 0;
   let executions = 0;
@@ -28,8 +44,9 @@ function fixture(run?: () => AsyncGenerator<MessageChunk>) {
         leaseExpiresAt: '2099-01-01T00:00:00.000Z',
       };
     },
-    async settle(_lease, outcome) {
+    async settle(_lease, outcome, signals) {
       settled.push(outcome);
+      settledSignals.push([...(signals ?? [])]);
       if (outcome === 'released') active = false;
     },
   };
@@ -59,6 +76,7 @@ function fixture(run?: () => AsyncGenerator<MessageChunk>) {
     broker,
     requests,
     settled,
+    settledSignals,
     counts: () => ({ constructions, executions, active }),
   };
 }
@@ -117,9 +135,63 @@ describe('factory provider exclusive stream admission', () => {
     const f = fixture();
     await consume(createAdmittedProvider(f.entry, f.broker));
     expect(f.settled).toEqual(['released']);
+    expect(f.settledSignals[0]?.[0]).toMatchObject({
+      kind: 'factory-invocation-outcome',
+      outcome: 'completed',
+      provider: 'codex',
+      leaseId: 'lease-1',
+      context,
+    });
+    expect((f.settledSignals[0]?.[0] as { invocationId?: string }).invocationId).toBe(
+      f.requests[0]?.invocationId
+    );
     expect(f.counts()).toEqual({ constructions: 1, executions: 1, active: false });
     expect(JSON.stringify(f.requests)).not.toContain('private prompt');
     expect(f.requests[0]?.context).toEqual(context);
+  });
+  test('result observations carry normalized usage and provider failure classes', async () => {
+    const cases: [MessageChunk, string][] = [
+      [
+        {
+          type: 'result',
+          isError: true,
+          errorSubtype: 'oauth_authentication_failed',
+          errors: ['login expired'],
+        },
+        'auth-failure',
+      ],
+      [
+        {
+          type: 'result',
+          isError: true,
+          errorSubtype: 'human_input_required',
+          errors: ['human review needed'],
+        },
+        'human-input-required',
+      ],
+      [
+        {
+          type: 'result',
+          sessionId: 'session-1',
+          tokens: { input: 5, output: 7, cacheRead: 2 },
+          stopReason: 'stop',
+          resolvedModel: { id: 'qualified-model' },
+          resumed: true,
+        },
+        'completed',
+      ],
+    ];
+    for (const [result, outcome] of cases) {
+      const f = fixture(async function* () {
+        yield result;
+      });
+      await consume(createAdmittedProvider(f.entry, f.broker));
+      expect(f.settledSignals[0]?.[0]).toMatchObject({
+        kind: 'factory-invocation-outcome',
+        outcome,
+        requestDigest: f.requests[0]?.requestDigest,
+      });
+    }
   });
   test('admission freezes effectful model options across the asynchronous broker boundary', async () => {
     const f = fixture();
@@ -167,6 +239,12 @@ describe('factory provider exclusive stream admission', () => {
     await first;
     expect(attempts).toBe(2);
     expect(f.settled).toEqual(['released']);
+    expect(f.settledSignals[0]?.[0]).toMatchObject({
+      kind: 'factory-invocation-outcome',
+      outcome: 'completed',
+      leaseId: 'lease-1',
+      context,
+    });
   });
   test('crash and result-less close quarantine rather than lending the account again', async () => {
     for (const run of [
@@ -180,6 +258,10 @@ describe('factory provider exclusive stream admission', () => {
       const f = fixture(run);
       await expect(consume(createAdmittedProvider(f.entry, f.broker))).rejects.toThrow();
       expect(f.settled).toEqual(['quarantined']);
+      expect(f.settledSignals[0]?.[0]).toMatchObject({
+        kind: 'factory-invocation-outcome',
+        outcome: 'uncertain-termination',
+      });
       expect(f.counts().active).toBe(true);
       await expect(consume(createAdmittedProvider(f.entry, f.broker))).rejects.toThrow(
         'factory_provider_admission_denied'
@@ -217,6 +299,57 @@ describe('factory provider exclusive stream admission', () => {
       break;
     expect(f.settled).toEqual(['released']);
   });
+
+  test('separate resumed provider calls get fresh invocation and request identity', async () => {
+    const f = fixture();
+    const provider = createAdmittedProvider(f.entry, f.broker);
+    await consume(provider, { ...options, factoryInvocation: { ...context, iteration: 0 } });
+    await consume(provider, {
+      ...options,
+      factoryInvocation: { ...context, iteration: 1 },
+    });
+    expect(f.requests).toHaveLength(2);
+    expect(f.requests[0]?.context).toEqual({ ...context, iteration: 0 });
+    expect(f.requests[1]?.context).toEqual({ ...context, iteration: 1 });
+    expect(f.requests[0]?.invocationId).not.toBe(f.requests[1]?.invocationId);
+    expect(f.requests[0]?.requestDigest).not.toBe(f.requests[1]?.requestDigest);
+    expect(f.settled).toEqual(['released', 'released']);
+  });
+
+  test('provider human-input requests are enriched with exact lease identity and settled durably', async () => {
+    const f = fixture(async function* () {
+      yield {
+        type: 'human_input_request',
+        message: 'Which migration path should I use?',
+        reason: 'ambiguous migration',
+        sessionId: 'session-before-pause',
+        choices: ['additive', 'destructive'],
+        questions: [{ question: 'Which migration path should I use?' }],
+      };
+    });
+    await expect(consume(createAdmittedProvider(f.entry, f.broker))).rejects.toThrow(
+      'factory_provider_transport_uncertain'
+    );
+    const signal = f.settledSignals[0]?.[0] as { [key: string]: unknown };
+    expect(signal).toMatchObject({
+      kind: 'factory-invocation-outcome',
+      outcome: 'human-input-required',
+      provider: 'codex',
+      leaseId: 'lease-1',
+      context,
+      sessionId: 'session-before-pause',
+      stopReason: 'ambiguous migration',
+      humanInput: {
+        message: 'Which migration path should I use?',
+        reason: 'ambiguous migration',
+        sessionId: 'session-before-pause',
+        choices: ['additive', 'destructive'],
+        questions: [{ question: 'Which migration path should I use?' }],
+      },
+    });
+    expect(f.settled).toEqual(['quarantined']);
+  });
+
   test('settlement failure remains an error and never claims a released account', async () => {
     const f = fixture();
     f.broker.settle = async () => {

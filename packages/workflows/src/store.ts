@@ -12,6 +12,7 @@ import type {
   ApprovalContext,
   WorkflowWaitContext,
   WorkflowWaitResult,
+  FactoryHumanInputContext,
   ScheduledWorkflowResume,
   WorkflowNodeSession,
   WorkflowRunNodeSession,
@@ -30,6 +31,8 @@ export type { WorkflowNodeSession, WorkflowRunNodeSession } from './schemas';
 export interface PersistedNodeOutput {
   output: string;
   structuredOutput?: unknown;
+  /** Loop-group body iteration when the terminal row carried one. */
+  iteration?: number;
 }
 
 export interface DagResumeSnapshot {
@@ -104,6 +107,9 @@ export const WORKFLOW_EVENT_TYPES = [
   'wait_signaled',
   'wait_completed',
   'wait_expired',
+  'factory_observation',
+  'factory_human_input_requested',
+  'factory_human_input_received',
   'quota_resume_scheduled',
   'quota_resume_triggered',
   'quota_resume_exhausted',
@@ -307,6 +313,21 @@ export interface IWorkflowStore extends IRunTreeStore, IWorkflowRunNodeSessionSt
     waitContext: WorkflowWaitContext,
     pause: WorkflowWaitPause
   ): Promise<void>;
+  /** Pause a running run on provider-native human input without resolving any approval gate. */
+  pauseWorkflowRunForFactoryHumanInput?(
+    id: string,
+    context: FactoryHumanInputContext
+  ): Promise<void>;
+  /** Record the exact operator response for a paused factory human-input request. */
+  resolveFactoryHumanInput?(
+    id: string,
+    context: FactoryHumanInputContext
+  ): Promise<{ resolved: boolean }>;
+  /** Mark one exact factory human-input response as consumed by its authorized continuation. */
+  consumeFactoryHumanInputResponse?(
+    id: string,
+    context: FactoryHumanInputContext
+  ): Promise<{ consumed: boolean }>;
   /** Consume the exact wait cursor and persist its completion snapshot atomically. */
   clearWorkflowWaitContext(
     id: string,

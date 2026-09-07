@@ -351,7 +351,10 @@ function parseFanOutSnapshots(value: unknown): FanOutInstanceSnapshot[] | undefi
 }
 
 export async function getDagResumeSnapshot(workflowRunId: string): Promise<{
-  completedNodeOutputs: Map<string, { output: string; structuredOutput?: unknown }>;
+  completedNodeOutputs: Map<
+    string,
+    { output: string; structuredOutput?: unknown; iteration?: number }
+  >;
   fanOutSnapshots: Map<string, readonly FanOutInstanceSnapshot[]>;
   unresolvedNodeStarts: Set<string>;
   tokens?: TokenUsage;
@@ -476,6 +479,7 @@ export async function getDagResumeSnapshot(workflowRunId: string): Promise<{
         ...(data.structured_output !== undefined
           ? { structuredOutput: data.structured_output }
           : {}),
+        ...(Number.isInteger(data.iteration) ? { iteration: data.iteration as number } : {}),
       });
     }
     // Composed-instance terminals are the durable accounting source for their whole
