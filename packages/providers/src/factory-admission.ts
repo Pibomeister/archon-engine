@@ -3,13 +3,24 @@ import { factoryRequestDigest } from './factory-digest';
  * This is not per-model-turn metering. Standalone providers do not use it.
  */
 import { createHash, randomUUID } from 'node:crypto';
-import type { IAgentProvider, MessageChunk, ProviderRegistration, SendQueryOptions } from './types';
+import type {
+  FactoryInvocationOutcome,
+  FactoryInvocationSignal,
+  IAgentProvider,
+  MessageChunk,
+  ProviderRegistration,
+  SendQueryOptions,
+} from './types';
 import { getFactoryBinding, getFactoryScope } from './factory-mode';
 import { validateFactoryProviderScope } from './factory-sandbox';
 
 export interface FactoryInvocationContext {
   runId: string;
   nodeId: string;
+  /** Factory command identity that authorized this logical launch. */
+  launchId?: string;
+  /** Factory attempt identity for this exact execution base. */
+  attemptId?: string;
   iteration?: number;
   reask?: number;
 }
@@ -36,7 +47,11 @@ export interface AdmissionLease {
 }
 export interface AdmissionBroker {
   acquire(request: AdmissionRequest): Promise<AdmissionLease>;
-  settle(lease: AdmissionLease, outcome: 'released' | 'quarantined'): Promise<void>;
+  settle(
+    lease: AdmissionLease,
+    outcome: 'released' | 'quarantined',
+    signals?: readonly FactoryInvocationSignal[]
+  ): Promise<void>;
 }
 
 function digest(value: string): string {
@@ -63,10 +78,11 @@ function snapshot<T>(value: T): T {
 async function settleLease(
   broker: AdmissionBroker,
   lease: AdmissionLease,
-  closed: boolean
+  closed: boolean,
+  signals: readonly FactoryInvocationSignal[]
 ): Promise<void> {
   try {
-    await broker.settle(lease, closed ? 'released' : 'quarantined');
+    await broker.settle(lease, closed ? 'released' : 'quarantined', signals);
   } catch {
     throw new Error('factory_provider_settlement_uncertain');
   }
@@ -101,6 +117,99 @@ function requestFor(
     promptDigest: digest(prompt),
   };
   return { ...body, requestDigest: factoryRequestDigest(body) };
+}
+
+function classifyResultOutcome(
+  result: Extract<MessageChunk, { type: 'result' }>
+): FactoryInvocationOutcome {
+  const detail = [result.errorSubtype, result.stopReason, ...(result.errors ?? [])]
+    .filter((item): item is string => typeof item === 'string')
+    .join(' ')
+    .toLowerCase();
+  if (detail.includes('human') && (detail.includes('input') || detail.includes('review'))) {
+    return 'human-input-required';
+  }
+  if (
+    detail.includes('auth') ||
+    detail.includes('unauthorized') ||
+    detail.includes('forbidden') ||
+    detail.includes('credential') ||
+    detail.includes('login')
+  ) {
+    return 'auth-failure';
+  }
+  return result.isError && result.errorSubtype !== 'success' ? 'provider-error' : 'completed';
+}
+
+function signalForResult(
+  provider: string,
+  request: AdmissionRequest,
+  lease: AdmissionLease,
+  result: Extract<MessageChunk, { type: 'result' }>
+): FactoryInvocationSignal {
+  return {
+    kind: 'factory-invocation-outcome',
+    outcome: classifyResultOutcome(result),
+    provider,
+    invocationId: lease.invocationId,
+    requestDigest: lease.requestDigest,
+    leaseId: lease.leaseId,
+    context: { ...request.context },
+    ...(result.tokens ? { usage: { ...result.tokens } } : {}),
+    ...(result.sessionId ? { sessionId: result.sessionId } : {}),
+    ...(result.stopReason ? { stopReason: result.stopReason } : {}),
+    ...(result.errorSubtype ? { errorSubtype: result.errorSubtype } : {}),
+    ...(result.errors?.length ? { errors: [...result.errors] } : {}),
+    ...(result.resumed !== undefined ? { resumed: result.resumed } : {}),
+    ...(result.resolvedModel ? { resolvedModel: { ...result.resolvedModel } } : {}),
+    occurredAt: new Date().toISOString(),
+  };
+}
+
+function signalForHumanInputRequest(
+  provider: string,
+  request: AdmissionRequest,
+  lease: AdmissionLease,
+  chunk: Extract<MessageChunk, { type: 'human_input_request' }>
+): FactoryInvocationSignal {
+  return {
+    kind: 'factory-invocation-outcome',
+    outcome: 'human-input-required',
+    provider,
+    invocationId: lease.invocationId,
+    requestDigest: lease.requestDigest,
+    leaseId: lease.leaseId,
+    context: { ...request.context },
+    ...(chunk.sessionId ? { sessionId: chunk.sessionId } : {}),
+    ...(chunk.reason ? { stopReason: chunk.reason } : {}),
+    humanInput: {
+      message: chunk.message,
+      ...(chunk.reason ? { reason: chunk.reason } : {}),
+      ...(chunk.sessionId ? { sessionId: chunk.sessionId } : {}),
+      ...(chunk.choices ? { choices: [...chunk.choices] } : {}),
+      ...(Array.isArray(chunk.questions) ? { questions: [...chunk.questions] } : {}),
+    },
+    occurredAt: new Date().toISOString(),
+  };
+}
+
+function signalForUncertainTermination(
+  provider: string,
+  request: AdmissionRequest,
+  lease: AdmissionLease,
+  reason: string
+): FactoryInvocationSignal {
+  return {
+    kind: 'factory-invocation-outcome',
+    outcome: 'uncertain-termination',
+    provider,
+    invocationId: lease.invocationId,
+    requestDigest: lease.requestDigest,
+    leaseId: lease.leaseId,
+    context: { ...request.context },
+    errorSubtype: reason,
+    occurredAt: new Date().toISOString(),
+  };
 }
 
 /** Lazily construct the SDK provider only after a matching broker receipt. */
@@ -150,6 +259,7 @@ export function createAdmittedProvider(
       }
       let resultSeen = false;
       let closed = false;
+      let terminalSignal: FactoryInvocationSignal | undefined;
       const backgroundTasks = new Set<string>();
       const expiryController = new AbortController();
       let expiryTimer: ReturnType<typeof setTimeout> | undefined;
@@ -176,7 +286,15 @@ export function createAdmittedProvider(
           resumeSessionId,
           admittedOptions
         )) {
-          if (chunk.type === 'result') resultSeen = true;
+          if (chunk.type === 'result') {
+            resultSeen = true;
+            terminalSignal = signalForResult(entry.id, request, lease, chunk);
+          }
+          if (chunk.type === 'human_input_request') {
+            terminalSignal = signalForHumanInputRequest(entry.id, request, lease, chunk);
+            yield { ...chunk, signal: terminalSignal };
+            continue;
+          }
           if (chunk.type === 'task_started') backgroundTasks.add(chunk.taskId);
           if (chunk.type === 'task_notification') backgroundTasks.delete(chunk.taskId);
           if (chunk.type === 'background_tasks') {
@@ -191,16 +309,31 @@ export function createAdmittedProvider(
             backgroundTasks.size === 0 &&
             !admittedOptions?.abortSignal?.aborted;
           yield chunk;
+          if (chunk.type === 'result' && terminalSignal) {
+            yield { type: 'factory_observation', signal: terminalSignal };
+          }
         }
         closed =
           resultSeen &&
           transportClosed &&
           backgroundTasks.size === 0 &&
           !admittedOptions?.abortSignal?.aborted;
-        if (!closed) throw new Error('factory_provider_transport_uncertain');
+        if (!closed) {
+          terminalSignal ??= signalForUncertainTermination(
+            entry.id,
+            request,
+            lease,
+            resultSeen ? 'factory_provider_transport_uncertain' : 'factory_provider_result_missing'
+          );
+          throw new Error('factory_provider_transport_uncertain');
+        }
       } finally {
         if (expiryTimer) clearTimeout(expiryTimer);
-        await settleLease(broker, lease, closed);
+        const signals = [
+          terminalSignal ??
+            signalForUncertainTermination(entry.id, request, lease, 'factory_provider_exception'),
+        ];
+        await settleLease(broker, lease, closed, signals);
       }
     },
   };

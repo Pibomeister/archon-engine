@@ -86,8 +86,10 @@ import {
   workflowApproveCommand,
   workflowRejectCommand,
   workflowRespondCommand,
+  workflowFactoryHumanInputCommand,
   workflowLaunchStatusCommand,
   workflowGateEvidenceCommand,
+  workflowFinalEvidenceCommand,
   workflowCleanupCommand,
   workflowResetSessionsCommand,
   workflowEventEmitCommand,
@@ -192,6 +194,7 @@ Commands:
   workflow launch-intent <name> [message]  Compute engine launch payload digest
   workflow launch-status <key>  Look up a durable launch reservation
   workflow gate-evidence <run-id> <occurrence-id>  Read sealed gate evidence
+  workflow final-evidence <run-id>  Read sealed final workflow evidence
   workflow wait <run-id>     Block until the run ends or needs a human decision
   workflow resume <run-id>   Resume a failed or paused run from completed nodes
   workflow cancel <run-id>   Stop a running workflow started with --detach
@@ -459,14 +462,39 @@ async function main(): Promise<number> {
 
   try {
     if (
-      [
-        values['command-id'],
-        values['expected-occurrence'],
-        values['expected-evidence-digest'],
-      ].some(value => value !== undefined) &&
+      [values['expected-occurrence'], values['expected-evidence-digest']].some(
+        value => value !== undefined
+      ) &&
       !(command === 'workflow' && subcommand === 'respond')
     ) {
       return await fail(jsonFlag, 'Conditional gate flags are only supported by workflow respond.');
+    }
+    if (
+      [
+        values['expected-node'],
+        values['expected-invocation'],
+        values['expected-request-digest'],
+        values['expected-lease'],
+        values['response-file'],
+      ].some(value => value !== undefined) &&
+      !(command === 'workflow' && subcommand === 'factory-human-input')
+    ) {
+      return await fail(
+        jsonFlag,
+        'Factory human-input flags are only supported by workflow factory-human-input.'
+      );
+    }
+    if (
+      values['command-id'] !== undefined &&
+      !(
+        command === 'workflow' &&
+        (subcommand === 'respond' || subcommand === 'factory-human-input')
+      )
+    ) {
+      return await fail(
+        jsonFlag,
+        'Command id is only supported by workflow respond and workflow factory-human-input.'
+      );
     }
     if (
       [values['launch-key'], values['launch-payload-digest']].some(value => value !== undefined) &&
@@ -551,6 +579,7 @@ async function main(): Promise<number> {
         (subcommand === 'launch-intent' ||
           subcommand === 'launch-status' ||
           subcommand === 'gate-evidence' ||
+          subcommand === 'final-evidence' ||
           (dryRunFlag && subcommand === 'run'))
       ) {
         // Dry-run only discovers workflow files and simulates in memory. It does
@@ -689,6 +718,10 @@ async function main(): Promise<number> {
                 'Usage: workflow gate-evidence <run-id> <occurrence-id> --json'
               );
             return await workflowGateEvidenceCommand(positionals[2], positionals[3]);
+          case 'final-evidence':
+            if (!positionals[2] || positionals[3] !== undefined)
+              return await fail(jsonFlag, 'Usage: workflow final-evidence <run-id> --json');
+            return await workflowFinalEvidenceCommand(positionals[2]);
           case 'launch-intent':
           case 'run': {
             const workflowName = positionals[2];
@@ -958,6 +991,46 @@ async function main(): Promise<number> {
               effectiveCwd,
               detachFlag
             );
+            break;
+          }
+
+          case 'factory-human-input': {
+            const inputRunId = positionals[2];
+            if (!inputRunId) {
+              return await fail(
+                jsonFlag,
+                'Usage: archon workflow factory-human-input <run-id> --json --command-id <id> --expected-node <node-id> --expected-invocation <invocation-id> --expected-request-digest <sha256> --expected-lease <lease-id> [--response-file <path|->]\n' +
+                  '  Response text is read from stdin unless --response-file is provided.'
+              );
+            }
+            const factoryValues = [
+              values['command-id'],
+              values['expected-node'],
+              values['expected-invocation'],
+              values['expected-request-digest'],
+              values['expected-lease'],
+            ];
+            if (
+              !jsonFlag ||
+              !factoryValues.every(value => typeof value === 'string' && value.length > 0)
+            ) {
+              return await fail(
+                jsonFlag,
+                'Factory human-input response requires --json, --command-id, --expected-node, --expected-invocation, --expected-request-digest and --expected-lease.'
+              );
+            }
+            await workflowFactoryHumanInputCommand(inputRunId, {
+              json: jsonFlag,
+              cwd: effectiveCwd,
+              responseFile: values['response-file'] as string | undefined,
+              binding: {
+                commandId: values['command-id'] as string,
+                expectedNodeId: values['expected-node'] as string,
+                expectedInvocationId: values['expected-invocation'] as string,
+                expectedRequestDigest: values['expected-request-digest'] as string,
+                expectedLeaseId: values['expected-lease'] as string,
+              },
+            });
             break;
           }
 

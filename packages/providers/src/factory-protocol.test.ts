@@ -42,3 +42,34 @@ test('legacy config aliases and incomplete lease receipts fail closed', () => {
   void version;
   expect(leaseSchema.safeParse(withoutVersion).success).toBe(false);
 });
+
+test('factory provider policy accepts only finite explicit limit values', () => {
+  type Limits = {
+    maxInvocations: number;
+    maxRunMs: number;
+    maxExecutionMs: number;
+    maxInputTokens?: number;
+    maxOutputTokens?: number;
+    maxConsecutiveNoWorkAttempts?: number;
+  };
+  const limited = structuredClone(golden.config) as typeof golden.config & {
+    providerPolicy: typeof golden.config.providerPolicy & {
+      limits?: Limits;
+    };
+  };
+  limited.providerPolicy.limits = {
+    maxInvocations: 3,
+    maxRunMs: 3_600_000,
+    maxExecutionMs: 1_800_000,
+    maxInputTokens: 250_000,
+    maxOutputTokens: 60_000,
+    maxConsecutiveNoWorkAttempts: 2,
+  };
+  expect(configSchema.parse(limited).providerPolicy.limits).toEqual(limited.providerPolicy.limits);
+
+  const invalid = structuredClone(limited) as typeof limited & {
+    providerPolicy: typeof limited.providerPolicy & { limits: Limits };
+  };
+  invalid.providerPolicy.limits.maxInvocations = Number.POSITIVE_INFINITY;
+  expect(configSchema.safeParse(invalid).success).toBe(false);
+});

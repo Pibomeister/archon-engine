@@ -521,3 +521,160 @@ describe(`engine-bound command receipts (${postgresUrl ? 'PostgreSQL' : 'SQLite'
     ).toBe(0);
   });
 });
+
+describe(`factory human-input command receipts (${postgresUrl ? 'PostgreSQL' : 'SQLite'})`, () => {
+  async function pausedForFactoryInput(): Promise<{
+    run: WorkflowRun;
+    context: Record<string, unknown>;
+  }> {
+    const run = await workflows.createWorkflowRun({
+      conversation_id: conversationId,
+      workflow_name: 'factory-human-input',
+      user_message: 'test',
+    });
+    await workflows.updateWorkflowRun(run.id, { status: 'running' });
+    const context = {
+      version: 'archon.factory-human-input.v1',
+      runId: run.id,
+      nodeId: 'implement',
+      invocationId: 'invocation-1',
+      requestDigest: 'request-digest-1',
+      leaseId: 'lease-1',
+      launchId: 'launch-1',
+      attemptId: 'attempt-1',
+      message: 'Which migration path should I use?',
+      reason: 'ambiguous migration',
+      sessionId: 'session-before-pause',
+      requestedAt: '2026-09-07T12:00:00.000Z',
+    };
+    await workflows.pauseWorkflowRunForFactoryHumanInput(run.id, context as never);
+    return { run: await getRun(run.id), context };
+  }
+
+  test('exact factory human-input response is receipt-backed and resumable', async () => {
+    const { run } = await pausedForFactoryInput();
+    expect(run.status).toBe('paused');
+    const binding = {
+      commandId: randomUUID(),
+      expectedNodeId: 'implement',
+      expectedInvocationId: 'invocation-1',
+      expectedRequestDigest: 'request-digest-1',
+      expectedLeaseId: 'lease-1',
+    };
+    const receipt = await operations.respondToFactoryHumanInputConditionally(
+      run.id,
+      'Use the additive migration path.',
+      binding
+    );
+    expect(receipt).toMatchObject({ ok: true, runId: run.id, resumable: true });
+    expect(
+      await operations.respondToFactoryHumanInputConditionally(
+        run.id,
+        'Use the additive migration path.',
+        binding
+      )
+    ).toEqual(receipt);
+    const stored = (await getRun(run.id)).metadata.factory_human_input as {
+      response?: { text?: string };
+    };
+    expect(stored.response?.text).toBe('Use the additive migration path.');
+    expect(await workflows.consumeFactoryHumanInputResponse(run.id, stored as never)).toEqual({
+      consumed: false,
+    });
+    expect((await workflows.resumeWorkflowRun(run.id)).status).toBe('running');
+    expect(await workflows.consumeFactoryHumanInputResponse(run.id, stored as never)).toEqual({
+      consumed: true,
+    });
+    expect(await workflows.consumeFactoryHumanInputResponse(run.id, stored as never)).toEqual({
+      consumed: false,
+    });
+  });
+
+  test('factory human-input pause preserves prior approval proof but response cannot resolve gates', async () => {
+    const { run: gated } = await paused();
+    const approval = (await getRun(gated.id)).metadata.approval;
+    await workflows.updateWorkflowRun(gated.id, { status: 'running' });
+    await workflows.pauseWorkflowRunForFactoryHumanInput(gated.id, {
+      version: 'archon.factory-human-input.v1',
+      runId: gated.id,
+      nodeId: 'implement',
+      invocationId: 'invocation-after-gate',
+      requestDigest: 'request-digest-after-gate',
+      leaseId: 'lease-after-gate',
+      launchId: 'launch-after-gate',
+      attemptId: 'attempt-after-gate',
+      message: 'Clarify implementation detail',
+      requestedAt: '2026-09-07T12:00:00.000Z',
+    } as never);
+    const pausedRun = await getRun(gated.id);
+    expect(pausedRun.metadata.approval).toEqual(approval);
+    expect(pausedRun.metadata.factory_human_input).toMatchObject({
+      invocationId: 'invocation-after-gate',
+    });
+    const receipt = await operations.respondToFactoryHumanInputConditionally(
+      gated.id,
+      'Use the approved plan context.',
+      {
+        commandId: randomUUID(),
+        expectedNodeId: 'implement',
+        expectedInvocationId: 'invocation-after-gate',
+        expectedRequestDigest: 'request-digest-after-gate',
+        expectedLeaseId: 'lease-after-gate',
+      }
+    );
+    expect(receipt).toMatchObject({ ok: true, occurrenceId: 'invocation-after-gate' });
+    const responded = await getRun(gated.id);
+    expect(responded.metadata.approval).toEqual(approval);
+    expect((responded.metadata.approval as { resolved?: unknown }).resolved).toBeUndefined();
+  });
+
+  test('generic resume is blocked until the exact factory human-input response is recorded', async () => {
+    const { run } = await pausedForFactoryInput();
+    await db.query('UPDATE remote_agent_workflow_runs SET working_path = $2 WHERE id = $1', [
+      run.id,
+      '/tmp/factory-human-input',
+    ]);
+    expect(
+      await workflows.findResumableRun('factory-human-input', '/tmp/factory-human-input')
+    ).toBeNull();
+    await expect(workflows.resumeWorkflowRun(run.id)).rejects.toThrow(/not resumable/);
+    const binding = {
+      commandId: randomUUID(),
+      expectedNodeId: 'implement',
+      expectedInvocationId: 'invocation-1',
+      expectedRequestDigest: 'request-digest-1',
+      expectedLeaseId: 'lease-1',
+    };
+    expect(
+      await operations.respondToFactoryHumanInputConditionally(
+        run.id,
+        'Use the additive migration path.',
+        binding
+      )
+    ).toMatchObject({ ok: true, resumable: true });
+    expect(
+      await workflows.findResumableRun('factory-human-input', '/tmp/factory-human-input')
+    ).toMatchObject({ id: run.id });
+    expect((await workflows.resumeWorkflowRun(run.id)).status).toBe('running');
+  });
+
+  test('stale factory human-input identity cannot resolve a different pause', async () => {
+    const { run } = await pausedForFactoryInput();
+    const receipt = await operations.respondToFactoryHumanInputConditionally(
+      run.id,
+      'Use the risky path.',
+      {
+        commandId: randomUUID(),
+        expectedNodeId: 'implement',
+        expectedInvocationId: 'other-invocation',
+        expectedRequestDigest: 'request-digest-1',
+        expectedLeaseId: 'lease-1',
+      }
+    );
+    expect(receipt).toMatchObject({ ok: false, code: 'stale_factory_human_input' });
+    const stored = (await getRun(run.id)).metadata.factory_human_input as {
+      response?: unknown;
+    };
+    expect(stored.response).toBeUndefined();
+  });
+});
