@@ -43,6 +43,29 @@ test('legacy config aliases and incomplete lease receipts fail closed', () => {
   expect(leaseSchema.safeParse(withoutVersion).success).toBe(false);
 });
 
+test('budgeted lease receipts require a complete positive reservation pair while legacy receipts remain valid', () => {
+  const budgeted = {
+    ...golden.lease,
+    budgetReservationId: 'budget:fixture',
+    admittedActiveExecutionSeconds: 60,
+  };
+  expect(leaseSchema.parse(budgeted)).toMatchObject({
+    budgetReservationId: 'budget:fixture',
+    admittedActiveExecutionSeconds: 60,
+  });
+  expect(
+    leaseSchema.parse({ ...budgeted, admittedActiveExecutionSeconds: 0.5 })
+      .admittedActiveExecutionSeconds
+  ).toBe(0.5);
+  const { budgetReservationId, ...missingReservation } = budgeted;
+  void budgetReservationId;
+  expect(leaseSchema.safeParse(missingReservation).success).toBe(false);
+  expect(leaseSchema.safeParse({ ...budgeted, admittedActiveExecutionSeconds: 0 }).success).toBe(
+    false
+  );
+  expect(leaseSchema.parse(golden.lease).leaseId).toBe(golden.lease.leaseId);
+});
+
 test('strict broker bindings retain the bridge execution identity while legacy envelopes remain valid', () => {
   const extended = structuredClone(golden.config);
   const executionIdentity = {

@@ -33,6 +33,8 @@ test('actual registry consumes a one-shot FD and broker lease without forwarding
                 requestDigest: body.requestDigest,
                 leaseId: 'fixture-lease',
                 leaseExpiresAt: new Date(Date.now() + 60000).toISOString(),
+                budgetReservationId: 'budget:fixture',
+                admittedActiveExecutionSeconds: 60,
               }
             : { outcome: body.outcome }
         )

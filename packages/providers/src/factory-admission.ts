@@ -44,6 +44,8 @@ export interface AdmissionLease {
   requestDigest: string;
   leaseId: string;
   leaseExpiresAt: string;
+  budgetReservationId?: string;
+  admittedActiveExecutionSeconds?: number;
 }
 export interface AdmissionBroker {
   acquire(request: AdmissionRequest): Promise<AdmissionLease>;

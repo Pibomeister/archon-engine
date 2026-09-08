@@ -9,6 +9,7 @@ import { factoryRequestDigest } from './factory-digest';
 
 const text = z.string().min(1).max(4096);
 const finitePositiveInteger = z.number().int().positive().finite();
+const finitePositive = z.number().positive().finite();
 export const factoryBindingSchema = z
   .object({
     machineId: text,
@@ -88,8 +89,19 @@ export const leaseSchema = z
     requestDigest: text,
     leaseId: text,
     leaseExpiresAt: z.iso.datetime(),
+    budgetReservationId: text.optional(),
+    admittedActiveExecutionSeconds: finitePositive.optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((lease, context) => {
+    const hasReservation = lease.budgetReservationId !== undefined;
+    const hasActiveSeconds = lease.admittedActiveExecutionSeconds !== undefined;
+    if (hasReservation === hasActiveSeconds) return;
+    context.addIssue({
+      code: 'custom',
+      message: 'budgetReservationId and admittedActiveExecutionSeconds must be supplied together',
+    });
+  });
 
 function readConfig(fd: number): BrokerConfig {
   if (!Number.isInteger(fd) || fd < 3 || fd > 64) throw new Error('factory_broker_fd_invalid');
