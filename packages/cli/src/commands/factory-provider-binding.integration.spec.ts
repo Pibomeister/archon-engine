@@ -78,6 +78,13 @@ nodes:
   base.providerPolicy.allowedWriteRoots = [project];
   base.providerPolicy.allowedReadRoots = [project];
   base.providerPolicy.deniedRoots = [manual];
+  Object.assign(base.managedRun, {
+    launchKey: 'launch:binding-parent',
+    commandId: 'command:binding-parent',
+    originalReadyBaseRevision: 'a'.repeat(40),
+    executionBaseRevision: 'b'.repeat(40),
+    repairAttemptId: 'repair:binding-parent',
+  });
 
   async function invoke(
     args: string[],
@@ -154,6 +161,9 @@ nodes:
     );
     expect(existsSync(join(project, 'after-successor.txt'))).toBe(false);
   }
+  const launchIntent = await invoke(['launch-intent', 'binding-parent', 'Parent'], base);
+  expect(launchIntent.code, launchIntent.stdout + launchIntent.stderr).toBe(0);
+  expect(JSON.parse(launchIntent.stdout)).toMatchObject({ ok: true });
   const launched = await invoke(
     ['run', 'binding-parent', 'Parent', '--launch-key', 'binding-parent-one'],
     base
@@ -168,6 +178,13 @@ nodes:
   expect(marker.runtimeBundleId).toBe(base.managedRun.runtimeBundleId);
   expect(marker.runtimeBindingDigest).toBe(base.managedRun.runtimeBindingDigest);
   expect(marker.worktreePath).toBe(project);
+  expect(marker).toMatchObject({
+    launchKey: 'launch:binding-parent',
+    commandId: 'command:binding-parent',
+    originalReadyBaseRevision: 'a'.repeat(40),
+    executionBaseRevision: 'b'.repeat(40),
+    repairAttemptId: 'repair:binding-parent',
+  });
   const approval = parent.metadata.approval as { occurrenceId: string; evidenceDigest: string };
   const accepted = await invoke([
     'respond',

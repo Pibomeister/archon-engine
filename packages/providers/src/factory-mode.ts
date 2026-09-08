@@ -23,6 +23,12 @@ export const factoryBindingSchema = z
     projectId: text,
     /** Control command/launch key for this native invocation chain. */
     launchId: text.optional(),
+    /** The command identity and frozen execution baseline issued by Control. */
+    launchKey: text.optional(),
+    commandId: text.optional(),
+    originalReadyBaseRevision: text.optional(),
+    executionBaseRevision: text.optional(),
+    repairAttemptId: text.optional(),
   })
   .strict();
 export const configSchema = z

@@ -43,6 +43,25 @@ test('legacy config aliases and incomplete lease receipts fail closed', () => {
   expect(leaseSchema.safeParse(withoutVersion).success).toBe(false);
 });
 
+test('strict broker bindings retain the bridge execution identity while legacy envelopes remain valid', () => {
+  const extended = structuredClone(golden.config);
+  const executionIdentity = {
+    launchKey: 'launch:fixture',
+    commandId: 'command:fixture',
+    originalReadyBaseRevision: 'a'.repeat(40),
+    executionBaseRevision: 'b'.repeat(40),
+    repairAttemptId: 'repair:fixture',
+  };
+  Object.assign(extended.managedRun, executionIdentity);
+
+  const parsed = configSchema.parse(extended);
+  const { worktreePath, ...binding } = parsed.managedRun;
+  void worktreePath;
+  expect(factoryBindingSchema.parse(binding)).toMatchObject(executionIdentity);
+  expect(factoryMarkerForConfig(parsed)).toMatchObject(executionIdentity);
+  expect(configSchema.parse(golden.config).managedRun).not.toHaveProperty('commandId');
+});
+
 test('factory provider policy accepts only finite explicit limit values', () => {
   type Limits = {
     maxInvocations: number;

@@ -58,6 +58,11 @@ test('actual registry consumes a one-shot FD and broker lease without forwarding
       runtimeBundleId: 'runtime:fixture',
       runtimeBindingDigest: 'sha256:runtime',
       projectId: 'project:fixture',
+      launchKey: 'launch:fixture',
+      commandId: 'command:fixture',
+      originalReadyBaseRevision: 'a'.repeat(40),
+      executionBaseRevision: 'b'.repeat(40),
+      repairAttemptId: 'repair:fixture',
       worktreePath: worktree,
     };
     const config = {
