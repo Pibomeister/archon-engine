@@ -625,6 +625,121 @@ async function gatherDescendantRunIds(deps: WorkflowDeps, rootId: string): Promi
   return out;
 }
 
+function childFailOutcome(error: string, childRunId = ''): ChildWorkflowOutcome {
+  return { childRunId, status: 'failed', error };
+}
+
+async function resolveChildWorkflowForNode(
+  deps: WorkflowDeps,
+  cwd: string,
+  childWorkflowName: string
+): Promise<WorkflowDefinition | ChildWorkflowOutcome> {
+  try {
+    const { workflows } = await discoverWorkflowsWithConfig(cwd, deps.loadConfig);
+    const childWorkflow = resolveWorkflowName(
+      childWorkflowName,
+      workflows.map(w => w.workflow)
+    );
+    return childWorkflow ?? childFailOutcome(`Unknown sub-run workflow '${childWorkflowName}'.`);
+  } catch (err) {
+    return childFailOutcome(
+      `Failed to resolve sub-run '${childWorkflowName}': ${(err as Error).message}`
+    );
+  }
+}
+
+async function validateChildWorkflowAncestry(
+  deps: WorkflowDeps,
+  parentRun: WorkflowRun,
+  childWorkflow: WorkflowDefinition
+): Promise<ChildWorkflowOutcome | null> {
+  let ancestry: WorkflowRun[];
+  try {
+    ancestry = [parentRun, ...(await deps.store.getRunAncestry(parentRun.id))];
+  } catch (err) {
+    return childFailOutcome(
+      `Failed to resolve run ancestry for sub-run guard: ${(err as Error).message}`
+    );
+  }
+  if (ancestry.some(a => a.workflow_name === childWorkflow.name)) {
+    return childFailOutcome(
+      `Sub-run cycle detected: '${childWorkflow.name}' is already an ancestor of this run.`
+    );
+  }
+  if (ancestry.length >= CHILD_WORKFLOW_DEPTH_CAP) {
+    return childFailOutcome(
+      `Sub-run depth cap (${String(CHILD_WORKFLOW_DEPTH_CAP)}) exceeded nesting '${childWorkflow.name}'.`
+    );
+  }
+  return null;
+}
+
+interface ChildCwdResolution {
+  childCwd: string;
+  childIsolationEnv?: ChildIsolationResult;
+}
+
+async function resolveChildWorkflowCwd(
+  args: RunChildWorkflowArgs,
+  resolveChildIsolation?: ChildIsolationResolver
+): Promise<ChildCwdResolution | ChildWorkflowOutcome> {
+  const {
+    childWorkflowName,
+    cwd,
+    parentRun,
+    nodeId,
+    childIndex,
+    codebaseId,
+    isolation,
+    resumeFailedChild,
+  } = args;
+  if (resumeFailedChild) {
+    const priorPath = resumeFailedChild.working_path;
+    if (priorPath && !existsSync(priorPath)) {
+      return childFailOutcome(
+        `Cannot resume sub-run '${childWorkflowName}': its working path no longer exists ` +
+          `(${priorPath}). The worktree may have been cleaned up — start a fresh run.`,
+        resumeFailedChild.id
+      );
+    }
+    if (!priorPath) {
+      return childFailOutcome(
+        `Cannot resume sub-run '${childWorkflowName}': its run row has no recorded working ` +
+          'path, so the checkout it ran in is unknown — start a fresh run.',
+        resumeFailedChild.id
+      );
+    }
+    return { childCwd: priorPath };
+  }
+  if (isolation !== 'worktree') return { childCwd: cwd };
+  if (!resolveChildIsolation) {
+    return childFailOutcome(
+      `isolation: 'worktree' on sub-run '${childWorkflowName}' requires an injected ` +
+        'child-isolation resolver (available for git-repo codebases run via the CLI or ' +
+        "orchestrator). Remove the isolation or use 'inherit' (shared checkout)."
+    );
+  }
+  try {
+    const childIsolationEnv = await resolveChildIsolation.resolve({
+      parentRun,
+      nodeId,
+      childIndex,
+      codebaseId,
+    });
+    return { childCwd: childIsolationEnv.cwd, childIsolationEnv };
+  } catch (err) {
+    return childFailOutcome(
+      `Failed to create isolated worktree for sub-run '${childWorkflowName}': ${(err as Error).message}`
+    );
+  }
+}
+
+function isChildWorkflowOutcome(
+  value: ChildCwdResolution | WorkflowDefinition | ChildWorkflowOutcome
+): value is ChildWorkflowOutcome {
+  return 'status' in value && 'childRunId' in value;
+}
+
 /**
  * Start (or resume a failed) child workflow run in-process for a `workflow:` node
  * (#2121 Phase 2). Reuses the FULL executeWorkflow lifecycle for the child —
@@ -650,148 +765,25 @@ async function runChildWorkflow(
     nodeId,
     childWorkflowName,
     input,
-    cwd,
     conversationId,
     conversationDbId,
     userId,
     codebaseId,
-    isolation,
     childIndex,
     itemHash,
     resumeFailedChild,
   } = args;
 
-  // Every failure below returns a `{ status: 'failed' }` outcome (never throws);
-  // `childRunId` defaults to '' for failures before a child row exists.
-  const failOutcome = (error: string, childRunId = ''): ChildWorkflowOutcome => ({
-    childRunId,
-    status: 'failed',
-    error,
-  });
+  const childWorkflowResult = await resolveChildWorkflowForNode(deps, args.cwd, childWorkflowName);
+  if (isChildWorkflowOutcome(childWorkflowResult)) return childWorkflowResult;
+  const childWorkflow = childWorkflowResult;
 
-  // 1. Resolve the child workflow by NAME (static target — constitution guardrail).
-  //    Resolution runs BEFORE the cycle check so a case-variant / suffix / substring
-  //    reference to an ancestor (e.g. `workflow: SELFIE` naming its own run) is caught
-  //    as a cycle by canonical name, not left to the less-informative depth cap.
-  let childWorkflow: WorkflowDefinition | undefined;
-  try {
-    // DELIBERATE AFFORDANCE — do not "fix" this by adding a load-time existence
-    // check for `workflow:` targets. Discovery runs HERE, when the node executes,
-    // so a run can author a workflow mid-flight and then execute it as a governed
-    // child run; a load-time check would compile, pass every existing test, and
-    // silently delete that capability. Recorded in the constitution's case-law
-    // table (reference/workflow-language-constitution.md) and locked by
-    // `describe('workflow: late resolution is a deliberate affordance')` in
-    // subrun.test.ts.
-    const { workflows } = await discoverWorkflowsWithConfig(cwd, deps.loadConfig);
-    childWorkflow = resolveWorkflowName(
-      childWorkflowName,
-      workflows.map(w => w.workflow)
-    );
-  } catch (err) {
-    // resolveWorkflowName throws only on ambiguity.
-    return failOutcome(
-      `Failed to resolve sub-run '${childWorkflowName}': ${(err as Error).message}`
-    );
-  }
-  if (!childWorkflow) {
-    return failOutcome(`Unknown sub-run workflow '${childWorkflowName}'.`);
-  }
+  const ancestryError = await validateChildWorkflowAncestry(deps, parentRun, childWorkflow);
+  if (ancestryError) return ancestryError;
 
-  // 2. Cycle guard + depth cap (D9), compared against the RESOLVED canonical name.
-  //    The child's ancestor chain is the parent plus the parent's ancestors; a
-  //    resolved target already in the chain is a cycle.
-  let ancestry: WorkflowRun[];
-  try {
-    ancestry = [parentRun, ...(await deps.store.getRunAncestry(parentRun.id))];
-  } catch (err) {
-    return failOutcome(
-      `Failed to resolve run ancestry for sub-run guard: ${(err as Error).message}`
-    );
-  }
-  if (ancestry.some(a => a.workflow_name === childWorkflow.name)) {
-    return failOutcome(
-      `Sub-run cycle detected: '${childWorkflow.name}' is already an ancestor of this run.`
-    );
-  }
-  if (ancestry.length >= CHILD_WORKFLOW_DEPTH_CAP) {
-    return failOutcome(
-      `Sub-run depth cap (${String(CHILD_WORKFLOW_DEPTH_CAP)}) exceeded nesting '${childWorkflow.name}'.`
-    );
-  }
-
-  // 3. Resolve the child's execution cwd (slice 2, PR-A). `isolation: 'worktree'`
-  //    runs the child in its own git worktree obtained from the injected resolver.
-  //    A resume whose child run row still exists reuses that row's recorded path
-  //    instead of resolving again; a resume whose child row is GONE (never written,
-  //    or deleted) falls through to the fresh-spawn path and does re-resolve —
-  //    safely, because the identifier is deterministic per (parent, node, index)
-  //    and the env-row write is an upsert (see child-isolation-resolver.ts).
-  //    `inherit` (or undefined) shares the parent's checkout — slice-1 behavior.
-  //    Resolving AFTER the name + cycle guards means a bad reference never leaves an
-  //    orphan worktree behind. The resolver throwing surfaces as a failed outcome
-  //    (never a silent shared-checkout fallback — a parallel write into the shared
-  //    checkout is the exact collision worktree isolation prevents).
-  let childCwd: string;
-  // Populated only when THIS spawn created a fresh isolated worktree — its env id +
-  // branch are stamped into the child's metadata (S3; PR-E console grouping reads it).
-  let childIsolationEnv: ChildIsolationResult | undefined;
-  if (resumeFailedChild) {
-    // Reuse the child's own recorded working_path: its worktree for an isolated
-    // child, the shared parent checkout for `inherit`. Reaching this branch at all
-    // means the child row survived, so there is nothing to re-resolve.
-    const priorPath = resumeFailedChild.working_path;
-    // An isolated child's worktree can be pruned by `isolation cleanup`/`complete`
-    // between its failure and this resume. Reusing a vanished path would surface as a
-    // deep ENOENT mid-run; fail fast with the same guidance the top-level CLI resume
-    // gives (workflow.ts resume precedent).
-    if (priorPath && !existsSync(priorPath)) {
-      return failOutcome(
-        `Cannot resume sub-run '${childWorkflowName}': its working path no longer exists ` +
-          `(${priorPath}). The worktree may have been cleaned up — start a fresh run.`,
-        resumeFailedChild.id
-      );
-    }
-    // `working_path` is nullable in the schema, and falling back to the parent's
-    // `cwd` here would be the one silent shared-checkout fallback in this function —
-    // for an ISOLATED child that is exactly the concurrent-write collision the
-    // isolation was requested to prevent. Unreachable today (every child row is
-    // created with a real path, see the createWorkflowRun call below), so this is
-    // defense-in-depth: fail loudly rather than resume somewhere the author didn't ask for.
-    if (!priorPath) {
-      return failOutcome(
-        `Cannot resume sub-run '${childWorkflowName}': its run row has no recorded working ` +
-          'path, so the checkout it ran in is unknown — start a fresh run.',
-        resumeFailedChild.id
-      );
-    }
-    childCwd = priorPath;
-  } else if (isolation === 'worktree') {
-    if (!resolveChildIsolation) {
-      return failOutcome(
-        `isolation: 'worktree' on sub-run '${childWorkflowName}' requires an injected ` +
-          'child-isolation resolver (available for git-repo codebases run via the CLI or ' +
-          "orchestrator). Remove the isolation or use 'inherit' (shared checkout)."
-      );
-    }
-    try {
-      childIsolationEnv = await resolveChildIsolation.resolve({
-        parentRun,
-        nodeId,
-        childIndex,
-        codebaseId,
-      });
-      childCwd = childIsolationEnv.cwd;
-    } catch (err) {
-      // The resolver already classified + logged the failure (child-isolation-resolver);
-      // prepend the sub-run context for the node-facing outcome.
-      return failOutcome(
-        `Failed to create isolated worktree for sub-run '${childWorkflowName}': ${(err as Error).message}`
-      );
-    }
-  } else {
-    childCwd = cwd;
-  }
+  const cwdResult = await resolveChildWorkflowCwd(args, resolveChildIsolation);
+  if (isChildWorkflowOutcome(cwdResult)) return cwdResult;
+  const { childCwd, childIsolationEnv } = cwdResult;
 
   // 4. Create the child run row (fresh) or hydrate the failed one (resume path).
   let childOpts: ExecuteWorkflowOptions;
@@ -850,7 +842,7 @@ async function runChildWorkflow(
       childRunId = childRun.id;
     }
   } catch (err) {
-    return failOutcome(
+    return childFailOutcome(
       `Failed to create sub-run '${childWorkflowName}': ${(err as Error).message}`
     );
   }
@@ -874,7 +866,7 @@ async function runChildWorkflow(
     //    tokens). Works for synchronous completion AND a child paused at its gate.
     const finalChild = await deps.store.getWorkflowRun(childRunId);
     if (!finalChild) {
-      return failOutcome('Child run row disappeared after execution.', childRunId);
+      return childFailOutcome('Child run row disappeared after execution.', childRunId);
     }
     return childOutcomeFromRun(finalChild);
   } catch (err) {
@@ -894,9 +886,21 @@ async function runChildWorkflow(
     await deps.store.cancelWorkflowRun(childRunId).catch((cancelErr: unknown) => {
       getLog().error({ err: cancelErr as Error, childRunId }, 'workflow.child_setup_cancel_failed');
     });
-    return failOutcome(
+    return childFailOutcome(
       `Sub-run '${childWorkflowName}' errored: ${(err as Error).message}`,
       childRunId
+    );
+  }
+}
+
+function logMalformedChildWorkflowGate(parent: WorkflowRun, childRunId: string): void {
+  const approval = isApprovalContext(parent.metadata?.approval)
+    ? parent.metadata.approval
+    : undefined;
+  if (approval?.type === 'child_workflow' && !approval.childRunId) {
+    getLog().error(
+      { parentRunId: parent.id, childRunId },
+      'workflow.parent_resume_malformed_gate_missing_child_run_id'
     );
   }
 }
@@ -974,15 +978,7 @@ async function maybeResumeParentRun(
     // Paused but not blocked on this child. Distinguish a MALFORMED child_workflow
     // gate (missing childRunId — an invariant violation that would wedge the parent
     // forever; make it loud) from a normal different-child / non-child gate (silent).
-    const approval = isApprovalContext(parent.metadata?.approval)
-      ? parent.metadata.approval
-      : undefined;
-    if (approval?.type === 'child_workflow' && !approval.childRunId) {
-      getLog().error(
-        { parentRunId, childRunId: childRun.id },
-        'workflow.parent_resume_malformed_gate_missing_child_run_id'
-      );
-    }
+    logMalformedChildWorkflowGate(parent, childRun.id);
     return;
   }
 
@@ -1086,158 +1082,125 @@ async function maybeResumeParentRun(
   }
 }
 
-/**
- * Execute a complete DAG-based workflow.
- *
- * Required positional args carry identity and dependencies. Everything else
- * lives in `opts` ({@link ExecuteWorkflowOptions}). To resume a prior run,
- * call {@link hydrateResumableRun} first and spread its result into `opts` —
- * the executor does not perform resume detection on its own.
- */
-export async function executeWorkflow(
+interface WorkflowProviderResolution {
+  resolvedProvider: string;
+  resolvedModel?: string;
+  workflowPreset?: ModelAliasPreset;
+  aiProfile: ResolvedAiProfile;
+  userAiPrefs: UserAiPrefsLayer;
+}
+
+type WorkflowPathBundle = Awaited<ReturnType<typeof resolveProjectPaths>> & {
+  scopeArtifactsDir?: string;
+};
+
+async function guardPinnedRun(
   deps: WorkflowDeps,
   platform: IWorkflowPlatform,
   conversationId: string,
-  cwd: string,
   workflow: WorkflowDefinition,
-  userMessage: string,
-  conversationDbId: string,
-  opts: ExecuteWorkflowOptions = {}
-): Promise<WorkflowExecutionResult> {
-  const {
-    codebaseId,
-    issueContext,
-    isolationContext,
-    parentConversationId,
-    preCreatedRun,
-    priorCompletedNodes,
-    priorTokenUsage,
-    userId,
-    source,
-    parseWarnings,
-    baseBranch: callerBaseBranch,
-    baseOverride: callerBaseOverride,
-    execContext = { kind: 'host' },
-    container: containerCtx,
-    resolveChildIsolation,
-  } = opts;
-
+  source: WorkflowSource | undefined,
+  preCreatedRun: WorkflowRun | undefined,
+  execContext: ExecutionContext
+): Promise<WorkflowExecutionResult | null> {
   const workflowPin = buildWorkflowPinState(workflow, source);
-  if (preCreatedRun && workflowRunRequiresPin(workflow, preCreatedRun, execContext)) {
-    try {
-      assertWorkflowPinMatchesRun(preCreatedRun, workflowPin);
-    } catch (error) {
-      const msg = (error as Error).message;
-      getLog().warn(
-        { workflowRunId: preCreatedRun.id, workflowName: workflow.name, error: msg },
-        'workflow.pin_validation_failed'
-      );
-      await deps.store.failWorkflowRun(preCreatedRun.id, msg).catch((err: unknown) => {
-        getLog().error(
-          { err, workflowRunId: preCreatedRun.id },
-          'workflow.pin_validation_fail_record_failed'
-        );
-      });
-      await safeSendMessage(platform, conversationId, `⚠️ ${msg}`);
-      return { success: false, workflowRunId: preCreatedRun.id, error: msg };
-    }
-  }
-
-  // Guard: a container run MUST be resumed with its container rewired (the CLI does
-  // this via backend.resumeEnv, threading a `container` context). A resume that
-  // reaches here for a container run WITHOUT that context — e.g. approving a
-  // --container run from chat/web, which has no docker backend wired — would run
-  // host-side and SILENTLY skip the write-back apply, losing the approved changes.
-  // Fail loudly and point at the CLI instead; the run stays resumable (failed) so
-  // the CLI can rediscover the container and apply.
-  if (preCreatedRun?.metadata?.isolation === 'container' && !containerCtx) {
-    const msg =
-      `Run '${preCreatedRun.id}' executed inside an isolation container. Resume it from the ` +
-      'CLI in the same project (`archon workflow approve/reject/resume <id>`), where the ' +
-      'container is rediscovered — chat/web resume cannot rewire it.';
-    getLog().warn({ workflowRunId: preCreatedRun.id }, 'workflow.container_resume_without_backend');
+  if (!preCreatedRun || !workflowRunRequiresPin(workflow, preCreatedRun, execContext)) return null;
+  try {
+    assertWorkflowPinMatchesRun(preCreatedRun, workflowPin);
+    return null;
+  } catch (error) {
+    const msg = (error as Error).message;
+    getLog().warn(
+      { workflowRunId: preCreatedRun.id, workflowName: workflow.name, error: msg },
+      'workflow.pin_validation_failed'
+    );
     await deps.store.failWorkflowRun(preCreatedRun.id, msg).catch((err: unknown) => {
       getLog().error(
         { err, workflowRunId: preCreatedRun.id },
-        'workflow.container_resume_guard_fail_failed'
+        'workflow.pin_validation_fail_record_failed'
       );
     });
     await safeSendMessage(platform, conversationId, `⚠️ ${msg}`);
     return { success: false, workflowRunId: preCreatedRun.id, error: msg };
   }
+}
 
-  // Load config once for the entire workflow execution
-  const isolatedExecution =
-    execContext.kind === 'container' || workflow.hardened?.required === true;
+async function guardContainerResume(
+  deps: WorkflowDeps,
+  platform: IWorkflowPlatform,
+  conversationId: string,
+  preCreatedRun: WorkflowRun | undefined,
+  containerCtx: ContainerRunContext | undefined
+): Promise<WorkflowExecutionResult | null> {
+  if (preCreatedRun?.metadata?.isolation !== 'container' || containerCtx) return null;
+  const msg =
+    `Run '${preCreatedRun.id}' executed inside an isolation container. Resume it from the ` +
+    'CLI in the same project (`archon workflow approve/reject/resume <id>`), where the ' +
+    'container is rediscovered — chat/web resume cannot rewire it.';
+  getLog().warn({ workflowRunId: preCreatedRun.id }, 'workflow.container_resume_without_backend');
+  await deps.store.failWorkflowRun(preCreatedRun.id, msg).catch((err: unknown) => {
+    getLog().error(
+      { err, workflowRunId: preCreatedRun.id },
+      'workflow.container_resume_guard_fail_failed'
+    );
+  });
+  await safeSendMessage(platform, conversationId, `⚠️ ${msg}`);
+  return { success: false, workflowRunId: preCreatedRun.id, error: msg };
+}
+
+async function buildExecutionConfig(
+  deps: WorkflowDeps,
+  cwd: string,
+  codebaseId: string | undefined,
+  userId: string | undefined,
+  isolatedExecution: boolean
+): Promise<WorkflowConfig> {
   const fileConfig = await deps.loadConfig(cwd);
   const dbEnvVars =
     !isolatedExecution && codebaseId ? await deps.store.getCodebaseEnvVars(codebaseId) : {};
-  // Resolve a fresh bot GitHub token once at workflow start when:
-  //   (a) the codebase URL is a github.com repo, and
-  //   (b) deps.resolveBotGitHubToken is registered (App mode).
-  // Injected into envVars so bash/script subprocesses authenticate `gh` and
-  // initial `git push` via inherited GH_TOKEN. Workflows that run >1h still
-  // need the credential helper for live token rotation (handled at clone
-  // time in the GitHub adapter), but the env injection is enough for the
-  // typical <1h workflow.
   const botGitHubEnv = isolatedExecution
     ? {}
     : await resolveBotGitHubEnvForWorkflow(deps, codebaseId);
   const userGitHubEnv = isolatedExecution
     ? {}
     : await resolveUserGithubEnvForWorkflow(deps, userId);
-  const config: WorkflowConfig = {
+  return {
     ...fileConfig,
-    // Order: file < db < bot-token < per-user. Per-codebase env vars are
-    // operator-set; the injected bot token is system-set; the per-user override
-    // wins last so a run routes through the originating human's token (or scrubs
-    // the org/bot token when they haven't connected). Empty-string values from
-    // the per-user policy scrub the corresponding key via the subprocess merge.
     envVars: isolatedExecution
       ? {}
       : { ...fileConfig.envVars, ...dbEnvVars, ...botGitHubEnv, ...userGitHubEnv },
   };
-  const configuredCommandFolder = config.commands.folder;
+}
 
-  // Resolve base branch: the per-dispatch override takes priority, then repo
-  // config, then the caller-provided codebase default, then git auto-detection.
-  // The override must outrank config so `--base` reports the same branch the
-  // worktree was cut from (WorktreeProvider applies the same order).
-  // If detection fails, leave empty — substituteWorkflowVariables throws only if $BASE_BRANCH is referenced.
+async function resolveBaseBranchForWorkflow(
+  deps: WorkflowDeps,
+  cwd: string,
+  codebaseId: string | undefined,
+  config: WorkflowConfig,
+  callerBaseBranch: string | undefined,
+  callerBaseOverride: string | undefined
+): Promise<string> {
   const overrideBaseBranch = callerBaseOverride?.trim();
   const fallbackBaseBranch = callerBaseBranch?.trim();
-  let baseBranch: string;
-  if (overrideBaseBranch) {
-    baseBranch = overrideBaseBranch;
-  } else if (config.baseBranch) {
-    baseBranch = config.baseBranch;
-  } else if (fallbackBaseBranch) {
-    baseBranch = fallbackBaseBranch;
-  } else if (await isFolderCodebase(deps, codebaseId)) {
-    // Folder projects run on a non-git root — auto-detection can only fail and
-    // emit ERROR/WARN noise on every run (#2159). Leave empty; $BASE_BRANCH
-    // stays unresolved and throws only if a prompt actually references it.
-    baseBranch = '';
-  } else {
-    try {
-      baseBranch = await getDefaultBranch(toRepoPath(cwd));
-    } catch (error) {
-      // Intentional fallback: auto-detection failure is non-fatal.
-      // substituteWorkflowVariables throws if $BASE_BRANCH is actually referenced in a prompt.
-      getLog().warn(
-        { err: error as Error, errorType: (error as Error).constructor.name, cwd },
-        'workflow.base_branch_auto_detect_failed'
-      );
-      baseBranch = '';
-    }
+  if (overrideBaseBranch) return overrideBaseBranch;
+  if (config.baseBranch) return config.baseBranch;
+  if (fallbackBaseBranch) return fallbackBaseBranch;
+  if (await isFolderCodebase(deps, codebaseId)) return '';
+  try {
+    return await getDefaultBranch(toRepoPath(cwd));
+  } catch (error) {
+    getLog().warn(
+      { err: error as Error, errorType: (error as Error).constructor.name, cwd },
+      'workflow.base_branch_auto_detect_failed'
+    );
+    return '';
   }
+}
 
-  const docsDir = config.docsPath ?? 'docs/';
-
-  // Per-user AI prefs (Phase 3): the originating user's tiers/aliases/default-
-  // assistant override install config (highest precedence). The dep contract is
-  // non-throwing, but a third-party deps impl might throw anyway — guard so a
-  // prefs failure can never abort a run; `{}` keeps config-only behavior.
+async function resolveUserAiPrefsLayer(
+  deps: WorkflowDeps,
+  userId: string | undefined
+): Promise<UserAiPrefsLayer> {
   let userAiPrefs: UserAiPrefsLayer = {};
   if (userId && deps.getUserAiPrefs) {
     try {
@@ -1257,28 +1220,37 @@ export async function executeWorkflow(
       'workflow.user_ai_prefs_applied'
     );
   }
-  let aiProfile: ResolvedAiProfile;
+  return userAiPrefs;
+}
+
+function buildExecutionAiProfile(
+  config: WorkflowConfig,
+  userAiPrefs: UserAiPrefsLayer,
+  userId: string | undefined
+): ResolvedAiProfile {
   try {
-    aiProfile = buildAiProfile(userAiPrefs.defaultProvider ?? config.assistant, {
+    return buildAiProfile(userAiPrefs.defaultProvider ?? config.assistant, {
       repoTiers: config.tiers,
       repoAliases: config.aliases,
       userTiers: userAiPrefs.tiers,
       userAliases: userAiPrefs.aliases,
     });
   } catch (error) {
-    // Structurally invalid STORED prefs (corrupt DB row) must not kill the run
-    // before its record exists — degrade to config-only. A broken config layer
-    // still fails fast: the rebuild below rethrows the same error.
     getLog().error({ err: error as Error, userId }, 'workflow.user_ai_prefs_profile_invalid');
-    aiProfile = buildAiProfile(config.assistant, {
+    return buildAiProfile(config.assistant, {
       repoTiers: config.tiers,
       repoAliases: config.aliases,
     });
   }
+}
 
-  // Resolve provider and model once (used by all nodes). Literal model strings
-  // keep the existing workflow/provider/config chain; tier and @alias refs use
-  // the resolved preset provider/model so bundled workflows are portable.
+async function resolveWorkflowProviderAndModel(
+  platform: IWorkflowPlatform,
+  conversationId: string,
+  workflow: WorkflowDefinition,
+  config: WorkflowConfig,
+  aiProfile: ResolvedAiProfile
+): Promise<Omit<WorkflowProviderResolution, 'aiProfile' | 'userAiPrefs'>> {
   let resolvedProvider: string = workflow.provider ?? config.assistant;
   let resolvedModel: string | undefined;
   let workflowPreset: ModelAliasPreset | undefined;
@@ -1304,19 +1276,17 @@ export async function executeWorkflow(
           conversationId,
           `Warning: Workflow '${workflow.name}' sets provider '${workflow.provider}' but model '${workflow.model}' resolves to provider '${workflowModelSpec.provider}' — using '${workflowModelSpec.provider}'.`
         );
-        if (!delivered) {
+        if (!delivered)
           getLog().error(
             { workflowName: workflow.name, conversationId },
             'workflow.model_provider_conflict_warning_delivery_failed'
           );
-        }
       }
       resolvedProvider = workflowModelSpec.provider;
       resolvedModel = workflowModelSpec.model;
       providerSource = `model preset '${workflow.model}'`;
     }
   }
-
   if (!isRegisteredProvider(resolvedProvider)) {
     throw new Error(
       `Workflow '${workflow.name}': unknown provider '${resolvedProvider}'. ` +
@@ -1325,9 +1295,7 @@ export async function executeWorkflow(
           .join(', ')}`
     );
   }
-  const assistantDefaults = config.assistants[resolvedProvider];
-  resolvedModel ??= assistantDefaults?.model as string | undefined;
-
+  resolvedModel ??= config.assistants[resolvedProvider]?.model as string | undefined;
   getLog().info(
     {
       workflowName: workflow.name,
@@ -1337,277 +1305,232 @@ export async function executeWorkflow(
     },
     'workflow_provider_resolved'
   );
+  return { resolvedProvider, resolvedModel, workflowPreset };
+}
 
-  if (configuredCommandFolder) {
-    getLog().debug({ configuredCommandFolder }, 'command_folder_configured');
+async function resolveWorkflowRunRecord(
+  deps: WorkflowDeps,
+  platform: IWorkflowPlatform,
+  conversationId: string,
+  conversationDbId: string,
+  workflow: WorkflowDefinition,
+  userMessage: string,
+  cwd: string,
+  opts: ExecuteWorkflowOptions,
+  execContext: ExecutionContext,
+  workflowPin: ReturnType<typeof buildWorkflowPinState>
+): Promise<WorkflowRun | WorkflowExecutionResult> {
+  if (opts.preCreatedRun) {
+    if (opts.priorCompletedNodes !== undefined) {
+      const resumeMsg =
+        opts.priorCompletedNodes.size > 0
+          ? `▶️ **Resuming** workflow \`${workflow.name}\` — skipping ${String(opts.priorCompletedNodes.size)} already-completed node(s).\n\nNote: AI session context from prior nodes is not restored. Nodes that depend on prior context may need to re-read artifacts.`
+          : `▶️ **Resuming** workflow \`${workflow.name}\` — continuing interactive loop.`;
+      await safeSendMessage(platform, conversationId, resumeMsg);
+    }
+    return opts.preCreatedRun;
   }
-
-  // Workflow run + resume state. Caller decides whether to resume by passing
-  // preCreatedRun (from hydrateResumableRun) + priorCompletedNodes via opts.
-  // When both are absent the executor creates a fresh row below.
-  const dagPriorCompletedNodes = priorCompletedNodes;
-  const dagPriorTokenUsage = priorTokenUsage;
-  let workflowRun: WorkflowRun | undefined = preCreatedRun;
-
-  if (preCreatedRun && priorCompletedNodes !== undefined) {
-    const resumeMsg =
-      priorCompletedNodes.size > 0
-        ? `▶️ **Resuming** workflow \`${workflow.name}\` — skipping ${String(priorCompletedNodes.size)} already-completed node(s).\n\nNote: AI session context from prior nodes is not restored. Nodes that depend on prior context may need to re-read artifacts.`
-        : `▶️ **Resuming** workflow \`${workflow.name}\` — continuing interactive loop.`;
-    await safeSendMessage(platform, conversationId, resumeMsg);
+  try {
+    const workflowRun = await deps.store.createWorkflowRun({
+      workflow_name: workflow.name,
+      conversation_id: conversationDbId,
+      codebase_id: opts.codebaseId,
+      user_message: userMessage,
+      working_path: cwd,
+      metadata: {
+        ...(opts.issueContext ? { github_context: opts.issueContext } : {}),
+        ...(execContext.kind === 'container' ? { isolation: 'container' } : {}),
+        ...(opts.container ? { isolation_env_id: opts.container.envId } : {}),
+        ...(workflowRunRequiresPin(workflow, undefined, execContext)
+          ? { [WORKFLOW_PIN_METADATA_KEY]: workflowPin }
+          : {}),
+      },
+      parent_conversation_id: opts.parentConversationId,
+      user_id: opts.userId,
+    });
+    return {
+      ...workflowRun,
+      metadata: {
+        ...(workflowRun.metadata ?? {}),
+        ...(workflowRunRequiresPin(workflow, undefined, execContext)
+          ? { [WORKFLOW_PIN_METADATA_KEY]: workflowPin }
+          : {}),
+      },
+    };
+  } catch (error) {
+    getLog().error(
+      { err: error as Error, workflowName: workflow.name, conversationId },
+      'db_create_workflow_run_failed'
+    );
+    await sendCriticalMessage(
+      platform,
+      conversationId,
+      '❌ **Workflow failed**: Unable to start workflow (database error). Please try again later.'
+    );
+    return { success: false, error: 'Database error creating workflow run' };
   }
+}
 
-  if (!workflowRun) {
-    // Create workflow run record
+function isExecutionResult(value: unknown): value is WorkflowExecutionResult {
+  return typeof value === 'object' && value !== null && 'success' in value;
+}
+
+async function collectPathLockExclusions(
+  deps: WorkflowDeps,
+  workflowRun: WorkflowRun,
+  cwd: string
+): Promise<{ skipPathLock: boolean; pathLockExclude: string[] }> {
+  const pathLockExclude: string[] = [];
+  let skipPathLock = false;
+  if (workflowRun.parent_run_id) {
     try {
-      workflowRun = await deps.store.createWorkflowRun({
-        workflow_name: workflow.name,
-        conversation_id: conversationDbId,
-        codebase_id: codebaseId,
-        user_message: userMessage,
-        working_path: cwd,
-        // Record container isolation on the run itself so a later resume — a
-        // SEPARATE process with no --container flag in hand — can detect it and
-        // rediscover the container. `isolation_env_id` is the handle the resume
-        // path passes to `backend.resumeEnv()` (Phase C).
-        metadata: {
-          ...(issueContext ? { github_context: issueContext } : {}),
-          ...(execContext.kind === 'container' ? { isolation: 'container' } : {}),
-          ...(containerCtx ? { isolation_env_id: containerCtx.envId } : {}),
-          ...(workflowRunRequiresPin(workflow, undefined, execContext)
-            ? { [WORKFLOW_PIN_METADATA_KEY]: workflowPin }
-            : {}),
-        },
-        parent_conversation_id: parentConversationId,
-        user_id: userId,
-      });
-      workflowRun = {
-        ...workflowRun,
-        metadata: {
-          ...(workflowRun.metadata ?? {}),
-          ...(workflowRunRequiresPin(workflow, undefined, execContext)
-            ? { [WORKFLOW_PIN_METADATA_KEY]: workflowPin }
-            : {}),
-        },
-      };
-    } catch (error) {
-      const err = error as Error;
+      const ancestry = await deps.store.getRunAncestry(workflowRun.id);
+      pathLockExclude.push(...ancestry.map(a => a.id));
+    } catch (err) {
       getLog().error(
-        { err, workflowName: workflow.name, conversationId },
-        'db_create_workflow_run_failed'
+        { err: err as Error, workflowRunId: workflowRun.id, cwd },
+        'workflow.path_lock_ancestry_lookup_failed'
       );
-      await sendCriticalMessage(
-        platform,
-        conversationId,
-        '❌ **Workflow failed**: Unable to start workflow (database error). Please try again later.'
-      );
-      return { success: false, error: 'Database error creating workflow run' };
+      skipPathLock = true;
     }
   }
-
-  // Path-lock guard: ensure no other workflow run holds this working_path.
-  //
-  // Skipped when `workflow.mutates_checkout` is false — the author asserts
-  // that concurrent runs will not race (e.g. all writes are per-run-scoped).
-  //
-  // Runs after workflowRun is finalized (pre-created, resumed, or freshly
-  // created) so we always have self-ID + started_at for the deterministic
-  // older-wins tiebreaker. The query treats `pending` rows older than 5 min
-  // as orphaned, so leaks from crashed dispatches or resume orphans don't
-  // permanently block the path.
-  if (workflow.mutates_checkout !== false) {
+  if (!skipPathLock) {
     try {
-      // A `workflow:` sub-run and its children share ONE checkout (#2121), so the
-      // path-lock must not treat another run in this run's OWN vertical tree line as
-      // a conflict. Exclude both directions:
-      //   • ANCESTORS (upward via parent_run_id) — a child must not self-block against
-      //     its own running/paused parent on that path.
-      //   • DESCENDANTS (downward via a bounded walk) — a parent resumed while still
-      //     blocked on a paused child must re-pause on it, not self-cancel against it.
-      // Siblings are intentionally NOT excluded (see #2180). The ancestor lookup fails
-      // OPEN (skip the best-effort lock) — a false self-collision against the parent is
-      // worse than a briefly-unenforced lock; the descendant lookup fails CLOSED (run
-      // the lock with whatever we have) — most runs have no descendants, so a lost set
-      // only risks a legitimate-looking collision, never a self-collision.
-      const pathLockExclude: string[] = [];
-      let skipPathLock = false;
-      if (workflowRun.parent_run_id) {
-        try {
-          const ancestry = await deps.store.getRunAncestry(workflowRun.id);
-          pathLockExclude.push(...ancestry.map(a => a.id));
-        } catch (err) {
-          getLog().error(
-            { err: err as Error, workflowRunId: workflowRun.id, cwd },
-            'workflow.path_lock_ancestry_lookup_failed'
-          );
-          skipPathLock = true;
-        }
-      }
-      if (!skipPathLock) {
-        try {
-          const descendantIds = await gatherDescendantRunIds(deps, workflowRun.id);
-          pathLockExclude.push(...descendantIds);
-        } catch (err) {
-          getLog().warn(
-            { err: err as Error, workflowRunId: workflowRun.id, cwd },
-            'workflow.path_lock_descendant_lookup_failed'
-          );
-        }
-      }
-      const activeWorkflow = skipPathLock
-        ? null
-        : await deps.store.getActiveWorkflowRunByPath(cwd, {
-            id: workflowRun.id,
-            startedAt: new Date(parseDbTimestamp(workflowRun.started_at)),
-            ...(pathLockExclude.length > 0 ? { excludeRunIds: pathLockExclude } : {}),
-          });
-      if (activeWorkflow) {
-        // The lock query found another active row that wins the older-wins
-        // tiebreaker. Mark our own row terminal so it falls out of the
-        // active set immediately — without this, our row sits as
-        // pending/running and blocks the path until the 5-min stale window
-        // (or never, if we'd already promoted it to running via resume).
-        await deps.store
-          .updateWorkflowRun(workflowRun.id, { status: 'cancelled' })
-          .catch((cleanupErr: Error) => {
-            getLog().warn(
-              { err: cleanupErr, workflowRunId: workflowRun?.id, cwd },
-              'workflow.guard_self_cancel_failed'
-            );
-          });
-
-        const elapsedMs = Date.now() - parseDbTimestamp(activeWorkflow.started_at);
-        const duration = formatDuration(elapsedMs);
-        const shortId = activeWorkflow.id.slice(0, 8);
-
-        // Status-aware copy. The lock query returns running, paused, and
-        // fresh-pending rows — telling the user to "wait for it to finish"
-        // is wrong for `paused` (waiting on user action via approve/reject).
-        let stateLine: string;
-        let actionLines: string;
-        if (activeWorkflow.status === 'paused') {
-          stateLine = `paused waiting for user input (${duration} since started, run \`${shortId}\`)`;
-          actionLines =
-            `• Approve it: \`/workflow approve ${shortId}\`\n` +
-            `• Reject it: \`/workflow reject ${shortId}\`\n` +
-            `• Cancel it: \`/workflow cancel ${shortId}\`\n` +
-            '• Use a different branch: `--branch <other>`';
-        } else {
-          const verb = activeWorkflow.status === 'pending' ? 'starting' : 'running';
-          stateLine = `${verb} ${duration}, run \`${shortId}\``;
-          actionLines =
-            '• Wait for it to finish: `/workflow status`\n' +
-            `• Cancel it: \`/workflow cancel ${shortId}\`\n` +
-            '• Use a different branch: `--branch <other>`';
-        }
-        await sendCriticalMessage(
-          platform,
-          conversationId,
-          `❌ **This worktree is in use** by \`${activeWorkflow.workflow_name}\` ` +
-            `(${stateLine}).\n${actionLines}`
-        );
-        return {
-          success: false,
-          error: `Workflow already active on this path (${activeWorkflow.status}): ${activeWorkflow.workflow_name}`,
-        };
-      }
-    } catch (error) {
-      const err = error as Error;
-      getLog().error(
-        { err, conversationId, cwd, pendingRunId: workflowRun.id },
-        'db_active_workflow_check_failed'
+      pathLockExclude.push(...(await gatherDescendantRunIds(deps, workflowRun.id)));
+    } catch (err) {
+      getLog().warn(
+        { err: err as Error, workflowRunId: workflowRun.id, cwd },
+        'workflow.path_lock_descendant_lookup_failed'
       );
-      // Release the lock token. workflowRun is finalized at this point
-      // (pre-created or resumed or freshly created) and would otherwise sit
-      // as pending/running, blocking the path. For pending the 5-min stale
-      // window would clear it eventually; for a row already promoted to
-      // running (e.g., resumed), nothing would clear it without manual
-      // intervention.
-      await deps.store
-        .updateWorkflowRun(workflowRun.id, { status: 'cancelled' })
-        .catch((cleanupErr: Error) => {
-          getLog().warn(
-            { err: cleanupErr, workflowRunId: workflowRun?.id },
-            'workflow.guard_query_failure_cleanup_failed'
-          );
+    }
+  }
+  return { skipPathLock, pathLockExclude };
+}
+
+function formatActiveWorkflowMessage(activeWorkflow: WorkflowRun): {
+  message: string;
+  error: string;
+} {
+  const elapsedMs = Date.now() - parseDbTimestamp(activeWorkflow.started_at);
+  const duration = formatDuration(elapsedMs);
+  const shortId = activeWorkflow.id.slice(0, 8);
+  const paused = activeWorkflow.status === 'paused';
+  const stateLine = paused
+    ? `paused waiting for user input (${duration} since started, run \`${shortId}\`)`
+    : `${activeWorkflow.status === 'pending' ? 'starting' : 'running'} ${duration}, run \`${shortId}\``;
+  const actionLines = paused
+    ? `• Approve it: \`/workflow approve ${shortId}\`\n` +
+      `• Reject it: \`/workflow reject ${shortId}\`\n` +
+      `• Cancel it: \`/workflow cancel ${shortId}\`\n` +
+      '• Use a different branch: `--branch <other>`'
+    : '• Wait for it to finish: `/workflow status`\n' +
+      `• Cancel it: \`/workflow cancel ${shortId}\`\n` +
+      '• Use a different branch: `--branch <other>`';
+  return {
+    message: `❌ **This worktree is in use** by \`${activeWorkflow.workflow_name}\` (${stateLine}).\n${actionLines}`,
+    error: `Workflow already active on this path (${activeWorkflow.status}): ${activeWorkflow.workflow_name}`,
+  };
+}
+
+async function enforceWorkflowPathLock(
+  deps: WorkflowDeps,
+  platform: IWorkflowPlatform,
+  conversationId: string,
+  cwd: string,
+  workflow: WorkflowDefinition,
+  workflowRun: WorkflowRun
+): Promise<WorkflowExecutionResult | null> {
+  if (workflow.mutates_checkout === false) return null;
+  try {
+    const { skipPathLock, pathLockExclude } = await collectPathLockExclusions(
+      deps,
+      workflowRun,
+      cwd
+    );
+    const activeWorkflow = skipPathLock
+      ? null
+      : await deps.store.getActiveWorkflowRunByPath(cwd, {
+          id: workflowRun.id,
+          startedAt: new Date(parseDbTimestamp(workflowRun.started_at)),
+          ...(pathLockExclude.length > 0 ? { excludeRunIds: pathLockExclude } : {}),
         });
-      await sendCriticalMessage(
-        platform,
-        conversationId,
-        '❌ **Workflow blocked**: Unable to verify if another workflow is running (database error). Please try again in a moment.'
-      );
-      return { success: false, error: 'Database error checking for active workflow' };
-    }
+    if (!activeWorkflow) return null;
+    await deps.store
+      .updateWorkflowRun(workflowRun.id, { status: 'cancelled' })
+      .catch((cleanupErr: Error) => {
+        getLog().warn(
+          { err: cleanupErr, workflowRunId: workflowRun.id, cwd },
+          'workflow.guard_self_cancel_failed'
+        );
+      });
+    const { message, error } = formatActiveWorkflowMessage(activeWorkflow);
+    await sendCriticalMessage(platform, conversationId, message);
+    return { success: false, error };
+  } catch (error) {
+    getLog().error(
+      { err: error as Error, conversationId, cwd, pendingRunId: workflowRun.id },
+      'db_active_workflow_check_failed'
+    );
+    await deps.store
+      .updateWorkflowRun(workflowRun.id, { status: 'cancelled' })
+      .catch((cleanupErr: Error) => {
+        getLog().warn(
+          { err: cleanupErr, workflowRunId: workflowRun.id },
+          'workflow.guard_query_failure_cleanup_failed'
+        );
+      });
+    await sendCriticalMessage(
+      platform,
+      conversationId,
+      '❌ **Workflow blocked**: Unable to verify if another workflow is running (database error). Please try again in a moment.'
+    );
+    return { success: false, error: 'Database error checking for active workflow' };
   }
+}
 
-  // Resolve external artifact, log, and state directories. A resumed run
-  // carries its `output_root` and short-circuits identity resolution entirely.
-  const { artifactsDir, logDir, artifactsRoot, stateDir, outputRoot } = await resolveProjectPaths(
-    deps,
-    cwd,
-    workflowRun.id,
-    codebaseId,
-    { persistedOutputRoot: workflowRun.output_root }
-  );
-
-  // Record the resolved root ONCE, so every later reader (artifact routes, CLI)
-  // addresses this run's output by a durable pointer instead of re-deriving it
-  // from a codebase name that may since have been renamed (#1192). Never
-  // overwritten — a resumed run already has one, and the store additionally
-  // enforces write-once via COALESCE.
-  //
-  // A failure here is NOT retried: the guard is `if (!output_root)`, so this run
-  // keeps a NULL pointer for its whole lifetime and permanently stays on the
-  // re-derive path — the exact orphaning #1192 makes possible. It does not
-  // justify failing an otherwise healthy run (re-derivation works today), but it
-  // is a durable per-run degradation, so it logs at ERROR rather than WARN.
+async function prepareWorkflowPaths(
+  deps: WorkflowDeps,
+  platform: IWorkflowPlatform,
+  conversationId: string,
+  cwd: string,
+  workflow: WorkflowDefinition,
+  workflowRun: WorkflowRun,
+  codebaseId: string | undefined
+): Promise<WorkflowPathBundle | WorkflowExecutionResult> {
+  const paths = await resolveProjectPaths(deps, cwd, workflowRun.id, codebaseId, {
+    persistedOutputRoot: workflowRun.output_root,
+  });
   if (!workflowRun.output_root) {
     await deps.store
-      .updateWorkflowRun(workflowRun.id, { output_root: outputRoot })
+      .updateWorkflowRun(workflowRun.id, { output_root: paths.outputRoot })
       .catch((err: Error) => {
         getLog().error(
-          { err, workflowRunId: workflowRun.id, outputRoot },
+          { err, workflowRunId: workflowRun.id, outputRoot: paths.outputRoot },
           'workflow.output_root_persist_failed'
         );
       });
   }
-
-  // Detect (never move) legacy repo-local `.archon/` output directories. State was a
-  // prompt convention; artifacts/logs the engine wrote itself on the unregistered-cwd
-  // fallback (#2311) — the case Archon caused must not be the quieter of the two.
-  // The run's ACTUAL posture, not the workflow's declared policy. `worktree.enabled`
-  // is only one input to the real decision (`pinnedEnabled ?? (!resume && !noWorktree)`,
-  // resolved in the CLI), so a workflow that leaves `worktree` unset and is run with
-  // `--no-worktree` executes IN PLACE while the declared policy still reads as isolated.
-  // That is the one case where this warning is actionable — the legacy files are sitting
-  // in the user's real repository — and it is exactly the case the declared policy gets
-  // backwards. A managed worktree always lives under ARCHON_HOME; an in-place checkout
-  // never does, so the cwd answers the question the policy cannot.
   const isolated = archonPaths.isInsideArchonHome(cwd);
-  await maybeWarnLegacyStatePath(cwd, stateDir, isolated);
-  await maybeWarnLegacyArtifactsPath(cwd, artifactsRoot, isolated);
-
-  // Stable cross-invocation artifact scope (#1846): only for persist_session
-  // workflows with a conversation scope. Undefined otherwise — zero new dirs.
+  await maybeWarnLegacyStatePath(cwd, paths.stateDir, isolated);
+  await maybeWarnLegacyArtifactsPath(cwd, paths.artifactsRoot, isolated);
   const scopeArtifactsDir = resolveScopeArtifactsDir(
     workflow,
     workflowRun.conversation_id,
-    artifactsRoot
+    paths.artifactsRoot
   );
-
-  // Pre-create the artifacts directory so commands can write to it immediately
-  // (and the durable scope dir, when the workflow opted into one — same disk,
-  // same failure mode, same fatal treatment). `stateDir` is pre-created here
-  // too so `$STATE_DIR` is usable from the first node without an mkdir, and an
-  // unwritable state dir fails the run rather than silently degrading.
   try {
-    await mkdir(artifactsDir, { recursive: true });
-    await mkdir(stateDir, { recursive: true });
+    await mkdir(paths.artifactsDir, { recursive: true });
+    await mkdir(paths.stateDir, { recursive: true });
     if (scopeArtifactsDir) await mkdir(scopeArtifactsDir, { recursive: true });
   } catch (error) {
     const err = error as NodeJS.ErrnoException;
     getLog().error(
-      { err, artifactsDir, stateDir, workflowRunId: workflowRun.id },
+      {
+        err,
+        artifactsDir: paths.artifactsDir,
+        stateDir: paths.stateDir,
+        workflowRunId: workflowRun.id,
+      },
       'workflow.artifacts_dir_create_failed'
     );
     await deps.store
@@ -1621,7 +1544,7 @@ export async function executeWorkflow(
     await sendCriticalMessage(
       platform,
       conversationId,
-      `❌ **Workflow failed**: Could not create artifacts directory \`${artifactsDir}\`: ${err.message}`
+      `❌ **Workflow failed**: Could not create artifacts directory \`${paths.artifactsDir}\`: ${err.message}`
     );
     return {
       success: false,
@@ -1629,223 +1552,485 @@ export async function executeWorkflow(
       error: `Artifacts directory creation failed: ${err.message}`,
     };
   }
-  getLog().debug({ artifactsDir, logDir, stateDir, outputRoot }, 'workflow_paths_resolved');
+  getLog().debug(paths, 'workflow_paths_resolved');
+  return { ...paths, ...(scopeArtifactsDir ? { scopeArtifactsDir } : {}) };
+}
 
-  // Per-user AI-provider credentials (Phase 2). Resolved AFTER artifactsDir is
-  // created because file-based deliveries (Codex `CODEX_HOME/auth.json`) live
-  // under it. Merged LAST into config.envVars so the originating user's keys
-  // win over file/db/bot-github env — preserves the GitHub merge order and
-  // keeps the no-key path byte-for-byte unchanged (resolveUserProviderEnvForWorkflow
-  // returns {} when the feature is disabled or no userId is present).
-  const userProviderEnv = isolatedExecution
-    ? {}
-    : await resolveUserProviderEnvForWorkflow(deps, userId, artifactsDir);
-  config.envVars = { ...config.envVars, ...userProviderEnv };
+function getIsolationMode(
+  execContext: ExecutionContext,
+  isolationContext: ExecuteWorkflowOptions['isolationContext']
+): 'container' | 'worktree' | 'in-place' {
+  if (execContext.kind === 'container') return 'container';
+  if (isolationContext) return 'worktree';
+  return 'in-place';
+}
 
-  // Wrap execution in try-catch to ensure workflow is marked as failed on any error.
-  //
-  // Hold a Windows keep-awake request for the executing window (see
-  // utils/keep-awake.ts for the Modern Standby / mid-run-death rationale and
-  // best-effort semantics). Placed HERE, not at function top, so the
-  // early-return validation paths above never leak an unpaired acquire; the
-  // matching release is the first statement of this try's finally.
-  keepAwake.acquire();
-  try {
-    getLog().info(
-      {
+function emitWorkflowStartTelemetry(
+  platform: IWorkflowPlatform,
+  workflow: WorkflowDefinition,
+  source: WorkflowSource | undefined,
+  resolvedProvider: string,
+  resolvedModel: string | undefined,
+  isolationContext: ExecuteWorkflowOptions['isolationContext'],
+  isResume: boolean
+): void {
+  captureWorkflowInvoked({
+    workflowName: workflow.name,
+    workflowSource: source,
+    platform: platform.getPlatformType(),
+    provider: resolvedProvider,
+    model: resolvedModel,
+    nodeCount: workflow.nodes.length,
+    usesLoop: workflow.nodes.some(isLoopNode),
+    usesLoopGroup: workflow.nodes.some(isLoopGroupNode),
+    usesApproval: workflow.nodes.some(isApprovalNode),
+    usesScript: workflow.nodes.some(isScriptNode),
+    usesBash: workflow.nodes.some(isBashNode),
+    usesOutputFormat: workflow.nodes.some(n => n.output_format !== undefined),
+    usesOutputType: workflow.nodes.some(n => n.output_type !== undefined),
+    usesPersistSession:
+      workflow.persist_sessions === true || workflow.nodes.some(n => n.persist_session === true),
+    usesMcp: workflow.nodes.some(n => n.mcp !== undefined),
+    usesSkills: workflow.nodes.some(n => n.skills !== undefined),
+    usesFreshContext: workflow.nodes.some(n => isLoopNode(n) && n.loop.fresh_context),
+    interactive: workflow.interactive ?? false,
+    usedIsolation: isolationContext !== undefined,
+    isResume,
+  });
+}
+
+async function beginWorkflowRun(
+  deps: WorkflowDeps,
+  platform: IWorkflowPlatform,
+  conversationId: string,
+  conversationDbId: string,
+  workflow: WorkflowDefinition,
+  userMessage: string,
+  workflowRun: WorkflowRun,
+  config: WorkflowConfig,
+  baseBranch: string,
+  opts: ExecuteWorkflowOptions,
+  execContext: ExecutionContext,
+  provider: WorkflowProviderResolution,
+  logDir: string
+): Promise<WorkflowExecutionResult | null> {
+  getLog().info(
+    {
+      workflowName: workflow.name,
+      workflowRunId: workflowRun.id,
+      hasIssueContext: !!opts.issueContext,
+      issueContextLength: opts.issueContext?.length ?? 0,
+    },
+    'workflow_starting'
+  );
+  await logWorkflowStart(logDir, workflowRun.id, workflow.name, userMessage);
+  const emitter = getWorkflowEventEmitter();
+  emitter.registerRun(workflowRun.id, conversationId);
+  emitter.emit({
+    type: 'workflow_started',
+    runId: workflowRun.id,
+    workflowName: workflow.name,
+    conversationId: conversationDbId,
+  });
+  emitWorkflowStartTelemetry(
+    platform,
+    workflow,
+    opts.source,
+    provider.resolvedProvider,
+    provider.resolvedModel,
+    opts.isolationContext,
+    opts.priorCompletedNodes !== undefined
+  );
+  deps.store
+    .createWorkflowEvent({
+      workflow_run_id: workflowRun.id,
+      event_type: 'workflow_started',
+      data: {
         workflowName: workflow.name,
-        workflowRunId: workflowRun.id,
-        hasIssueContext: !!issueContext,
-        issueContextLength: issueContext?.length ?? 0,
+        defaultAssistant: provider.userAiPrefs.defaultProvider ?? config.assistant,
+        provider: provider.resolvedProvider,
+        model: provider.resolvedModel ?? null,
+        isolationMode: getIsolationMode(execContext, opts.isolationContext),
+        baseBranch,
+        userId: workflowRun.user_id ?? null,
+        userMessage: workflowRun.user_message,
+        origin: workflowRun.parent_run_id ? 'workflow' : platform.getPlatformType(),
       },
-      'workflow_starting'
-    );
-    await logWorkflowStart(logDir, workflowRun.id, workflow.name, userMessage);
-
-    // Register run with emitter and emit workflow_started
-    const emitter = getWorkflowEventEmitter();
-    emitter.registerRun(workflowRun.id, conversationId);
-
-    emitter.emit({
-      type: 'workflow_started',
-      runId: workflowRun.id,
-      workflowName: workflow.name,
-      conversationId: conversationDbId,
+    })
+    .catch((err: Error) => {
+      getLog().error(
+        { err, workflowRunId: workflowRun.id, eventType: 'workflow_started' },
+        'workflow_event_persist_failed'
+      );
     });
-
-    // Fire-and-forget anonymous usage telemetry. Categorical only: bundled
-    // workflows report their real name, custom ones report "custom". No PII —
-    // descriptions/prompts/paths are never sent. Machine context + version ride
-    // along as super-properties. Opt out: ARCHON_TELEMETRY_DISABLED=1 / DO_NOT_TRACK=1.
-    captureWorkflowInvoked({
-      workflowName: workflow.name,
-      workflowSource: source,
-      platform: platform.getPlatformType(),
-      provider: resolvedProvider,
-      model: resolvedModel,
-      nodeCount: workflow.nodes.length,
-      usesLoop: workflow.nodes.some(isLoopNode),
-      usesLoopGroup: workflow.nodes.some(isLoopGroupNode),
-      usesApproval: workflow.nodes.some(isApprovalNode),
-      usesScript: workflow.nodes.some(isScriptNode),
-      usesBash: workflow.nodes.some(isBashNode),
-      usesOutputFormat: workflow.nodes.some(n => n.output_format !== undefined),
-      usesOutputType: workflow.nodes.some(n => n.output_type !== undefined),
-      usesPersistSession:
-        workflow.persist_sessions === true || workflow.nodes.some(n => n.persist_session === true),
-      usesMcp: workflow.nodes.some(n => n.mcp !== undefined),
-      usesSkills: workflow.nodes.some(n => n.skills !== undefined),
-      usesFreshContext: workflow.nodes.some(n => isLoopNode(n) && n.loop.fresh_context),
-      interactive: workflow.interactive ?? false,
-      usedIsolation: isolationContext !== undefined,
-      isResume: dagPriorCompletedNodes !== undefined,
-    });
-
-    let isolationMode: 'container' | 'worktree' | 'in-place' = 'in-place';
-    if (execContext.kind === 'container') {
-      isolationMode = 'container';
-    } else if (isolationContext) {
-      isolationMode = 'worktree';
-    }
-
+  if (opts.parseWarnings && opts.parseWarnings.length > 0) {
     deps.store
       .createWorkflowEvent({
         workflow_run_id: workflowRun.id,
-        event_type: 'workflow_started',
-        data: {
-          workflowName: workflow.name,
-          defaultAssistant: userAiPrefs.defaultProvider ?? config.assistant,
-          provider: resolvedProvider,
-          model: resolvedModel ?? null,
-          isolationMode,
-          baseBranch,
-          userId: workflowRun.user_id ?? null,
-          userMessage: workflowRun.user_message,
-          origin: workflowRun.parent_run_id ? 'workflow' : platform.getPlatformType(),
-        },
+        event_type: 'workflow_parse_warnings',
+        data: { workflowName: workflow.name, warnings: [...opts.parseWarnings] },
       })
       .catch((err: Error) => {
         getLog().error(
-          { err, workflowRunId: workflowRun.id, eventType: 'workflow_started' },
+          { err, workflowRunId: workflowRun.id, eventType: 'workflow_parse_warnings' },
           'workflow_event_persist_failed'
         );
       });
-
-    // Keys the engine dropped from this run's YAML (#2213). Recorded here rather
-    // than at the chat/console dispatch site for two reasons: every run reaches
-    // this line whatever surface started it (CLI and REST included, which have no
-    // conversation to post into), and the record is therefore written by a path
-    // that a failed `platform.sendMessage` cannot touch. That notification stays
-    // best-effort; this is the durable trace behind it, readable via
-    // `archon workflow get <id> --verbose` and the events API.
-    if (parseWarnings && parseWarnings.length > 0) {
-      deps.store
-        .createWorkflowEvent({
-          workflow_run_id: workflowRun.id,
-          event_type: 'workflow_parse_warnings',
-          data: {
-            workflowName: workflow.name,
-            warnings: [...parseWarnings],
-          },
-        })
-        .catch((err: Error) => {
-          getLog().error(
-            { err, workflowRunId: workflowRun.id, eventType: 'workflow_parse_warnings' },
-            'workflow_event_persist_failed'
-          );
-        });
-    }
-
-    // Set status to running now that execution has started (skip for resumed runs — already running)
-    if (!dagPriorCompletedNodes) {
-      try {
-        await deps.store.updateWorkflowRun(workflowRun.id, { status: 'running' });
-      } catch (dbError) {
-        getLog().error(
-          { err: dbError as Error, workflowRunId: workflowRun.id },
-          'db_workflow_status_update_failed'
-        );
-        await sendCriticalMessage(
-          platform,
-          conversationId,
-          'Workflow blocked: Unable to update status. Please try again.'
-        );
-        return { success: false, error: 'Database error setting workflow to running' };
-      }
-    }
-
-    // Context for error logging
-    const workflowContext: SendMessageContext = {
-      workflowId: workflowRun.id,
-    };
-
-    // Build startup message
-    let startupMessage = '';
-
-    // Add isolation context to startup message
-    if (isolationContext) {
-      const { isPrReview, prSha, prBranch, branchName } = isolationContext;
-
-      if (isPrReview && prSha && prBranch) {
-        startupMessage += `Reviewing PR at commit \`${prSha.substring(0, 7)}\` (branch: \`${prBranch}\`)\n\n`;
-      } else if (branchName) {
-        const repoName = cwd.split(/[/\\]/).pop() || 'repository';
-        await sendCriticalMessage(
-          platform,
-          conversationId,
-          `📍 ${repoName} @ \`${branchName}\``,
-          workflowContext,
-          2,
-          { category: 'isolation_context', segment: 'new' }
-        );
-      } else {
-        getLog().warn(
-          {
-            workflowId: workflowRun.id,
-            hasFields: {
-              isPrReview: !!isPrReview,
-              prSha: !!prSha,
-              prBranch: !!prBranch,
-              branchName: !!branchName,
-            },
-          },
-          'isolation_context_incomplete'
-        );
-      }
-    }
-
-    // Add workflow start message (step details omitted from text notification)
-    // Strip routing metadata from description (Use when:, Handles:, NOT for:, Capability:, Triggers:)
-    const cleanDescription = (workflow.description ?? '')
-      .split('\n')
-      .filter(
-        line =>
-          !/^\s*(Use when|Handles|NOT for|Capability|Triggers)[:\s]/i.test(line) && line.trim()
-      )
-      .join('\n')
-      .trim();
-    const descriptionText = cleanDescription || workflow.name;
-    startupMessage += `🚀 **Starting workflow**: \`${workflow.name}\`\n\n> ${descriptionText}`;
-
-    // Send consolidated message - use critical send with limited retries (1 retry max)
-    // to avoid blocking workflow execution while still catching transient failures
-    const startupSent = await sendCriticalMessage(
+  }
+  if (opts.priorCompletedNodes) return null;
+  try {
+    await deps.store.updateWorkflowRun(workflowRun.id, { status: 'running' });
+    return null;
+  } catch (dbError) {
+    getLog().error(
+      { err: dbError as Error, workflowRunId: workflowRun.id },
+      'db_workflow_status_update_failed'
+    );
+    await sendCriticalMessage(
       platform,
       conversationId,
-      startupMessage,
-      workflowContext,
-      2, // maxRetries=2 means 2 total attempts (1 initial + 1 retry), 1s max delay
-      { category: 'workflow_status', segment: 'new' }
+      'Workflow blocked: Unable to update status. Please try again.'
     );
-    if (!startupSent) {
-      getLog().error(
-        { workflowId: workflowRun.id, conversationId },
-        'startup_message_delivery_failed'
-      );
-      // Continue anyway - workflow is already recorded in database
-    }
+    return { success: false, error: 'Database error setting workflow to running' };
+  }
+}
 
-    // Execute the DAG workflow
+async function sendWorkflowStartupMessage(
+  platform: IWorkflowPlatform,
+  conversationId: string,
+  cwd: string,
+  workflow: WorkflowDefinition,
+  workflowRun: WorkflowRun,
+  isolationContext: ExecuteWorkflowOptions['isolationContext']
+): Promise<void> {
+  const workflowContext: SendMessageContext = { workflowId: workflowRun.id };
+  let startupMessage = '';
+  if (isolationContext) {
+    const { isPrReview, prSha, prBranch, branchName } = isolationContext;
+    if (isPrReview && prSha && prBranch) {
+      startupMessage += `Reviewing PR at commit \`${prSha.substring(0, 7)}\` (branch: \`${prBranch}\`)\n\n`;
+    } else if (branchName) {
+      const repoName = cwd.split(/[/\\]/).pop() || 'repository';
+      await sendCriticalMessage(
+        platform,
+        conversationId,
+        `📍 ${repoName} @ \`${branchName}\``,
+        workflowContext,
+        2,
+        { category: 'isolation_context', segment: 'new' }
+      );
+    } else {
+      getLog().warn(
+        {
+          workflowId: workflowRun.id,
+          hasFields: {
+            isPrReview: !!isPrReview,
+            prSha: !!prSha,
+            prBranch: !!prBranch,
+            branchName: !!branchName,
+          },
+        },
+        'isolation_context_incomplete'
+      );
+    }
+  }
+  const cleanDescription = (workflow.description ?? '')
+    .split('\n')
+    .filter(
+      line => !/^\s*(Use when|Handles|NOT for|Capability|Triggers)[:\s]/i.test(line) && line.trim()
+    )
+    .join('\n')
+    .trim();
+  startupMessage += `🚀 **Starting workflow**: \`${workflow.name}\`\n\n> ${cleanDescription || workflow.name}`;
+  const startupSent = await sendCriticalMessage(
+    platform,
+    conversationId,
+    startupMessage,
+    workflowContext,
+    2,
+    { category: 'workflow_status', segment: 'new' }
+  );
+  if (!startupSent)
+    getLog().error(
+      { workflowId: workflowRun.id, conversationId },
+      'startup_message_delivery_failed'
+    );
+}
+
+async function resumeParentAfterChildTerminal(
+  deps: WorkflowDeps,
+  platform: IWorkflowPlatform,
+  conversationId: string,
+  conversationDbId: string,
+  workflowRun: WorkflowRun,
+  finalStatus: WorkflowRun | null,
+  resolveChildIsolation?: ChildIsolationResolver
+): Promise<void> {
+  if (!finalStatus?.parent_run_id) return;
+  if (!['completed', 'failed', 'cancelled'].includes(finalStatus.status)) return;
+  await maybeResumeParentRun(
+    deps,
+    platform,
+    conversationId,
+    conversationDbId,
+    finalStatus,
+    resolveChildIsolation
+  ).catch((err: unknown) => {
+    getLog().error(
+      { err: err as Error, childRunId: workflowRun.id, parentRunId: finalStatus.parent_run_id },
+      'workflow.parent_auto_resume_failed'
+    );
+  });
+}
+
+function resultFromFinalStatus(
+  workflowRun: WorkflowRun,
+  finalStatus: WorkflowRun | null,
+  dagSummary: string | undefined
+): WorkflowExecutionResult {
+  if (finalStatus?.status === 'completed')
+    return { success: true, workflowRunId: workflowRun.id, summary: dagSummary };
+  if (finalStatus?.status === 'paused')
+    return { success: true, paused: true, workflowRunId: workflowRun.id };
+  return {
+    success: false,
+    workflowRunId: workflowRun.id,
+    error: 'Workflow did not complete successfully',
+  };
+}
+
+async function handleWorkflowUnhandledError(
+  deps: WorkflowDeps,
+  platform: IWorkflowPlatform,
+  conversationId: string,
+  workflow: WorkflowDefinition,
+  workflowRun: WorkflowRun,
+  logDir: string,
+  source: WorkflowSource | undefined,
+  resolvedProvider: string,
+  error: unknown
+): Promise<WorkflowExecutionResult> {
+  const err = error as Error;
+  getLog().error(
+    { err, workflowName: workflow.name, workflowId: workflowRun.id },
+    'workflow_execution_unhandled_error'
+  );
+  try {
+    await deps.store.failWorkflowRun(workflowRun.id, err.message);
+  } catch (dbError) {
+    getLog().error(
+      { err: dbError as Error, workflowId: workflowRun.id, originalError: err.message },
+      'db_record_failure_failed'
+    );
+  }
+  try {
+    await logWorkflowError(logDir, workflowRun.id, err.message);
+  } catch (logError) {
+    getLog().error(
+      { err: logError as Error, workflowId: workflowRun.id },
+      'workflow_error_log_write_failed'
+    );
+  }
+  const emitter = getWorkflowEventEmitter();
+  emitter.emit({
+    type: 'workflow_failed',
+    runId: workflowRun.id,
+    workflowName: workflow.name,
+    error: err.message,
+  });
+  captureWorkflowCompleted({
+    outcome: 'failed',
+    workflowName: workflow.name,
+    workflowSource: source,
+    provider: resolvedProvider,
+    exitReason: 'unhandled_error',
+    errorClass: toTelemetryErrorClass(classifyError(err)),
+  });
+  deps.store
+    .createWorkflowEvent({
+      workflow_run_id: workflowRun.id,
+      event_type: 'workflow_failed',
+      data: { error: err.message },
+    })
+    .catch((eventErr: Error) => {
+      getLog().error(
+        { err: eventErr, workflowRunId: workflowRun.id, eventType: 'workflow_failed' },
+        'workflow_event_persist_failed'
+      );
+    });
+  emitter.unregisterRun(workflowRun.id);
+  const delivered = await sendCriticalMessage(
+    platform,
+    conversationId,
+    `❌ **Workflow failed**: ${err.message}`
+  );
+  if (!delivered)
+    getLog().error(
+      { workflowId: workflowRun.id, originalError: err.message },
+      'user_failure_notification_failed'
+    );
+  return { success: false, workflowRunId: workflowRun.id, error: err.message };
+}
+
+async function runWorkflowFinallyBackstop(
+  deps: WorkflowDeps,
+  workflowRun: WorkflowRun | undefined
+): Promise<void> {
+  keepAwake.release();
+  if (!workflowRun) return;
+  const runId = workflowRun.id;
+  const backstopStatus = await deps.store.getWorkflowRunStatus(runId).catch(() => null);
+  if (backstopStatus !== 'running') return;
+  getLog().warn({ workflowRunId: runId }, 'executor.backstop_triggered');
+  await deps.store
+    .failWorkflowRun(runId, 'Workflow exited without finalizing — see logs')
+    .catch((err: unknown) => {
+      getLog().error({ err, workflowRunId: runId }, 'executor.backstop_fail_failed');
+    });
+}
+
+/**
+ * Execute a complete DAG-based workflow.
+ *
+ * Required positional args carry identity and dependencies. Everything else
+ * lives in `opts` ({@link ExecuteWorkflowOptions}). To resume a prior run,
+ * call {@link hydrateResumableRun} first and spread its result into `opts` —
+ * the executor does not perform resume detection on its own.
+ */
+export async function executeWorkflow(
+  deps: WorkflowDeps,
+  platform: IWorkflowPlatform,
+  conversationId: string,
+  cwd: string,
+  workflow: WorkflowDefinition,
+  userMessage: string,
+  conversationDbId: string,
+  opts: ExecuteWorkflowOptions = {}
+): Promise<WorkflowExecutionResult> {
+  const execContext = opts.execContext ?? { kind: 'host' };
+  const workflowPin = buildWorkflowPinState(workflow, opts.source);
+  const pinFailure = await guardPinnedRun(
+    deps,
+    platform,
+    conversationId,
+    workflow,
+    opts.source,
+    opts.preCreatedRun,
+    execContext
+  );
+  if (pinFailure) return pinFailure;
+  const containerFailure = await guardContainerResume(
+    deps,
+    platform,
+    conversationId,
+    opts.preCreatedRun,
+    opts.container
+  );
+  if (containerFailure) return containerFailure;
+
+  const isolatedExecution =
+    execContext.kind === 'container' || workflow.hardened?.required === true;
+  const config = await buildExecutionConfig(
+    deps,
+    cwd,
+    opts.codebaseId,
+    opts.userId,
+    isolatedExecution
+  );
+  const baseBranch = await resolveBaseBranchForWorkflow(
+    deps,
+    cwd,
+    opts.codebaseId,
+    config,
+    opts.baseBranch,
+    opts.baseOverride
+  );
+  const docsDir = config.docsPath ?? 'docs/';
+  const userAiPrefs = await resolveUserAiPrefsLayer(deps, opts.userId);
+  const aiProfile = buildExecutionAiProfile(config, userAiPrefs, opts.userId);
+  const providerBits = await resolveWorkflowProviderAndModel(
+    platform,
+    conversationId,
+    workflow,
+    config,
+    aiProfile
+  );
+  const provider: WorkflowProviderResolution = { ...providerBits, aiProfile, userAiPrefs };
+  if (config.commands.folder)
+    getLog().debug(
+      { configuredCommandFolder: config.commands.folder },
+      'command_folder_configured'
+    );
+
+  const runRecord = await resolveWorkflowRunRecord(
+    deps,
+    platform,
+    conversationId,
+    conversationDbId,
+    workflow,
+    userMessage,
+    cwd,
+    opts,
+    execContext,
+    workflowPin
+  );
+  if (isExecutionResult(runRecord)) return runRecord;
+  const workflowRun: WorkflowRun | undefined = runRecord;
+
+  const lockFailure = await enforceWorkflowPathLock(
+    deps,
+    platform,
+    conversationId,
+    cwd,
+    workflow,
+    workflowRun
+  );
+  if (lockFailure) return lockFailure;
+  const paths = await prepareWorkflowPaths(
+    deps,
+    platform,
+    conversationId,
+    cwd,
+    workflow,
+    workflowRun,
+    opts.codebaseId
+  );
+  if (isExecutionResult(paths)) return paths;
+  if (!isolatedExecution) {
+    const userProviderEnv = await resolveUserProviderEnvForWorkflow(
+      deps,
+      opts.userId,
+      paths.artifactsDir
+    );
+    config.envVars = { ...config.envVars, ...userProviderEnv };
+  }
+
+  keepAwake.acquire();
+  try {
+    const beginFailure = await beginWorkflowRun(
+      deps,
+      platform,
+      conversationId,
+      conversationDbId,
+      workflow,
+      userMessage,
+      workflowRun,
+      config,
+      baseBranch,
+      opts,
+      execContext,
+      provider,
+      paths.logDir
+    );
+    if (beginFailure) return beginFailure;
+    await sendWorkflowStartupMessage(
+      platform,
+      conversationId,
+      cwd,
+      workflow,
+      workflowRun,
+      opts.isolationContext
+    );
     const dagSummary = await executeDagWorkflow(
       deps,
       platform,
@@ -1853,176 +2038,51 @@ export async function executeWorkflow(
       cwd,
       workflow,
       workflowRun,
-      resolvedProvider,
-      resolvedModel,
-      artifactsDir,
-      stateDir,
-      logDir,
+      provider.resolvedProvider,
+      provider.resolvedModel,
+      paths.artifactsDir,
+      paths.stateDir,
+      paths.logDir,
       baseBranch,
       docsDir,
       config,
-      configuredCommandFolder,
-      issueContext,
-      dagPriorCompletedNodes,
-      source,
-      aiProfile,
-      workflowPreset,
-      scopeArtifactsDir,
+      config.commands.folder,
+      opts.issueContext,
+      opts.priorCompletedNodes,
+      opts.source,
+      provider.aiProfile,
+      provider.workflowPreset,
+      paths.scopeArtifactsDir,
       execContext,
-      containerCtx,
-      // Sub-run closure (#2121 Phase 2): captures executeWorkflow (this module — no
-      // import cycle) so a `workflow:` node can spawn a governed child run in-process.
-      // Also captures the per-child isolation resolver (slice 2, PR-A) so an
-      // `isolation: 'worktree'` child gets its own worktree cwd.
+      opts.container,
       (childArgs: RunChildWorkflowArgs): Promise<ChildWorkflowOutcome> =>
-        runChildWorkflow(deps, platform, childArgs, resolveChildIsolation),
-      dagPriorTokenUsage
+        runChildWorkflow(deps, platform, childArgs, opts.resolveChildIsolation),
+      opts.priorTokenUsage
     );
-
-    // executeDagWorkflow throws on fatal errors; check DB status for result
     const finalStatus = await deps.store.getWorkflowRun(workflowRun.id);
-    // Sub-run re-entry (#2121 Phase 2): if this run is a `workflow:` child that just
-    // reached a terminal state, re-enter its paused parent in-process. Guarded to be
-    // a no-op on the synchronous first-run path (parent still 'running'). Wrapped in
-    // catch — a parent-resume failure must not corrupt the child's own result.
-    if (
-      finalStatus?.parent_run_id &&
-      (finalStatus.status === 'completed' ||
-        finalStatus.status === 'failed' ||
-        finalStatus.status === 'cancelled')
-    ) {
-      await maybeResumeParentRun(
-        deps,
-        platform,
-        conversationId,
-        conversationDbId,
-        finalStatus,
-        // The parent resumes mid-DAG and may still have isolated sub-run nodes ahead
-        // of it; without this it would fail them for a missing resolver the surface
-        // did inject. Same resolver the child ran with — it is codebase-bound and the
-        // child shares the parent's codebase.
-        resolveChildIsolation
-      ).catch((err: unknown) => {
-        getLog().error(
-          {
-            err: err as Error,
-            childRunId: workflowRun.id,
-            parentRunId: finalStatus.parent_run_id,
-          },
-          'workflow.parent_auto_resume_failed'
-        );
-      });
-    }
-    if (finalStatus?.status === 'completed') {
-      return { success: true, workflowRunId: workflowRun.id, summary: dagSummary };
-    } else if (finalStatus?.status === 'paused') {
-      return { success: true, paused: true, workflowRunId: workflowRun.id };
-    } else {
-      return {
-        success: false,
-        workflowRunId: workflowRun.id,
-        error: 'Workflow did not complete successfully',
-      };
-    }
-  } catch (error) {
-    // Top-level error handler: ensure workflow is marked as failed
-    const err = error as Error;
-    getLog().error(
-      { err, workflowName: workflow.name, workflowId: workflowRun.id },
-      'workflow_execution_unhandled_error'
-    );
-
-    // Record failure in database (non-blocking - log but don't re-throw on DB error)
-    try {
-      await deps.store.failWorkflowRun(workflowRun.id, err.message);
-    } catch (dbError) {
-      getLog().error(
-        { err: dbError as Error, workflowId: workflowRun.id, originalError: err.message },
-        'db_record_failure_failed'
-      );
-    }
-
-    // Log to file (separate from database - non-blocking)
-    try {
-      await logWorkflowError(logDir, workflowRun.id, err.message);
-    } catch (logError) {
-      getLog().error(
-        { err: logError as Error, workflowId: workflowRun.id },
-        'workflow_error_log_write_failed'
-      );
-    }
-
-    // Emit workflow_failed event
-    const emitter = getWorkflowEventEmitter();
-    emitter.emit({
-      type: 'workflow_failed',
-      runId: workflowRun.id,
-      workflowName: workflow.name,
-      error: err.message,
-    });
-    // Anonymous telemetry for the unhandled-throw failure path. The DAG-internal
-    // failure paths (no/partial completion) fire their own captureWorkflowCompleted
-    // and return without throwing, so this only covers genuine unhandled errors —
-    // no double-count. Duration/node-counts are not in scope here.
-    captureWorkflowCompleted({
-      outcome: 'failed',
-      workflowName: workflow.name,
-      workflowSource: source,
-      provider: resolvedProvider,
-      exitReason: 'unhandled_error',
-      // Categorical class only (fatal/transient/unknown) — err.message never leaves.
-      errorClass: toTelemetryErrorClass(classifyError(err)),
-    });
-    deps.store
-      .createWorkflowEvent({
-        workflow_run_id: workflowRun.id,
-        event_type: 'workflow_failed',
-        data: { error: err.message },
-      })
-      .catch((err: Error) => {
-        getLog().error(
-          { err, workflowRunId: workflowRun.id, eventType: 'workflow_failed' },
-          'workflow_event_persist_failed'
-        );
-      });
-    emitter.unregisterRun(workflowRun.id);
-
-    // Notify user about the failure
-    const delivered = await sendCriticalMessage(
+    await resumeParentAfterChildTerminal(
+      deps,
       platform,
       conversationId,
-      `❌ **Workflow failed**: ${err.message}`
+      conversationDbId,
+      workflowRun,
+      finalStatus,
+      opts.resolveChildIsolation
     );
-    if (!delivered) {
-      getLog().error(
-        { workflowId: workflowRun.id, originalError: err.message },
-        'user_failure_notification_failed'
-      );
-    }
-    // Return failure result instead of re-throwing
-    return { success: false, workflowRunId: workflowRun.id, error: err.message };
+    return resultFromFinalStatus(workflowRun, finalStatus, dagSummary);
+  } catch (error) {
+    return await handleWorkflowUnhandledError(
+      deps,
+      platform,
+      conversationId,
+      workflow,
+      workflowRun,
+      paths.logDir,
+      opts.source,
+      provider.resolvedProvider,
+      error
+    );
   } finally {
-    // Release the keep-awake request FIRST — before the backstop DB calls that
-    // may throw — so it always pairs with the acquire above this try, on every
-    // exit path (success, thrown error, or backstop failure).
-    keepAwake.release();
-    // Defensive backstop: if the workflow run is still 'running' after all
-    // normal and exceptional code paths, flip it to 'failed' to prevent zombie
-    // accumulation. Guards against any future code path that exits without
-    // calling failWorkflowRun (e.g. a generator cleanup that exits without
-    // throwing). Only fires when the process stays alive long enough to run
-    // this finally — see #1561 for the originating zombie-state incident.
-    if (workflowRun) {
-      const runId = workflowRun.id;
-      const backstopStatus = await deps.store.getWorkflowRunStatus(runId).catch(() => null);
-      if (backstopStatus === 'running') {
-        getLog().warn({ workflowRunId: runId }, 'executor.backstop_triggered');
-        await deps.store
-          .failWorkflowRun(runId, 'Workflow exited without finalizing — see logs')
-          .catch((err: unknown) => {
-            getLog().error({ err, workflowRunId: runId }, 'executor.backstop_fail_failed');
-          });
-      }
-    }
+    await runWorkflowFinallyBackstop(deps, workflowRun);
   }
 }

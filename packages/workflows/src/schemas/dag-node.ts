@@ -767,6 +767,477 @@ export const KNOWN_DAG_NODE_KEYS: ReadonlySet<string> = new Set(
 // dagNodeSchema — flat validation schema with transform to DagNode
 // ---------------------------------------------------------------------------
 
+type RawDagNode = z.infer<typeof dagNodeFlatSchema>;
+type DagNodeRefinementContext = Parameters<Parameters<typeof dagNodeFlatSchema.superRefine>[0]>[1];
+
+interface DagNodeModeFlags {
+  hasCommand: boolean;
+  hasPrompt: boolean;
+  hasBash: boolean;
+  hasLoop: boolean;
+  hasLoopGroup: boolean;
+  hasApproval: boolean;
+  hasCancel: boolean;
+  hasControllerAction: boolean;
+  hasScript: boolean;
+  hasInclude: boolean;
+  hasWorkflow: boolean;
+}
+
+interface DagNodeStructuralBase {
+  id: string;
+  description?: string;
+  depends_on?: string[];
+  when?: string;
+  trigger_rule?: TriggerRule;
+}
+
+interface DagNodeExecutionBase extends DagNodeStructuralBase {
+  idle_timeout?: number;
+  timeout?: number;
+  always_run?: boolean;
+  output_type?: string;
+}
+
+interface DagNodeSharedFields {
+  retry?: z.infer<typeof stepRetryConfigSchema>;
+}
+
+type DagNodeAiFields = Partial<
+  Pick<
+    PromptNode,
+    | 'model'
+    | 'provider'
+    | 'context'
+    | 'output_format'
+    | 'allowed_tools'
+    | 'denied_tools'
+    | 'hooks'
+    | 'mcp'
+    | 'skills'
+    | 'agents'
+    | 'pi'
+    | 'effort'
+    | 'thinking'
+    | 'maxBudgetUsd'
+    | 'systemPrompt'
+    | 'fallbackModel'
+    | 'settingSources'
+    | 'betas'
+    | 'sandbox'
+    | 'persist_session'
+  >
+>;
+
+function addDagNodeIssue(
+  ctx: DagNodeRefinementContext,
+  message: string,
+  path?: (string | number)[]
+): void {
+  ctx.addIssue({
+    code: z.ZodIssueCode.custom,
+    message,
+    ...(path !== undefined ? { path } : {}),
+  });
+}
+
+function getDagNodeModeFlags(data: RawDagNode): DagNodeModeFlags {
+  return {
+    hasCommand: typeof data.command === 'string' && data.command.trim().length > 0,
+    hasPrompt: typeof data.prompt === 'string' && data.prompt.trim().length > 0,
+    hasBash: typeof data.bash === 'string' && data.bash.trim().length > 0,
+    hasLoop: data.loop !== undefined,
+    hasLoopGroup: data.loop_group !== undefined,
+    hasApproval: data.approval !== undefined,
+    hasCancel: typeof data.cancel === 'string' && data.cancel.trim().length > 0,
+    hasControllerAction: data.controller_action !== undefined,
+    hasScript: typeof data.script === 'string' && data.script.trim().length > 0,
+    hasInclude: typeof data.include === 'string' && data.include.trim().length > 0,
+    hasWorkflow: typeof data.workflow === 'string' && data.workflow.trim().length > 0,
+  };
+}
+
+function countDagNodeModes(flags: DagNodeModeFlags): number {
+  return Object.values(flags).filter(Boolean).length;
+}
+
+function validateDagNodeId(data: RawDagNode, ctx: DagNodeRefinementContext): boolean {
+  const id = data.id.trim();
+  if (!id) {
+    addDagNodeIssue(ctx, "missing required field 'id'", ['id']);
+    return false;
+  }
+  if (id === 'INPUTS') {
+    addDagNodeIssue(ctx, "node id 'INPUTS' is reserved for the $INPUTS.<name> parameter surface", [
+      'id',
+    ]);
+  }
+  return true;
+}
+
+function validateIncludeWith(data: RawDagNode, ctx: DagNodeRefinementContext): void {
+  if (data.with === undefined) return;
+  const prototype =
+    typeof data.with === 'object' && data.with !== null
+      ? Object.getPrototypeOf(data.with)
+      : undefined;
+  if (
+    typeof data.with !== 'object' ||
+    data.with === null ||
+    Array.isArray(data.with) ||
+    (prototype !== Object.prototype && prototype !== null)
+  ) {
+    addDagNodeIssue(
+      ctx,
+      "'with' on include nodes must be an object mapping input names to strings",
+      ['with']
+    );
+    return;
+  }
+  for (const [key, value] of Object.entries(data.with)) {
+    if (!INPUT_NAME_PATTERN.test(key)) {
+      addDagNodeIssue(
+        ctx,
+        `invalid include input name '${key}'; use letters, numbers, underscores, or hyphens and start with a letter or underscore`,
+        ['with']
+      );
+    }
+    if (typeof value !== 'string') {
+      addDagNodeIssue(ctx, `include input '${key}' must be a string`, ['with']);
+    }
+  }
+}
+
+function validateWorkflowNodeUnsupportedFields(
+  data: RawDagNode,
+  ctx: DagNodeRefinementContext
+): void {
+  if (data.with !== undefined) {
+    addDagNodeIssue(
+      ctx,
+      "'with:' named-parameter mapping is not yet supported on workflow nodes (slice 2). Use 'input:' instead.",
+      ['with']
+    );
+  }
+  if (data.retry !== undefined) {
+    addDagNodeIssue(
+      ctx,
+      "'retry' is not supported on workflow nodes (a retry would orphan the first child run — resume through the parent instead)",
+      ['retry']
+    );
+  }
+}
+
+function validateWorkflowFanOut(data: RawDagNode, ctx: DagNodeRefinementContext): void {
+  if (data.fan_out?.join === 'first_success') {
+    addDagNodeIssue(
+      ctx,
+      "'fan_out.join: first_success' (racing) is rejected, not deferred: a winner cancels " +
+        "the losers, which couples children that are meant to be independent. Use 'all_done' " +
+        '(the default). For several genuinely different attempts, write them as separate ' +
+        'nodes with their own models feeding one collector node — every attempt is kept and ' +
+        'nothing is cancelled.',
+      ['fan_out', 'join']
+    );
+  }
+  if (data.fan_out?.as !== undefined) {
+    addDagNodeIssue(
+      ctx,
+      "'fan_out.as' (the $INPUTS channel) is not yet supported (PR-B, #2214). Remove it — " +
+        "each item is delivered to the child as $ARGUMENTS, which the child's prompts can use today.",
+      ['fan_out', 'as']
+    );
+  }
+}
+
+function validateModeSpecificUnsupportedFields(
+  data: RawDagNode,
+  flags: DagNodeModeFlags,
+  ctx: DagNodeRefinementContext
+): void {
+  if (flags.hasInclude) validateIncludeWith(data, ctx);
+  if (flags.hasWorkflow) validateWorkflowNodeUnsupportedFields(data, ctx);
+  if (!flags.hasWorkflow && data.isolation !== undefined) {
+    addDagNodeIssue(ctx, "'isolation' is only supported on workflow (sub-run) nodes.", [
+      'isolation',
+    ]);
+  }
+  if (!flags.hasWorkflow && data.fan_out !== undefined) {
+    addDagNodeIssue(ctx, "'fan_out' is only supported on workflow (sub-run) nodes.", ['fan_out']);
+  }
+  if (flags.hasWorkflow) validateWorkflowFanOut(data, ctx);
+}
+
+function validateEmptyOrMissingMode(
+  data: RawDagNode,
+  modeCount: number,
+  ctx: DagNodeRefinementContext
+): boolean {
+  if (modeCount !== 0) return true;
+  if (typeof data.bash === 'string') {
+    addDagNodeIssue(ctx, 'bash script cannot be empty', ['bash']);
+    return false;
+  }
+  if (typeof data.prompt === 'string') {
+    addDagNodeIssue(ctx, 'prompt cannot be empty', ['prompt']);
+    return false;
+  }
+  if (typeof data.script === 'string') {
+    addDagNodeIssue(ctx, 'script cannot be empty', ['script']);
+    return false;
+  }
+  addDagNodeIssue(
+    ctx,
+    "must have either 'command', 'prompt', 'bash', 'loop', 'loop_group', 'approval', 'cancel', 'controller_action', 'script', 'include', or 'workflow'"
+  );
+  return false;
+}
+
+function isInvalidPositiveNumber(value: number | undefined): boolean {
+  return value !== undefined && (value <= 0 || !isFinite(value));
+}
+
+function validateCommandModeField(
+  data: RawDagNode,
+  flags: DagNodeModeFlags,
+  ctx: DagNodeRefinementContext
+): void {
+  if (!flags.hasCommand) return;
+  const command = (data.command ?? '').trim();
+  if (!isValidCommandName(command)) {
+    addDagNodeIssue(ctx, `invalid command name "${command}"`, ['command']);
+  }
+}
+
+function validateScriptModeFields(
+  data: RawDagNode,
+  flags: DagNodeModeFlags,
+  ctx: DagNodeRefinementContext
+): void {
+  if (!flags.hasScript) return;
+  if (data.runtime === undefined) {
+    addDagNodeIssue(ctx, "'runtime' is required for script nodes ('bun' or 'uv')", ['runtime']);
+  }
+  if (isInvalidPositiveNumber(data.timeout)) {
+    addDagNodeIssue(ctx, "'timeout' must be a positive number (ms)", ['timeout']);
+  }
+}
+
+function validateControllerActionFields(
+  data: RawDagNode,
+  flags: DagNodeModeFlags,
+  ctx: DagNodeRefinementContext
+): void {
+  if (flags.hasControllerAction && (data.phase === undefined || data.phase.trim().length === 0)) {
+    addDagNodeIssue(ctx, "'phase' is required for controller_action nodes.", ['phase']);
+  }
+  if (!flags.hasControllerAction && data.phase !== undefined) {
+    addDagNodeIssue(ctx, "'phase' is only supported on controller_action nodes.", ['phase']);
+  }
+}
+
+function validateRetryFields(
+  data: RawDagNode,
+  flags: DagNodeModeFlags,
+  ctx: DagNodeRefinementContext
+): void {
+  if (flags.hasLoop && data.retry !== undefined) {
+    addDagNodeIssue(
+      ctx,
+      "'retry' is not supported on loop nodes (loop manages its own iteration)",
+      ['retry']
+    );
+  }
+  if (flags.hasLoopGroup && data.retry !== undefined) {
+    addDagNodeIssue(
+      ctx,
+      "'retry' is not supported on loop_group nodes (loop_group manages its own iteration)",
+      ['retry']
+    );
+  }
+}
+
+function validateExecutableNodeFields(
+  data: RawDagNode,
+  flags: DagNodeModeFlags,
+  ctx: DagNodeRefinementContext
+): void {
+  validateCommandModeField(data, flags, ctx);
+  if (
+    (flags.hasBash || flags.hasCommand || flags.hasPrompt || flags.hasLoop) &&
+    isInvalidPositiveNumber(data.timeout)
+  ) {
+    addDagNodeIssue(ctx, "'timeout' must be a positive number (ms)", ['timeout']);
+  }
+  validateScriptModeFields(data, flags, ctx);
+  validateControllerActionFields(data, flags, ctx);
+  validateRetryFields(data, flags, ctx);
+  if (isInvalidPositiveNumber(data.idle_timeout)) {
+    addDagNodeIssue(ctx, "'idle_timeout' must be a finite positive number (ms)", ['idle_timeout']);
+  }
+}
+
+function refineDagNode(data: RawDagNode, ctx: DagNodeRefinementContext): void {
+  if (!validateDagNodeId(data, ctx)) return z.NEVER;
+  const flags = getDagNodeModeFlags(data);
+  const modeCount = countDagNodeModes(flags);
+  if (modeCount > 1) {
+    addDagNodeIssue(
+      ctx,
+      "'command', 'prompt', 'bash', 'loop', 'loop_group', 'approval', 'cancel', 'controller_action', 'script', 'include', and 'workflow' are mutually exclusive"
+    );
+    return z.NEVER;
+  }
+  validateModeSpecificUnsupportedFields(data, flags, ctx);
+  if (!validateEmptyOrMissingMode(data, modeCount, ctx)) return z.NEVER;
+  validateExecutableNodeFields(data, flags, ctx);
+}
+
+function buildDagNodeStructuralBase(data: RawDagNode): DagNodeStructuralBase {
+  const id = data.id.trim();
+  return {
+    id,
+    ...(data.description !== undefined ? { description: data.description } : {}),
+    ...(data.depends_on !== undefined && data.depends_on.length > 0
+      ? { depends_on: data.depends_on }
+      : {}),
+    ...(data.when !== undefined ? { when: data.when } : {}),
+    ...(data.trigger_rule !== undefined ? { trigger_rule: data.trigger_rule } : {}),
+  };
+}
+
+function buildDagNodeExecutionBase(
+  data: RawDagNode,
+  structuralBase: DagNodeStructuralBase
+): DagNodeExecutionBase {
+  return {
+    ...structuralBase,
+    ...(data.idle_timeout !== undefined ? { idle_timeout: data.idle_timeout } : {}),
+    ...(data.timeout !== undefined ? { timeout: data.timeout } : {}),
+    ...(data.always_run !== undefined ? { always_run: data.always_run } : {}),
+    ...(data.output_type !== undefined ? { output_type: data.output_type } : {}),
+  };
+}
+
+function buildDagNodeSharedFields(data: RawDagNode): DagNodeSharedFields {
+  return {
+    ...(data.retry !== undefined ? { retry: data.retry } : {}),
+  };
+}
+
+function buildPrimaryDagNodeAiFields(data: RawDagNode): DagNodeAiFields {
+  return {
+    ...(data.model !== undefined ? { model: data.model } : {}),
+    ...(data.provider !== undefined ? { provider: data.provider } : {}),
+    ...(data.context !== undefined ? { context: data.context } : {}),
+    ...(data.output_format !== undefined ? { output_format: data.output_format } : {}),
+    ...(data.allowed_tools !== undefined ? { allowed_tools: data.allowed_tools } : {}),
+    ...(data.denied_tools !== undefined ? { denied_tools: data.denied_tools } : {}),
+    ...(data.hooks !== undefined ? { hooks: data.hooks } : {}),
+    ...(data.mcp !== undefined ? { mcp: data.mcp.trim() } : {}),
+    ...(data.skills !== undefined ? { skills: data.skills.map(s => s.trim()) } : {}),
+    ...(data.agents !== undefined ? { agents: data.agents } : {}),
+  };
+}
+
+function buildAdvancedDagNodeAiFields(data: RawDagNode): DagNodeAiFields {
+  return {
+    ...(data.pi !== undefined ? { pi: data.pi } : {}),
+    ...(data.effort !== undefined ? { effort: data.effort } : {}),
+    ...(data.thinking !== undefined ? { thinking: data.thinking } : {}),
+    ...(data.maxBudgetUsd !== undefined ? { maxBudgetUsd: data.maxBudgetUsd } : {}),
+    ...(data.systemPrompt !== undefined ? { systemPrompt: data.systemPrompt } : {}),
+    ...(data.fallbackModel !== undefined ? { fallbackModel: data.fallbackModel } : {}),
+    ...(data.settingSources !== undefined ? { settingSources: data.settingSources } : {}),
+    ...(data.betas !== undefined ? { betas: data.betas } : {}),
+    ...(data.sandbox !== undefined ? { sandbox: data.sandbox } : {}),
+    ...(data.persist_session !== undefined ? { persist_session: data.persist_session } : {}),
+  };
+}
+
+function buildDagNodeAiFields(data: RawDagNode): DagNodeAiFields {
+  return {
+    ...buildPrimaryDagNodeAiFields(data),
+    ...buildAdvancedDagNodeAiFields(data),
+  };
+}
+
+function transformDagNode(data: RawDagNode): DagNode {
+  const structuralBase = buildDagNodeStructuralBase(data);
+  const base = buildDagNodeExecutionBase(data, structuralBase);
+  const shared = buildDagNodeSharedFields(data);
+  const aiOnly = buildDagNodeAiFields(data);
+
+  if (data.command !== undefined && data.command.trim().length > 0) {
+    return { ...base, ...shared, ...aiOnly, command: data.command.trim() } as CommandNode;
+  }
+  if (data.prompt !== undefined && data.prompt.trim().length > 0) {
+    return { ...base, ...shared, ...aiOnly, prompt: data.prompt.trim() } as PromptNode;
+  }
+  if (data.bash !== undefined && data.bash.trim().length > 0) {
+    return { ...base, ...shared, bash: data.bash.trim() } as BashNode;
+  }
+  if (data.script !== undefined && data.script.trim().length > 0) {
+    if (!data.runtime) throw new Error('unreachable: runtime must be defined for script nodes');
+    return {
+      ...base,
+      ...shared,
+      script: data.script.trim(),
+      runtime: data.runtime,
+      ...(data.deps !== undefined ? { deps: data.deps } : {}),
+    } as ScriptNode;
+  }
+  return transformDagNodeDirective(data, structuralBase, base, shared, aiOnly);
+}
+
+function transformDagNodeDirective(
+  data: RawDagNode,
+  structuralBase: DagNodeStructuralBase,
+  base: DagNodeExecutionBase,
+  shared: DagNodeSharedFields,
+  aiOnly: DagNodeAiFields
+): DagNode {
+  if (data.approval !== undefined)
+    return { ...base, ...shared, approval: data.approval } as ApprovalNode;
+  if (data.cancel !== undefined && data.cancel.trim().length > 0) {
+    return { ...base, ...shared, cancel: data.cancel.trim() } as CancelNode;
+  }
+  if (data.controller_action !== undefined) {
+    return {
+      ...base,
+      ...shared,
+      controller_action: data.controller_action,
+      ...(data.phase !== undefined ? { phase: data.phase.trim() } : {}),
+    } as ControllerActionNode;
+  }
+  if (data.include !== undefined && data.include.trim().length > 0) {
+    return {
+      ...structuralBase,
+      include: data.include.trim(),
+      ...(data.with !== undefined ? { with: data.with as Record<string, string> } : {}),
+    } as IncludeNode;
+  }
+  if (data.workflow !== undefined && data.workflow.trim().length > 0) {
+    return {
+      ...structuralBase,
+      ...(data.output_type !== undefined ? { output_type: data.output_type } : {}),
+      ...(data.output_format !== undefined ? { output_format: data.output_format } : {}),
+      workflow: data.workflow.trim(),
+      ...(data.input !== undefined ? { input: data.input } : {}),
+      ...(data.isolation !== undefined ? { isolation: data.isolation } : {}),
+      ...(data.fan_out !== undefined ? { fan_out: data.fan_out } : {}),
+    } as WorkflowNode;
+  }
+  if (data.loop_group !== undefined)
+    return { ...base, ...aiOnly, loop_group: data.loop_group } as LoopGroupNode;
+  if (!data.loop) throw new Error('unreachable: loop must be defined after superRefine');
+  return {
+    ...base,
+    ...(data.pi !== undefined ? { pi: data.pi } : {}),
+    loop: data.loop,
+  } as LoopNode;
+}
+
 /**
  * Validates a raw YAML object as a DAG node and transforms it to a typed DagNode.
  *
@@ -783,457 +1254,8 @@ export const KNOWN_DAG_NODE_KEYS: ReadonlySet<string> = new Set(
  * unchanged — the SDK is the source of truth for what model names exist.
  */
 export const dagNodeSchema = dagNodeFlatSchema
-  .superRefine((data, ctx) => {
-    const id = data.id.trim();
-
-    // id must be non-empty
-    if (!id) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: "missing required field 'id'",
-        path: ['id'],
-      });
-      return z.NEVER;
-    }
-    if (id === 'INPUTS') {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: "node id 'INPUTS' is reserved for the $INPUTS.<name> parameter surface",
-        path: ['id'],
-      });
-    }
-
-    const hasCommand = typeof data.command === 'string' && data.command.trim().length > 0;
-    const hasPrompt = typeof data.prompt === 'string' && data.prompt.trim().length > 0;
-    const hasBash = typeof data.bash === 'string' && data.bash.trim().length > 0;
-    const hasLoop = data.loop !== undefined;
-    const hasLoopGroup = data.loop_group !== undefined;
-    const hasApproval = data.approval !== undefined;
-    const hasCancel = typeof data.cancel === 'string' && data.cancel.trim().length > 0;
-    const hasControllerAction = data.controller_action !== undefined;
-    const hasScript = typeof data.script === 'string' && data.script.trim().length > 0;
-    const hasInclude = typeof data.include === 'string' && data.include.trim().length > 0;
-    const hasWorkflow = typeof data.workflow === 'string' && data.workflow.trim().length > 0;
-
-    const modeCount = [
-      hasCommand,
-      hasPrompt,
-      hasBash,
-      hasLoop,
-      hasLoopGroup,
-      hasApproval,
-      hasCancel,
-      hasControllerAction,
-      hasScript,
-      hasInclude,
-      hasWorkflow,
-    ].filter(Boolean).length;
-
-    if (modeCount > 1) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message:
-          "'command', 'prompt', 'bash', 'loop', 'loop_group', 'approval', 'cancel', 'controller_action', 'script', 'include', and 'workflow' are mutually exclusive",
-      });
-      return z.NEVER;
-    }
-
-    // `include.with` is a load-time, identifier-keyed string map. Keep the flat
-    // field raw so other node variants can still strip it contextually.
-    if (hasInclude && data.with !== undefined) {
-      const prototype =
-        typeof data.with === 'object' && data.with !== null
-          ? Object.getPrototypeOf(data.with)
-          : undefined;
-      if (
-        typeof data.with !== 'object' ||
-        data.with === null ||
-        Array.isArray(data.with) ||
-        (prototype !== Object.prototype && prototype !== null)
-      ) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: "'with' on include nodes must be an object mapping input names to strings",
-          path: ['with'],
-        });
-      } else {
-        for (const [key, value] of Object.entries(data.with)) {
-          if (!INPUT_NAME_PATTERN.test(key)) {
-            ctx.addIssue({
-              code: z.ZodIssueCode.custom,
-              message: `invalid include input name '${key}'; use letters, numbers, underscores, or hyphens and start with a letter or underscore`,
-              path: ['with'],
-            });
-          }
-          if (typeof value !== 'string') {
-            ctx.addIssue({
-              code: z.ZodIssueCode.custom,
-              message: `include input '${key}' must be a string`,
-              path: ['with'],
-            });
-          }
-        }
-      }
-    }
-    if (hasWorkflow && data.with !== undefined) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message:
-          "'with:' named-parameter mapping is not yet supported on workflow nodes (slice 2). Use 'input:' instead.",
-        path: ['with'],
-      });
-    }
-    // 'retry:' on a workflow node would spawn a NEW child run and orphan the first —
-    // recovery is resume-through-parent, not retry (#1764). Reject fail-fast.
-    if (hasWorkflow && data.retry !== undefined) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message:
-          "'retry' is not supported on workflow nodes (a retry would orphan the first child run — resume through the parent instead)",
-        path: ['retry'],
-      });
-    }
-    // Per-child worktree isolation (slice 2, PR-A) is accepted on workflow nodes.
-    // The engine fails the node fast at runtime if no child-isolation resolver is
-    // injected — never a silent shared-checkout fallback. On every OTHER node type
-    // `isolation:` is meaningless (only a `workflow:` node spawns a child run) and
-    // would be silently dropped — reject it fail-fast, mirroring the `with:` guard.
-    if (!hasWorkflow && data.isolation !== undefined) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: "'isolation' is only supported on workflow (sub-run) nodes.",
-        path: ['isolation'],
-      });
-    }
-    // Dynamic fan-out (slice 2, PR-C) is meaningful ONLY on a `workflow:` node — it
-    // multiplies a child sub-run. On any other node type it would be silently dropped,
-    // so reject it fail-fast (mirrors the `isolation` guard above).
-    if (!hasWorkflow && data.fan_out !== undefined) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: "'fan_out' is only supported on workflow (sub-run) nodes.",
-        path: ['fan_out'],
-      });
-    }
-    // `first_success` racing is REJECTED, not deferred — the earlier deferral is dead. A
-    // winner aborting and cancelling its losers is one child's outcome ending its siblings',
-    // which the independence rule forbids, and racing without terminating the losers is not
-    // racing. So there is no PR to wait for and the message must not imply one.
-    //
-    // The enum value stays even though its original "so the eventual PR only lifts a guard"
-    // justification is gone. A better one replaces it: an author whose YAML already says
-    // `first_success` gets a message naming the rejection and the shape that serves the want,
-    // instead of an opaque unrecognised-enum-value error. Do not remove it as dead weight.
-    if (hasWorkflow && data.fan_out?.join === 'first_success') {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message:
-          "'fan_out.join: first_success' (racing) is rejected, not deferred: a winner cancels " +
-          "the losers, which couples children that are meant to be independent. Use 'all_done' " +
-          '(the default). For several genuinely different attempts, write them as separate ' +
-          'nodes with their own models feeding one collector node — every attempt is kept and ' +
-          'nothing is cancelled.',
-        path: ['fan_out', 'join'],
-      });
-    }
-    // `as` names the per-item value for the `$INPUTS.<as>` channel that PR-B (#2214) will
-    // add. Accept the key in the schema (so PR-B lifts a guard rather than migrating YAML)
-    // but reject it fail-fast now, exactly as `first_success` above. `$INPUTS` exists
-    // nowhere in the engine today, so an author writing `as: task` and `$INPUTS.task` in
-    // the child gets the literal string delivered to the model — silently wrong output
-    // with no error. A field that quietly does nothing reads as a working feature.
-    if (hasWorkflow && data.fan_out?.as !== undefined) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message:
-          "'fan_out.as' (the $INPUTS channel) is not yet supported (PR-B, #2214). Remove it — " +
-          "each item is delivered to the child as $ARGUMENTS, which the child's prompts can use today.",
-        path: ['fan_out', 'as'],
-      });
-    }
-
-    if (modeCount === 0) {
-      if (typeof data.bash === 'string') {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: 'bash script cannot be empty',
-          path: ['bash'],
-        });
-        return z.NEVER;
-      }
-      if (typeof data.prompt === 'string') {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: 'prompt cannot be empty',
-          path: ['prompt'],
-        });
-        return z.NEVER;
-      }
-      if (typeof data.script === 'string') {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: 'script cannot be empty',
-          path: ['script'],
-        });
-        return z.NEVER;
-      }
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message:
-          "must have either 'command', 'prompt', 'bash', 'loop', 'loop_group', 'approval', 'cancel', 'controller_action', 'script', 'include', or 'workflow'",
-      });
-      return z.NEVER;
-    }
-
-    // Command name validation
-    if (hasCommand && !isValidCommandName((data.command ?? '').trim())) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: `invalid command name "${(data.command ?? '').trim()}"`,
-        path: ['command'],
-      });
-    }
-
-    // Bash node validations
-    if (hasBash) {
-      if (data.timeout !== undefined && (data.timeout <= 0 || !isFinite(data.timeout))) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: "'timeout' must be a positive number (ms)",
-          path: ['timeout'],
-        });
-      }
-    }
-
-    if (
-      (hasCommand || hasPrompt || hasLoop) &&
-      data.timeout !== undefined &&
-      (data.timeout <= 0 || !isFinite(data.timeout))
-    ) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: "'timeout' must be a positive number (ms)",
-        path: ['timeout'],
-      });
-    }
-
-    // Script node validations
-    if (hasScript) {
-      if (data.runtime === undefined) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: "'runtime' is required for script nodes ('bun' or 'uv')",
-          path: ['runtime'],
-        });
-      }
-      if (data.timeout !== undefined && (data.timeout <= 0 || !isFinite(data.timeout))) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: "'timeout' must be a positive number (ms)",
-          path: ['timeout'],
-        });
-      }
-    }
-
-    if (hasControllerAction && (data.phase === undefined || data.phase.trim().length === 0)) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: "'phase' is required for controller_action nodes.",
-        path: ['phase'],
-      });
-    }
-
-    if (!hasControllerAction && data.phase !== undefined) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: "'phase' is only supported on controller_action nodes.",
-        path: ['phase'],
-      });
-    }
-
-    // Loop node: retry not supported
-    if (hasLoop && data.retry !== undefined) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: "'retry' is not supported on loop nodes (loop manages its own iteration)",
-        path: ['retry'],
-      });
-    }
-
-    // Loop-group node: retry not supported (the loop_group manages its own iteration)
-    if (hasLoopGroup && data.retry !== undefined) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message:
-          "'retry' is not supported on loop_group nodes (loop_group manages its own iteration)",
-        path: ['retry'],
-      });
-    }
-
-    // idle_timeout must be finite and positive
-    if (
-      data.idle_timeout !== undefined &&
-      (data.idle_timeout <= 0 || !isFinite(data.idle_timeout))
-    ) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: "'idle_timeout' must be a finite positive number (ms)",
-        path: ['idle_timeout'],
-      });
-    }
-  })
-  .transform((data): DagNode => {
-    const id = data.id.trim();
-
-    // Structural graph fields present on every node — including the execution-less
-    // include node, which carries ONLY these (see the include branch below). Sparse:
-    // only defined values are included.
-    const structuralBase = {
-      id,
-      ...(data.description !== undefined ? { description: data.description } : {}),
-      ...(data.depends_on !== undefined && data.depends_on.length > 0
-        ? { depends_on: data.depends_on }
-        : {}),
-      ...(data.when !== undefined ? { when: data.when } : {}),
-      ...(data.trigger_rule !== undefined ? { trigger_rule: data.trigger_rule } : {}),
-    };
-
-    // Common base fields for executable nodes — structural fields plus the exec-only
-    // scheduling fields (sparse — only include defined values).
-    const base = {
-      ...structuralBase,
-      ...(data.idle_timeout !== undefined ? { idle_timeout: data.idle_timeout } : {}),
-      ...(data.timeout !== undefined ? { timeout: data.timeout } : {}),
-      ...(data.always_run !== undefined ? { always_run: data.always_run } : {}),
-      ...(data.output_type !== undefined ? { output_type: data.output_type } : {}),
-    };
-
-    // Shared optional fields (valid on AI and bash nodes)
-    const shared = {
-      ...(data.retry !== undefined ? { retry: data.retry } : {}),
-    };
-
-    // AI-only fields (not applicable to bash/loop nodes)
-    const aiOnly = {
-      ...(data.model !== undefined ? { model: data.model } : {}),
-      ...(data.provider !== undefined ? { provider: data.provider } : {}),
-      ...(data.context !== undefined ? { context: data.context } : {}),
-      ...(data.output_format !== undefined ? { output_format: data.output_format } : {}),
-      ...(data.allowed_tools !== undefined ? { allowed_tools: data.allowed_tools } : {}),
-      ...(data.denied_tools !== undefined ? { denied_tools: data.denied_tools } : {}),
-      ...(data.hooks !== undefined ? { hooks: data.hooks } : {}),
-      ...(data.mcp !== undefined ? { mcp: data.mcp.trim() } : {}),
-      ...(data.skills !== undefined ? { skills: data.skills.map(s => s.trim()) } : {}),
-      ...(data.agents !== undefined ? { agents: data.agents } : {}),
-      ...(data.pi !== undefined ? { pi: data.pi } : {}),
-      ...(data.effort !== undefined ? { effort: data.effort } : {}),
-      ...(data.thinking !== undefined ? { thinking: data.thinking } : {}),
-      ...(data.maxBudgetUsd !== undefined ? { maxBudgetUsd: data.maxBudgetUsd } : {}),
-      ...(data.systemPrompt !== undefined ? { systemPrompt: data.systemPrompt } : {}),
-      ...(data.fallbackModel !== undefined ? { fallbackModel: data.fallbackModel } : {}),
-      ...(data.settingSources !== undefined ? { settingSources: data.settingSources } : {}),
-      ...(data.betas !== undefined ? { betas: data.betas } : {}),
-      ...(data.sandbox !== undefined ? { sandbox: data.sandbox } : {}),
-      ...(data.persist_session !== undefined ? { persist_session: data.persist_session } : {}),
-    };
-
-    if (data.command !== undefined && data.command.trim().length > 0) {
-      return { ...base, ...shared, ...aiOnly, command: data.command.trim() } as CommandNode;
-    }
-    if (data.prompt !== undefined && data.prompt.trim().length > 0) {
-      return { ...base, ...shared, ...aiOnly, prompt: data.prompt.trim() } as PromptNode;
-    }
-    if (data.bash !== undefined && data.bash.trim().length > 0) {
-      return {
-        ...base,
-        ...shared,
-        bash: data.bash.trim(),
-        ...(data.timeout !== undefined ? { timeout: data.timeout } : {}),
-      } as BashNode;
-    }
-    if (data.script !== undefined && data.script.trim().length > 0) {
-      // runtime is guaranteed by superRefine to be defined at this point
-      if (!data.runtime) throw new Error('unreachable: runtime must be defined for script nodes');
-      return {
-        ...base,
-        ...shared,
-        script: data.script.trim(),
-        runtime: data.runtime,
-        ...(data.deps !== undefined ? { deps: data.deps } : {}),
-        ...(data.timeout !== undefined ? { timeout: data.timeout } : {}),
-      } as ScriptNode;
-    }
-    if (data.approval !== undefined) {
-      return { ...base, ...shared, approval: data.approval } as ApprovalNode;
-    }
-    if (data.cancel !== undefined && data.cancel.trim().length > 0) {
-      return { ...base, ...shared, cancel: data.cancel.trim() } as CancelNode;
-    }
-    if (data.controller_action !== undefined) {
-      return {
-        ...base,
-        ...shared,
-        controller_action: data.controller_action,
-        ...(data.phase !== undefined ? { phase: data.phase.trim() } : {}),
-      } as ControllerActionNode;
-    }
-    if (data.include !== undefined && data.include.trim().length > 0) {
-      // An include node is a load-time directive, not an executable node. It carries the
-      // structural graph fields, target name, and optional load-time input mapping. The
-      // expander reads those fields to attach and parameterize the sub-DAG (description just
-      // rides along). aiOnly / shared (retry) and the exec-only base fields (always_run /
-      // output_type / idle_timeout) are intentionally dropped; the loader warns about them
-      // via INCLUDE_NODE_IGNORED_FIELDS.
-      return {
-        ...structuralBase,
-        include: data.include.trim(),
-        ...(data.with !== undefined ? { with: data.with as Record<string, string> } : {}),
-      } as IncludeNode;
-    }
-    if (data.workflow !== undefined && data.workflow.trim().length > 0) {
-      // A workflow (sub-run) node makes no direct provider call, so it carries only
-      // the structural graph fields plus the sub-run surface: the target name, the
-      // input data string, the reserved isolation mode, and the output typing fields
-      // (output_type → typed sidecar; output_format → `$id.output.field` on a JSON
-      // child). aiOnly / shared(retry) / exec-only base fields are dropped; the loader
-      // warns about them via WORKFLOW_NODE_IGNORED_FIELDS.
-      return {
-        ...structuralBase,
-        ...(data.output_type !== undefined ? { output_type: data.output_type } : {}),
-        ...(data.output_format !== undefined ? { output_format: data.output_format } : {}),
-        workflow: data.workflow.trim(),
-        ...(data.input !== undefined ? { input: data.input } : {}),
-        // Isolation is EXPLICIT-ONLY — never inferred, including from `fan_out`. How many
-        // children a node spawns says nothing about whether they write; N review or
-        // research children over the shared checkout is the common case. A shared-checkout
-        // fan-out whose children would collide is caught at spawn time instead
-        // (executeFanOutWorkflowNode), where the child's `mutates_checkout` is knowable.
-        ...(data.isolation !== undefined ? { isolation: data.isolation } : {}),
-        ...(data.fan_out !== undefined ? { fan_out: data.fan_out } : {}),
-      } as WorkflowNode;
-    }
-    // loop_group — guaranteed by superRefine to be defined at this point.
-    // Spread aiOnly so group-level model/provider survive parsing — the executor forwards
-    // them to body AI nodes unless overridden per-node ('loop:' historically drops them at
-    // parse; loop_group keeps them to support group-level overrides). The REMAINING aiOnly
-    // fields are the ones LOOP_GROUP_NODE_AI_FIELDS declares unsupported: they ride along
-    // here but the loader warns about and ignores them at runtime.
-    if (data.loop_group !== undefined) {
-      return { ...base, ...aiOnly, loop_group: data.loop_group } as LoopGroupNode;
-    }
-    // loop — guaranteed by superRefine to be defined at this point.
-    // Unlike the rest of aiOnly (dropped for loops — model/provider inherit from
-    // the workflow level), `pi` posture IS kept: the loop's per-iteration Pi
-    // sendQuery is exactly where plannotator planning mode leaks (#2073/#2133),
-    // so the portable `pi:` block must reach it. Excluded from LOOP_NODE_AI_FIELDS
-    // so the loader doesn't warn it's ignored.
-    if (!data.loop) throw new Error('unreachable: loop must be defined after superRefine');
-    return {
-      ...base,
-      ...(data.pi !== undefined ? { pi: data.pi } : {}),
-      loop: data.loop,
-    } as LoopNode;
-  })
+  .superRefine(refineDagNode)
+  .transform(transformDagNode)
   .openapi('DagNode');
 
 // ---------------------------------------------------------------------------

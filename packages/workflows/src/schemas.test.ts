@@ -1103,6 +1103,53 @@ describe('dagNodeSchema — include', () => {
       expect(node.output_type).toBeUndefined();
     }
   });
+
+  test('include with invalid input names and values reports issues in key iteration order', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'r',
+      include: 'archon-review-block',
+      with: { 'bad.key': 42 },
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.map(issue => [issue.path.join('.'), issue.message])).toEqual([
+        [
+          'with',
+          "invalid include input name 'bad.key'; use letters, numbers, underscores, or hyphens and start with a letter or underscore",
+        ],
+        ['with', "include input 'bad.key' must be a string"],
+      ]);
+    }
+  });
+
+  test('workflow fan_out staged fields report join before as with stable paths', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'fan',
+      workflow: 'child',
+      fan_out: { items: '$items.output', join: 'first_success', as: 'task' },
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.map(issue => issue.path.join('.'))).toEqual([
+        'fan_out.join',
+        'fan_out.as',
+      ]);
+      expect(result.error.issues.map(issue => issue.message)).toEqual([
+        "'fan_out.join: first_success' (racing) is rejected, not deferred: a winner cancels the losers, which couples children that are meant to be independent. Use 'all_done' (the default). For several genuinely different attempts, write them as separate nodes with their own models feeding one collector node — every attempt is kept and nothing is cancelled.",
+        "'fan_out.as' (the $INPUTS channel) is not yet supported (PR-B, #2214). Remove it — each item is delivered to the child as $ARGUMENTS, which the child's prompts can use today.",
+      ]);
+    }
+  });
+
+  test('missing id aborts before mode diagnostics', () => {
+    const result = dagNodeSchema.safeParse({ id: '  ', prompt: '', bash: '' });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.map(issue => [issue.path.join('.'), issue.message])).toEqual([
+        ['id', "missing required field 'id'"],
+      ]);
+    }
+  });
 });
 
 describe('INCLUDE_NODE_IGNORED_FIELDS', () => {

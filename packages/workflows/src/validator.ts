@@ -288,6 +288,418 @@ function resolveProvider(
  * Checks that command files, MCP configs, and skill directories actually exist.
  * Call this AFTER parseWorkflow() has passed (Levels 1-2 are prerequisites).
  */
+interface WorkflowResourceContext {
+  workflow: WorkflowDefinition;
+  cwd: string;
+  config?: ValidationConfig;
+  defaultProvider?: string;
+  issues: ValidationIssue[];
+  availableCommands: string[];
+  requiresPortableModelRefs: boolean;
+  aiProfile?: ResolvedAiProfile;
+}
+
+function addAiProfileIssue(issues: ValidationIssue[], error: unknown): void {
+  issues.push({
+    level: 'error',
+    field: 'model',
+    message: (error as Error).message,
+    hint: 'Fix tiers/aliases in .archon/config.yaml, or use literal provider model strings.',
+  });
+}
+
+function buildValidationAiProfile(
+  issues: ValidationIssue[],
+  config: ValidationConfig | undefined,
+  defaultProvider: string | undefined
+): ResolvedAiProfile | undefined {
+  const modelProfileProvider = config?.assistant ?? defaultProvider ?? 'claude';
+  try {
+    return buildAiProfile(modelProfileProvider, {
+      repoTiers: config?.tiers,
+      repoAliases: config?.aliases,
+    });
+  } catch (error) {
+    addAiProfileIssue(issues, error);
+    return undefined;
+  }
+}
+
+function validateModelRef(
+  issues: ValidationIssue[],
+  aiProfile: ResolvedAiProfile | undefined,
+  ref: string,
+  nodeId?: string
+): void {
+  if (!aiProfile) return;
+  try {
+    resolveModelSpec(aiProfile, ref);
+  } catch (error) {
+    issues.push({
+      level: 'error',
+      ...(nodeId !== undefined ? { nodeId } : {}),
+      field: 'model',
+      message: (error as Error).message,
+      hint: 'Fix tiers/aliases in .archon/config.yaml, or use a literal provider model string.',
+    });
+  }
+}
+
+function collectWorkflowResourceNodes(workflow: WorkflowDefinition): DagNode[] {
+  const allNodes: DagNode[] = [];
+  const collectNodes = (nodes: readonly DagNode[]): void => {
+    for (const n of nodes) {
+      allNodes.push(n);
+      if (isLoopGroupNode(n)) collectNodes(n.loop_group.nodes);
+    }
+  };
+  collectNodes(workflow.nodes);
+  return allNodes;
+}
+
+async function validateCommandReference(
+  commandName: string,
+  nodeId: string,
+  field: 'command' | 'loop.command',
+  context: WorkflowResourceContext
+): Promise<void> {
+  if (!isValidCommandName(commandName)) {
+    context.issues.push({
+      level: 'error',
+      nodeId,
+      field,
+      message: `Invalid command name '${commandName}' — must not contain '/', '\\', '..', or start with '.'`,
+      hint: 'Use a simple name like "my-command" (without path separators or the .md extension)',
+    });
+    return;
+  }
+  const resolved = await resolveCommand(commandName, context.cwd, context.config);
+  if (resolved) return;
+  const similar = findSimilar(commandName, context.availableCommands);
+  const issue: ValidationIssue = {
+    level: 'error',
+    nodeId,
+    field,
+    message: `Command '${commandName}' not found`,
+    hint: `Create .archon/commands/${commandName}.md or use an existing command name`,
+  };
+  if (similar.length > 0) {
+    issue.hint = `Did you mean: ${similar.map(s => `'${s}'`).join(', ')}? Or create .archon/commands/${commandName}.md`;
+    issue.suggestions = similar;
+  }
+  context.issues.push(issue);
+}
+
+async function validateNodeCommandResources(
+  node: DagNode,
+  context: WorkflowResourceContext
+): Promise<void> {
+  if ('command' in node && typeof node.command === 'string') {
+    await validateCommandReference(node.command, node.id, 'command', context);
+  }
+  if (isLoopNode(node) && node.loop.command !== undefined) {
+    await validateCommandReference(node.loop.command, node.id, 'loop.command', context);
+  }
+}
+
+async function validateMcpConfigFile(
+  node: DagNode,
+  mcpPath: string,
+  mcpValue: string,
+  issues: ValidationIssue[]
+): Promise<void> {
+  if (!(await fileExists(mcpPath))) {
+    issues.push({
+      level: 'error',
+      nodeId: node.id,
+      field: 'mcp',
+      message: `MCP config file not found: '${mcpValue}'`,
+      hint: `Create the file at ${mcpPath} with MCP server definitions (JSON format). Example:\n  {"server-name": {"command": "npx", "args": ["-y", "@package/name"], "env": {}}}`,
+    });
+    return;
+  }
+  try {
+    const content = await readFile(mcpPath, 'utf-8');
+    const parsed = JSON.parse(content);
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      issues.push({
+        level: 'error',
+        nodeId: node.id,
+        field: 'mcp',
+        message: `MCP config file '${mcpValue}' must be a JSON object (Record<string, ServerConfig>)`,
+        hint: 'The file should contain a JSON object where each key is a server name',
+      });
+    }
+  } catch (e) {
+    const err = e as Error;
+    issues.push({
+      level: 'error',
+      nodeId: node.id,
+      field: 'mcp',
+      message: `MCP config file '${mcpValue}' contains invalid JSON: ${err.message}`,
+      hint: 'Fix the JSON syntax in the MCP config file',
+    });
+  }
+}
+
+async function validateMcpResources(
+  node: DagNode,
+  provider: string | undefined,
+  context: WorkflowResourceContext
+): Promise<void> {
+  if (!('mcp' in node) || typeof node.mcp !== 'string') return;
+  const mcpPath = isAbsolute(node.mcp) ? node.mcp : resolve(context.cwd, node.mcp);
+  await validateMcpConfigFile(node, mcpPath, node.mcp, context.issues);
+  if (provider && isRegisteredProvider(provider)) {
+    const caps = getProviderCapabilities(provider);
+    if (!caps.mcp) {
+      context.issues.push({
+        level: 'warning',
+        nodeId: node.id,
+        field: 'mcp',
+        message: `MCP servers are not supported by provider '${provider}' — this will be ignored`,
+        hint: 'Remove the mcp field or switch to a provider that supports MCP',
+      });
+    }
+  }
+}
+
+async function validateSkillsResources(
+  node: DagNode,
+  provider: string | undefined,
+  context: WorkflowResourceContext
+): Promise<void> {
+  if (!('skills' in node) || !Array.isArray(node.skills)) return;
+  const searchRoots = skillSearchRoots(context.cwd);
+  for (const skillName of node.skills) {
+    let found = false;
+    for (const root of searchRoots) {
+      const skillPath = join(root, skillName, 'SKILL.md');
+      if (await fileExists(skillPath)) {
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      context.issues.push({
+        level: 'warning',
+        nodeId: node.id,
+        field: 'skills',
+        message: `Skill '${skillName}' not found in .agents/skills/ or .claude/skills/ (project or user scope)`,
+        hint: `Install with: npx skills add <repo> — or create manually at .agents/skills/${skillName}/SKILL.md`,
+      });
+    }
+  }
+  if (provider && isRegisteredProvider(provider)) {
+    const caps = getProviderCapabilities(provider);
+    if (!caps.skills) {
+      context.issues.push({
+        level: 'warning',
+        nodeId: node.id,
+        field: 'skills',
+        message: `Skills are not supported by provider '${provider}' — this will be ignored`,
+        hint: 'Remove the skills field or switch to a provider that supports skills',
+      });
+    }
+  }
+}
+
+function validateProviderCapabilityWarnings(
+  node: DagNode,
+  provider: string | undefined,
+  issues: ValidationIssue[]
+): void {
+  if (!provider || !isRegisteredProvider(provider)) return;
+  const caps = getProviderCapabilities(provider);
+  if ('hooks' in node && node.hooks && !caps.hooks) {
+    issues.push({
+      level: 'warning',
+      nodeId: node.id,
+      field: 'hooks',
+      message: `Hooks are not supported by provider '${provider}' — this will be ignored`,
+      hint: 'Remove the hooks field or switch to a provider that supports hooks',
+    });
+  }
+  if ('agents' in node && node.agents && !caps.agents) {
+    issues.push({
+      level: 'warning',
+      nodeId: node.id,
+      field: 'agents',
+      message: `Inline agents are not supported by provider '${provider}' — this will be ignored`,
+      hint: 'Remove the agents field or switch to a provider that supports inline agents (e.g. claude)',
+    });
+  }
+  validateToolRestrictionWarnings(node, provider, caps, issues);
+}
+
+function validateToolRestrictionWarnings(
+  node: DagNode,
+  provider: string,
+  caps: ReturnType<typeof getProviderCapabilities>,
+  issues: ValidationIssue[]
+): void {
+  if (!caps.toolRestrictions) {
+    if (
+      ('allowed_tools' in node && node.allowed_tools !== undefined) ||
+      ('denied_tools' in node && node.denied_tools !== undefined)
+    ) {
+      issues.push({
+        level: 'warning',
+        nodeId: node.id,
+        field: 'allowed_tools/denied_tools',
+        message: `Tool restrictions are not supported by provider '${provider}' — this will be ignored`,
+        hint: 'Remove tool restriction fields or switch to a provider that supports them',
+      });
+    }
+    return;
+  }
+  if (caps.knownToolNames !== undefined && caps.knownToolNames.length > 0) {
+    validateKnownToolNames(node, provider, caps.knownToolNames, caps.renamedTools, issues);
+  }
+}
+
+function validateKnownToolNames(
+  node: DagNode,
+  provider: string,
+  known: readonly string[],
+  renamedTools: Record<string, string> | undefined,
+  issues: ValidationIssue[]
+): void {
+  const toolLists = [
+    ['allowed_tools', 'allowed_tools' in node ? node.allowed_tools : undefined],
+    ['denied_tools', 'denied_tools' in node ? node.denied_tools : undefined],
+  ] as const;
+  for (const [field, entries] of toolLists) {
+    for (const entry of entries ?? []) {
+      validateKnownToolEntry(node, provider, known, renamedTools, field, entry, issues);
+    }
+  }
+}
+
+function validateKnownToolEntry(
+  node: DagNode,
+  provider: string,
+  known: readonly string[],
+  renamedTools: Record<string, string> | undefined,
+  field: 'allowed_tools' | 'denied_tools',
+  entry: string,
+  issues: ValidationIssue[]
+): void {
+  const base = entry.split('(')[0].trim();
+  if (base === '' || base.startsWith('mcp__') || known.includes(base)) return;
+  const renamed = renamedTools?.[base];
+  if (renamed !== undefined) {
+    issues.push({
+      level: 'warning',
+      nodeId: node.id,
+      field,
+      message: `Tool '${base}' was renamed to '${renamed}' in the ${provider} SDK — the old name is silently ignored at runtime`,
+      hint: `Replace '${base}' with '${renamed}' in ${field}`,
+      suggestions: [renamed],
+    });
+    return;
+  }
+  const similar = findSimilar(base, known);
+  const issue: ValidationIssue = {
+    level: 'warning',
+    nodeId: node.id,
+    field,
+    message: `Unknown tool '${base}' for provider '${provider}' — unrecognized names are silently ignored at runtime`,
+    hint: 'Use a built-in tool name, or the mcp__<server>__<tool> form for MCP tools',
+  };
+  if (similar.length > 0) {
+    issue.hint = `Did you mean: ${similar.map(s => `'${s}'`).join(', ')}? (MCP tools use the mcp__<server>__<tool> form)`;
+    issue.suggestions = similar;
+  }
+  issues.push(issue);
+}
+
+async function validateScriptResources(
+  node: DagNode,
+  context: WorkflowResourceContext
+): Promise<void> {
+  if (!isScriptNode(node)) return;
+  if (!isInlineScript(node.script)) {
+    const scripts = await discoverScriptsForCwd(context.cwd);
+    const entry = scripts.get(node.script);
+    const scriptExists =
+      entry !== undefined &&
+      (node.runtime === 'uv' ? entry.runtime === 'uv' : entry.runtime === 'bun');
+    if (!scriptExists) {
+      context.issues.push({
+        level: 'error',
+        nodeId: node.id,
+        field: 'script',
+        message: `Named script '${node.script}' not found in .archon/scripts/ or ~/.archon/scripts/`,
+        hint: `Create .archon/scripts/${node.script}.${node.runtime === 'uv' ? 'py' : 'ts'} with your script code (or place at ~/.archon/scripts/ to share across repos)`,
+      });
+    }
+  }
+  const runtimeAvailable = await checkRuntimeAvailable(node.runtime);
+  if (!runtimeAvailable) {
+    context.issues.push({
+      level: 'warning',
+      nodeId: node.id,
+      field: 'runtime',
+      message: `Runtime '${node.runtime}' is not available on PATH`,
+      hint: RUNTIME_INSTALL_HINTS[node.runtime],
+    });
+  }
+  if (node.runtime === 'bun' && node.deps && node.deps.length > 0) {
+    context.issues.push({
+      level: 'warning',
+      nodeId: node.id,
+      field: 'deps',
+      message: "'deps' is ignored for bun runtime (bun auto-installs packages at runtime)",
+      hint: 'Remove deps or switch to runtime: uv if you need explicit dependency management',
+    });
+  }
+}
+
+function warnDoubleQuotedOutputRefs(node: DagNode, issues: ValidationIssue[]): void {
+  const doubleQuotedOutputRef = /(?:^|[=\s])"[^"\n]*\$[a-zA-Z_][a-zA-Z0-9_-]*\.output/m;
+  const warnDoubleQuoted = (body: string, field: string): void => {
+    if (doubleQuotedOutputRef.test(body)) {
+      issues.push({
+        level: 'warning',
+        nodeId: node.id,
+        field,
+        message:
+          '`"$nodeId.output"` — double-quoting a substitution that is already shell-quoted by Archon produces the wrong value',
+        hint: 'Use `var=$node.output.field` (unquoted) — the substitution is injected already quoted. (Numeric/boolean fields are injected raw, so double-quoting is harmless for those, but the rule is uniform.)',
+      });
+    }
+  };
+  if (isBashNode(node)) warnDoubleQuoted(node.bash, 'bash');
+  if (isLoopNode(node) && node.loop.until_bash)
+    warnDoubleQuoted(node.loop.until_bash, 'loop.until_bash');
+}
+
+async function validateNodeResources(
+  node: DagNode,
+  context: WorkflowResourceContext
+): Promise<void> {
+  if (isIncludeNode(node)) return;
+  const provider = resolveProvider(node, context.workflow.provider, context.defaultProvider);
+  if (context.requiresPortableModelRefs && 'model' in node && node.model?.startsWith('@')) {
+    context.issues.push({
+      level: 'error',
+      nodeId: node.id,
+      field: 'model',
+      message: `Node '${node.id}' uses custom model alias '${node.model}', which is not portable for ${context.config?.workflowSource} workflows`,
+      hint: 'Use small, medium, large, or a literal provider model string. Reserve @custom aliases for project workflows.',
+    });
+  }
+  if ('model' in node && node.model)
+    validateModelRef(context.issues, context.aiProfile, node.model, node.id);
+  await validateNodeCommandResources(node, context);
+  await validateMcpResources(node, provider, context);
+  await validateSkillsResources(node, provider, context);
+  validateProviderCapabilityWarnings(node, provider, context.issues);
+  await validateScriptResources(node, context);
+  warnDoubleQuotedOutputRefs(node, context.issues);
+}
+
 export async function validateWorkflowResources(
   workflow: WorkflowDefinition,
   cwd: string,
@@ -298,37 +710,7 @@ export async function validateWorkflowResources(
   const availableCommands = await discoverAvailableCommands(cwd, config);
   const requiresPortableModelRefs =
     config?.workflowSource === 'bundled' || config?.workflowSource === 'global';
-  const modelProfileProvider = config?.assistant ?? defaultProvider ?? 'claude';
-  let aiProfile: ResolvedAiProfile | undefined;
-
-  try {
-    aiProfile = buildAiProfile(modelProfileProvider, {
-      repoTiers: config?.tiers,
-      repoAliases: config?.aliases,
-    });
-  } catch (error) {
-    issues.push({
-      level: 'error',
-      field: 'model',
-      message: (error as Error).message,
-      hint: 'Fix tiers/aliases in .archon/config.yaml, or use literal provider model strings.',
-    });
-  }
-
-  const validateModelRef = (ref: string, nodeId?: string): void => {
-    if (!aiProfile) return;
-    try {
-      resolveModelSpec(aiProfile, ref);
-    } catch (error) {
-      issues.push({
-        level: 'error',
-        ...(nodeId !== undefined ? { nodeId } : {}),
-        field: 'model',
-        message: (error as Error).message,
-        hint: 'Fix tiers/aliases in .archon/config.yaml, or use a literal provider model string.',
-      });
-    }
-  };
+  const aiProfile = buildValidationAiProfile(issues, config, defaultProvider);
 
   if (requiresPortableModelRefs && workflow.model?.startsWith('@')) {
     issues.push({
@@ -338,371 +720,21 @@ export async function validateWorkflowResources(
       hint: 'Use small, medium, large, or a literal provider model string. Reserve @custom aliases for project workflows.',
     });
   }
-  if (workflow.model) validateModelRef(workflow.model);
+  if (workflow.model) validateModelRef(issues, aiProfile, workflow.model);
 
-  // Flatten top-level nodes plus every loop_group body (recursing into nested
-  // loop_groups) so resource checks (commands, mcp, skills, scripts) validate
-  // body nodes too. ID-uniqueness/cycle checks are the loader's job; the validator
-  // only checks referenced resources exist, so flattening is safe here.
-  const allNodes: DagNode[] = [];
-  const collectNodes = (nodes: readonly DagNode[]): void => {
-    for (const n of nodes) {
-      allNodes.push(n);
-      if (isLoopGroupNode(n)) collectNodes(n.loop_group.nodes);
-    }
+  const context: WorkflowResourceContext = {
+    workflow,
+    cwd,
+    config,
+    defaultProvider,
+    issues,
+    availableCommands,
+    requiresPortableModelRefs,
+    aiProfile,
   };
-  collectNodes(workflow.nodes);
-
-  for (const node of allNodes) {
-    // Include nodes carry no resources to check — the target workflow is resolved and
-    // inlined at DISCOVERY time (see include-expander.ts), so discovery-fed validation
-    // (CLI `validate workflows`) sees the already-expanded nodes and checks their
-    // commands/mcp/skills normally. This skip is DEFENSIVE-ONLY: no current caller reaches
-    // it with an unexpanded include node (POST /api/workflows/validate only runs
-    // parseWorkflow, not this resource pass). Kept so a future raw caller can't crash here.
-    if (isIncludeNode(node)) continue;
-
-    const provider = resolveProvider(node, workflow.provider, defaultProvider);
-
-    if (requiresPortableModelRefs && 'model' in node && node.model?.startsWith('@')) {
-      issues.push({
-        level: 'error',
-        nodeId: node.id,
-        field: 'model',
-        message: `Node '${node.id}' uses custom model alias '${node.model}', which is not portable for ${config.workflowSource} workflows`,
-        hint: 'Use small, medium, large, or a literal provider model string. Reserve @custom aliases for project workflows.',
-      });
-    }
-    if ('model' in node && node.model) validateModelRef(node.model, node.id);
-
-    // --- Command nodes: check file exists ---
-    if ('command' in node && typeof node.command === 'string') {
-      if (!isValidCommandName(node.command)) {
-        issues.push({
-          level: 'error',
-          nodeId: node.id,
-          field: 'command',
-          message: `Invalid command name '${node.command}' — must not contain '/', '\\', '..', or start with '.'`,
-          hint: 'Use a simple name like "my-command" (without path separators or the .md extension)',
-        });
-        continue;
-      }
-
-      const resolved = await resolveCommand(node.command, cwd, config);
-      if (!resolved) {
-        const similar = findSimilar(node.command, availableCommands);
-        const issue: ValidationIssue = {
-          level: 'error',
-          nodeId: node.id,
-          field: 'command',
-          message: `Command '${node.command}' not found`,
-          hint: `Create .archon/commands/${node.command}.md or use an existing command name`,
-        };
-        if (similar.length > 0) {
-          issue.hint = `Did you mean: ${similar.map(s => `'${s}'`).join(', ')}? Or create .archon/commands/${node.command}.md`;
-          issue.suggestions = similar;
-        }
-        issues.push(issue);
-      }
-    }
-
-    // --- Loop nodes with loop.command: check file exists (parallel to command-node check above) ---
-    if (isLoopNode(node) && node.loop.command !== undefined) {
-      const loopCommand = node.loop.command;
-      if (!isValidCommandName(loopCommand)) {
-        issues.push({
-          level: 'error',
-          nodeId: node.id,
-          field: 'loop.command',
-          message: `Invalid command name '${loopCommand}' — must not contain '/', '\\', '..', or start with '.'`,
-          hint: 'Use a simple name like "my-command" (without path separators or the .md extension)',
-        });
-      } else {
-        const resolved = await resolveCommand(loopCommand, cwd, config);
-        if (!resolved) {
-          const similar = findSimilar(loopCommand, availableCommands);
-          const issue: ValidationIssue = {
-            level: 'error',
-            nodeId: node.id,
-            field: 'loop.command',
-            message: `Command '${loopCommand}' not found`,
-            hint: `Create .archon/commands/${loopCommand}.md or use an existing command name`,
-          };
-          if (similar.length > 0) {
-            issue.hint = `Did you mean: ${similar.map(s => `'${s}'`).join(', ')}? Or create .archon/commands/${loopCommand}.md`;
-            issue.suggestions = similar;
-          }
-          issues.push(issue);
-        }
-      }
-    }
-
-    // --- MCP nodes: check config file exists and is valid JSON ---
-    if ('mcp' in node && typeof node.mcp === 'string') {
-      const mcpPath = isAbsolute(node.mcp) ? node.mcp : resolve(cwd, node.mcp);
-
-      if (!(await fileExists(mcpPath))) {
-        issues.push({
-          level: 'error',
-          nodeId: node.id,
-          field: 'mcp',
-          message: `MCP config file not found: '${node.mcp}'`,
-          hint: `Create the file at ${mcpPath} with MCP server definitions (JSON format). Example:\n  {"server-name": {"command": "npx", "args": ["-y", "@package/name"], "env": {}}}`,
-        });
-      } else {
-        // File exists — check it's valid JSON
-        try {
-          const content = await readFile(mcpPath, 'utf-8');
-          const parsed = JSON.parse(content);
-          if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-            issues.push({
-              level: 'error',
-              nodeId: node.id,
-              field: 'mcp',
-              message: `MCP config file '${node.mcp}' must be a JSON object (Record<string, ServerConfig>)`,
-              hint: 'The file should contain a JSON object where each key is a server name',
-            });
-          }
-        } catch (e) {
-          const err = e as Error;
-          issues.push({
-            level: 'error',
-            nodeId: node.id,
-            field: 'mcp',
-            message: `MCP config file '${node.mcp}' contains invalid JSON: ${err.message}`,
-            hint: 'Fix the JSON syntax in the MCP config file',
-          });
-        }
-      }
-
-      // Warn if using MCP with a provider that doesn't support it
-      if (provider && isRegisteredProvider(provider)) {
-        const caps = getProviderCapabilities(provider);
-        if (!caps.mcp) {
-          issues.push({
-            level: 'warning',
-            nodeId: node.id,
-            field: 'mcp',
-            message: `MCP servers are not supported by provider '${provider}' — this will be ignored`,
-            hint: 'Remove the mcp field or switch to a provider that supports MCP',
-          });
-        }
-      }
-    }
-
-    // --- Skills nodes: check skill directories exist ---
-    if ('skills' in node && Array.isArray(node.skills)) {
-      const searchRoots = skillSearchRoots(cwd);
-      for (const skillName of node.skills) {
-        let found = false;
-        for (const root of searchRoots) {
-          const skillPath = join(root, skillName, 'SKILL.md');
-          if (await fileExists(skillPath)) {
-            found = true;
-            break;
-          }
-        }
-
-        if (!found) {
-          issues.push({
-            level: 'warning',
-            nodeId: node.id,
-            field: 'skills',
-            message: `Skill '${skillName}' not found in .agents/skills/ or .claude/skills/ (project or user scope)`,
-            hint: `Install with: npx skills add <repo> — or create manually at .agents/skills/${skillName}/SKILL.md`,
-          });
-        }
-      }
-
-      // Warn if using skills with a provider that doesn't support them
-      if (provider && isRegisteredProvider(provider)) {
-        const caps = getProviderCapabilities(provider);
-        if (!caps.skills) {
-          issues.push({
-            level: 'warning',
-            nodeId: node.id,
-            field: 'skills',
-            message: `Skills are not supported by provider '${provider}' — this will be ignored`,
-            hint: 'Remove the skills field or switch to a provider that supports skills',
-          });
-        }
-      }
-    }
-
-    // --- Capability-driven warnings for hooks and tool restrictions ---
-    if (provider && isRegisteredProvider(provider)) {
-      const caps = getProviderCapabilities(provider);
-
-      if ('hooks' in node && node.hooks && !caps.hooks) {
-        issues.push({
-          level: 'warning',
-          nodeId: node.id,
-          field: 'hooks',
-          message: `Hooks are not supported by provider '${provider}' — this will be ignored`,
-          hint: 'Remove the hooks field or switch to a provider that supports hooks',
-        });
-      }
-
-      if ('agents' in node && node.agents && !caps.agents) {
-        issues.push({
-          level: 'warning',
-          nodeId: node.id,
-          field: 'agents',
-          message: `Inline agents are not supported by provider '${provider}' — this will be ignored`,
-          hint: 'Remove the agents field or switch to a provider that supports inline agents (e.g. claude)',
-        });
-      }
-
-      if (!caps.toolRestrictions) {
-        if (
-          ('allowed_tools' in node && node.allowed_tools !== undefined) ||
-          ('denied_tools' in node && node.denied_tools !== undefined)
-        ) {
-          issues.push({
-            level: 'warning',
-            nodeId: node.id,
-            field: 'allowed_tools/denied_tools',
-            message: `Tool restrictions are not supported by provider '${provider}' — this will be ignored`,
-            hint: 'Remove tool restriction fields or switch to a provider that supports them',
-          });
-        }
-      } else if (caps.knownToolNames !== undefined && caps.knownToolNames.length > 0) {
-        // Warn on tool names outside the provider's audited built-in vocabulary
-        // (#2084): the SDK matches names as opaque strings, so a misspelled or
-        // stale name (e.g. `Task` after the Claude SDK renamed it to `Agent`)
-        // is a silent no-op at runtime. Warning-level only — MCP tool names and
-        // tools added by a newer SDK can't be proven invalid, so this must
-        // never hard-fail validation. Providers without a declared vocabulary
-        // skip the check entirely.
-        const known = caps.knownToolNames;
-        const toolLists = [
-          ['allowed_tools', 'allowed_tools' in node ? node.allowed_tools : undefined],
-          ['denied_tools', 'denied_tools' in node ? node.denied_tools : undefined],
-        ] as const;
-        for (const [field, entries] of toolLists) {
-          for (const entry of entries ?? []) {
-            // Permission-rule specifiers wrap a base name: `Bash(git:*)` → `Bash`.
-            const base = entry.split('(')[0].trim();
-            // MCP tool names (mcp__server, mcp__server__tool, mcp__server__*)
-            // are dynamic per-install — never flag them.
-            if (base === '' || base.startsWith('mcp__') || known.includes(base)) continue;
-
-            const renamed = caps.renamedTools?.[base];
-            if (renamed !== undefined) {
-              issues.push({
-                level: 'warning',
-                nodeId: node.id,
-                field,
-                message: `Tool '${base}' was renamed to '${renamed}' in the ${provider} SDK — the old name is silently ignored at runtime`,
-                hint: `Replace '${base}' with '${renamed}' in ${field}`,
-                suggestions: [renamed],
-              });
-              continue;
-            }
-
-            const similar = findSimilar(base, known);
-            const issue: ValidationIssue = {
-              level: 'warning',
-              nodeId: node.id,
-              field,
-              message: `Unknown tool '${base}' for provider '${provider}' — unrecognized names are silently ignored at runtime`,
-              hint: 'Use a built-in tool name, or the mcp__<server>__<tool> form for MCP tools',
-            };
-            if (similar.length > 0) {
-              issue.hint = `Did you mean: ${similar.map(s => `'${s}'`).join(', ')}? (MCP tools use the mcp__<server>__<tool> form)`;
-              issue.suggestions = similar;
-            }
-            issues.push(issue);
-          }
-        }
-      }
-    }
-
-    // --- Script nodes: check named script file exists + runtime available ---
-    if (isScriptNode(node)) {
-      const script = node.script;
-
-      // Named script: validate file exists in repo or home scope.
-      // Precedence mirrors dag-executor: repo > home. Subfolders up to 1 level deep
-      // are searched by discoverScriptsForCwd, matching the workflows/commands convention.
-      if (!isInlineScript(script)) {
-        const scripts = await discoverScriptsForCwd(cwd);
-        const entry = scripts.get(script);
-        const scriptExists =
-          entry !== undefined &&
-          (node.runtime === 'uv' ? entry.runtime === 'uv' : entry.runtime === 'bun');
-
-        if (!scriptExists) {
-          issues.push({
-            level: 'error',
-            nodeId: node.id,
-            field: 'script',
-            message: `Named script '${script}' not found in .archon/scripts/ or ~/.archon/scripts/`,
-            hint: `Create .archon/scripts/${script}.${node.runtime === 'uv' ? 'py' : 'ts'} with your script code (or place at ~/.archon/scripts/ to share across repos)`,
-          });
-        }
-      }
-
-      // Runtime availability: warn if binary not on PATH
-      const runtimeAvailable = await checkRuntimeAvailable(node.runtime);
-      if (!runtimeAvailable) {
-        issues.push({
-          level: 'warning',
-          nodeId: node.id,
-          field: 'runtime',
-          message: `Runtime '${node.runtime}' is not available on PATH`,
-          hint: RUNTIME_INSTALL_HINTS[node.runtime],
-        });
-      }
-
-      // Warn when deps is specified with bun (bun auto-installs, deps is a no-op)
-      if (node.runtime === 'bun' && node.deps && node.deps.length > 0) {
-        issues.push({
-          level: 'warning',
-          nodeId: node.id,
-          field: 'deps',
-          message: "'deps' is ignored for bun runtime (bun auto-installs packages at runtime)",
-          hint: 'Remove deps or switch to runtime: uv if you need explicit dependency management',
-        });
-      }
-    }
-
-    // In bash node bodies (and loop `until_bash`, which substitutes the same way),
-    // $node.output values are injected PRE-QUOTED by Archon: small values are
-    // single-quoted inline ('the value'), large outputs (>32 KB) spill to a temp
-    // file as $(cat '/path'). Wrapping the substitution in double quotes breaks the
-    // SMALL case — var="$n.output" becomes var="'value'", embedding the literal
-    // single-quote chars as data. (For the large $(cat ...) case double-quoting is
-    // actually fine, but the author can't predict the size at write time, so the
-    // rule is unconditional: never double-quote.) Numeric/boolean FIELD values are
-    // injected raw, so double-quoting is harmless for those — which is why the bug
-    // is intermittent and easy to miss.
-    //   wrong="$n.output.field" → wrong="'ok'" (single quotes become part of the value)
-    //   right=$n.output.field   → right='ok' → bash assigns: ok
-    //
-    // The `(?:^|[=\s])"` prefix requires the opening `"` to be an operand (line
-    // start, after `=`, or after whitespace) so a *closing* quote of an unrelated
-    // earlier string doesn't cause a false positive (e.g. `echo "hi"; x=$a.output`).
-    // `[^"\n]` excludes newlines — a double-quote spanning lines is pathological.
-    const doubleQuotedOutputRef = /(?:^|[=\s])"[^"\n]*\$[a-zA-Z_][a-zA-Z0-9_-]*\.output/m;
-    const warnDoubleQuoted = (body: string, field: string): void => {
-      if (doubleQuotedOutputRef.test(body)) {
-        issues.push({
-          level: 'warning',
-          nodeId: node.id,
-          field,
-          message:
-            '`"$nodeId.output"` — double-quoting a substitution that is already shell-quoted by Archon produces the wrong value',
-          hint: 'Use `var=$node.output.field` (unquoted) — the substitution is injected already quoted. (Numeric/boolean fields are injected raw, so double-quoting is harmless for those, but the rule is uniform.)',
-        });
-      }
-    };
-    if (isBashNode(node)) warnDoubleQuoted(node.bash, 'bash');
-    if (isLoopNode(node) && node.loop.until_bash) {
-      warnDoubleQuoted(node.loop.until_bash, 'loop.until_bash');
-    }
+  for (const node of collectWorkflowResourceNodes(workflow)) {
+    await validateNodeResources(node, context);
   }
-
   return issues;
 }
 

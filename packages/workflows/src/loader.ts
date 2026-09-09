@@ -341,35 +341,34 @@ function parseDagNode(
  * fully-flattened, namespaced node list after inlining (duplicate-id collisions,
  * cycles introduced by rewired edges, unknown deps).
  */
-export function validateDagStructure(
+function collectDagNodeIds(
   nodes: DagNode[],
   enclosingIds?: ReadonlySet<string>
-): string | null {
-  // Check ID uniqueness
+): { ids: Set<string>; error: string | null } {
   const ids = new Set<string>();
   for (const node of nodes) {
-    if (ids.has(node.id)) {
-      return `Duplicate node id: '${node.id}'`;
-    }
-    // A loop_group body node must not reuse an enclosing DAG's node id: the executor
-    // seeds each iteration's scoped output map with the outer outputs, so a colliding
-    // body node would silently shadow the outer node for $id.output refs.
+    if (ids.has(node.id)) return { ids, error: `Duplicate node id: '${node.id}'` };
     if (enclosingIds?.has(node.id)) {
-      return `Node id '${node.id}' shadows a node id in the enclosing DAG`;
+      return { ids, error: `Node id '${node.id}' shadows a node id in the enclosing DAG` };
     }
     ids.add(node.id);
   }
+  return { ids, error: null };
+}
 
-  // Check depends_on references
+function validateDependsOnRefs(nodes: DagNode[], ids: ReadonlySet<string>): string | null {
   for (const node of nodes) {
     for (const dep of node.depends_on ?? []) {
-      if (!ids.has(dep)) {
-        return `Node '${node.id}' depends_on unknown node '${dep}'`;
-      }
+      if (!ids.has(dep)) return `Node '${node.id}' depends_on unknown node '${dep}'`;
     }
   }
+  return null;
+}
 
-  // Cycle detection via Kahn's algorithm
+function buildDagEdges(nodes: DagNode[]): {
+  inDegree: Map<string, number>;
+  dependents: Map<string, string[]>;
+} {
   const inDegree = new Map<string, number>();
   const dependents = new Map<string, string[]>();
   for (const node of nodes) {
@@ -380,10 +379,13 @@ export function validateDagStructure(
       dependents.set(dep, existing);
     }
   }
+  return { inDegree, dependents };
+}
 
+function validateDagAcyclic(nodes: DagNode[]): string | null {
+  const { inDegree, dependents } = buildDagEdges(nodes);
   const queue = nodes.filter(n => (inDegree.get(n.id) ?? 0) === 0).map(n => n.id);
   let visited = 0;
-
   while (queue.length > 0) {
     const nodeId = queue.shift();
     if (nodeId === undefined) break;
@@ -394,326 +396,597 @@ export function validateDagStructure(
       if (newDegree === 0) queue.push(dep);
     }
   }
+  if (visited >= nodes.length) return null;
+  const cycleNodes = nodes.filter(n => (inDegree.get(n.id) ?? 0) > 0).map(n => n.id);
+  return `Cycle detected among nodes: ${cycleNodes.join(', ')}`;
+}
 
-  if (visited < nodes.length) {
-    const cycleNodes = nodes.filter(n => (inDegree.get(n.id) ?? 0) > 0).map(n => n.id);
-    return `Cycle detected among nodes: ${cycleNodes.join(', ')}`;
+function stripMarkdownCode(s: string): string {
+  return s.replace(/```[\s\S]*?```/g, '').replace(/`[^`\n]*`/g, '');
+}
+
+function collectOutputRefSources(node: DagNode): string[] {
+  const sources: string[] = [];
+  if (node.when) sources.push(node.when);
+  if ('prompt' in node && typeof node.prompt === 'string')
+    sources.push(stripMarkdownCode(node.prompt));
+  if (isBashNode(node)) sources.push(node.bash);
+  if (isScriptNode(node)) sources.push(node.script);
+  if (isWorkflowNode(node)) {
+    if (node.input) sources.push(node.input);
+    if (node.fan_out) sources.push(node.fan_out.items);
   }
+  if (isCancelNode(node)) sources.push(node.cancel);
+  if (isApprovalNode(node)) sources.push(node.approval.message);
+  if (isLoopNode(node)) {
+    if (typeof node.loop.prompt === 'string') sources.push(stripMarkdownCode(node.loop.prompt));
+    if (node.loop.until_bash) sources.push(node.loop.until_bash);
+  }
+  if (isLoopGroupNode(node) && node.loop_group.until_bash) sources.push(node.loop_group.until_bash);
+  return sources;
+}
 
-  // Check $nodeId.output references across EVERY field the executor substitutes at
-  // runtime: when:, and the text surfaces that flow through substituteNodeOutputRefs
-  // (prompt, bash, script, approval.message, cancel, loop.prompt, loop.until_bash,
-  // loop_group.until_bash, workflow.input, workflow.fan_out.items). A dangling ref in
-  // any of them silently substitutes to '' at run time, so all must be validated here.
-  //
-  // KEEP IN SYNC (three ref-surface enumerations must agree):
-  //   1. this scan (loader validateDagStructure) — validates refs,
-  //   2. rewriteNodeOutputRefs (include-expander.ts) — renames refs on inline,
-  //   3. the substituteNodeOutputRefs call sites (dag-executor.ts) — resolves refs at run.
-  // Adding a substituted field to one means updating all three.
-  //
-  // Prose fields (prompt / loop.prompt) may contain triple-backtick fenced blocks or
-  // single-backtick inline code that are documentation meant to render literally to
-  // the LLM (e.g. the workflow-builder shows authors how to write `$<other-node>.output`
-  // inside a script-node example); strip those before scanning so they don't false-match.
-  // The code/expression fields (bash / script / until_bash / cancel) and when: clauses
-  // carry live refs (not documentation), so they are scanned verbatim.
+function validateOutputRefs(
+  nodes: DagNode[],
+  ids: ReadonlySet<string>,
+  enclosingIds?: ReadonlySet<string>
+): string | null {
   const outputRefPattern = new RegExp(OUTPUT_REF_SOURCE, 'g');
-  const stripMarkdownCode = (s: string): string =>
-    s.replace(/```[\s\S]*?```/g, '').replace(/`[^`\n]*`/g, '');
   for (const node of nodes) {
-    const sources: string[] = [];
-    if (node.when) sources.push(node.when);
-    if ('prompt' in node && typeof node.prompt === 'string') {
-      sources.push(stripMarkdownCode(node.prompt));
-    }
-    if (isBashNode(node)) sources.push(node.bash);
-    if (isScriptNode(node)) sources.push(node.script);
-    // workflow.input is a live ref surface (a data string), scanned verbatim like
-    // bash/script — not prose, so no markdown stripping. workflow.fan_out.items (slice
-    // 2, PR-C) is a live `$node.output` ref to a JSON array — scanned the same way.
-    if (isWorkflowNode(node)) {
-      if (node.input) sources.push(node.input);
-      if (node.fan_out) sources.push(node.fan_out.items);
-    }
-    if (isCancelNode(node)) sources.push(node.cancel);
-    if (isApprovalNode(node)) sources.push(node.approval.message);
-    if (isLoopNode(node)) {
-      // Only inline `loop.prompt` is scanned for `$nodeId.output` refs. A
-      // command-backed loop (`loop.command`) loads its prompt text from a file
-      // at runtime; that file's contents are the author's responsibility, the
-      // same way a `command:` node's body is not scanned at parse time.
-      if (typeof node.loop.prompt === 'string') {
-        sources.push(stripMarkdownCode(node.loop.prompt));
-      }
-      if (node.loop.until_bash) sources.push(node.loop.until_bash);
-    }
-    if (isLoopGroupNode(node) && node.loop_group.until_bash) {
-      sources.push(node.loop_group.until_bash);
-    }
-    for (const source of sources) {
+    for (const source of collectOutputRefSources(node)) {
       let m: RegExpExecArray | null;
-      outputRefPattern.lastIndex = 0; // reset stateful g-flag regex before each new source string
+      outputRefPattern.lastIndex = 0;
       while ((m = outputRefPattern.exec(source)) !== null) {
         const refNodeId = m[1];
-        // Output refs (unlike depends_on) may also reach ENCLOSING-scope nodes: the
-        // executor seeds a loop_group iteration's scoped output map with the outer
-        // DAG's outputs, so `$outerNode.output` inside a body prompt is valid.
         if (refNodeId !== undefined && !ids.has(refNodeId) && !enclosingIds?.has(refNodeId)) {
           return `Node '${node.id}' references unknown node '$${refNodeId}.output'`;
         }
       }
     }
   }
+  return null;
+}
 
-  // fan_out.items (slice 2, PR-C) must reference the output of a node that is a
-  // TRANSITIVE dependency of the fan-out node — so the item array is guaranteed
-  // produced before the node expands. A same-layer or downstream producer would race
-  // (the ref resolves to nothing → the node fails closed at run time); catch it at
-  // load time with an actionable message instead. A literal `items` with no `$…output`
-  // ref is left to the runtime fail-closed check (it must still parse to an array).
+function transitiveDepsOf(nodeId: string, directDeps: ReadonlyMap<string, string[]>): Set<string> {
+  const seen = new Set<string>();
+  const stack = [...(directDeps.get(nodeId) ?? [])];
+  while (stack.length > 0) {
+    const dep = stack.pop();
+    if (dep === undefined || seen.has(dep)) continue;
+    seen.add(dep);
+    stack.push(...(directDeps.get(dep) ?? []));
+  }
+  return seen;
+}
+
+function validateFanOutItemDeps(nodes: DagNode[]): string | null {
   const directDeps = new Map<string, string[]>(nodes.map(n => [n.id, n.depends_on ?? []]));
-  const transitiveDepsOf = (nodeId: string): Set<string> => {
-    const seen = new Set<string>();
-    const stack = [...(directDeps.get(nodeId) ?? [])];
-    while (stack.length > 0) {
-      const dep = stack.pop();
-      if (dep === undefined || seen.has(dep)) continue;
-      seen.add(dep);
-      stack.push(...(directDeps.get(dep) ?? []));
-    }
-    return seen;
-  };
   for (const node of nodes) {
     if (!isWorkflowNode(node) || !node.fan_out) continue;
     const refMatch = new RegExp(OUTPUT_REF_SOURCE).exec(node.fan_out.items);
     const producerId = refMatch?.[1];
-    if (producerId === undefined) continue; // no ref surface — runtime fail-closed owns it
-    if (!transitiveDepsOf(node.id).has(producerId)) {
+    if (producerId === undefined) continue;
+    if (!transitiveDepsOf(node.id, directDeps).has(producerId)) {
       return `Node '${node.id}' fan_out.items references '$${producerId}.output', which is not an upstream dependency — add '${producerId}' to '${node.id}'.depends_on so its item array is produced first`;
     }
   }
+  return null;
+}
 
-  // Recursively validate loop_group bodies as scoped sub-DAGs. A loop_group body is
-  // sealed for GRAPH edges: its depends_on edges resolve within the body (not the
-  // outer DAG), and the body is itself a DAG (unique ids, no cycles). $nodeId.output
-  // refs are wider — the accumulated enclosing-scope ids are passed down so body
-  // prompts may reference outer nodes (mirrors the executor seeding the scoped output
-  // map with outer outputs). Nested loop_groups recurse naturally, accumulating scope.
-  // Outer-DAG cycle/depends_on checks above operate on the flattened top-level node
-  // list and treat each loop_group as one outer node.
-  for (const node of nodes) {
-    if (isLoopGroupNode(node)) {
-      // `include` inside a loop_group body is rejected in v1 (bounds the interaction
-      // surface — see the plan's NOT Building). An include is a load-time inlining
-      // directive; nesting it inside a per-iteration sub-DAG body is not yet supported.
-      const includeInBody = node.loop_group.nodes.find(isIncludeNode);
-      if (includeInBody) {
-        return `loop_group '${node.id}' body: 'include' is not supported inside a loop_group body`;
-      }
-      // `workflow:` (sub-run) inside a loop_group body is rejected (bounds the
-      // interaction surface — see the plan's NOT Building). This wholesale rejection
-      // also covers a fan-out (`fan_out:`) workflow node in a loop_group body (slice 2,
-      // PR-C): a fan-out is a `workflow:` node, so nesting it per-iteration is likewise
-      // out of scope.
-      const workflowInBody = node.loop_group.nodes.find(isWorkflowNode);
-      if (workflowInBody) {
-        return `loop_group '${node.id}' body: 'workflow' (sub-run) is not supported inside a loop_group body`;
-      }
-      const scopeIds = new Set([...(enclosingIds ?? []), ...ids]);
-      const bodyError = validateDagStructure(node.loop_group.nodes, scopeIds);
-      if (bodyError) {
-        return `loop_group '${node.id}' body: ${bodyError}`;
-      }
-    }
+function validateLoopGroupBody(
+  node: DagNode,
+  ids: ReadonlySet<string>,
+  enclosingIds?: ReadonlySet<string>
+): string | null {
+  if (!isLoopGroupNode(node)) return null;
+  if (node.loop_group.nodes.find(isIncludeNode)) {
+    return `loop_group '${node.id}' body: 'include' is not supported inside a loop_group body`;
   }
+  if (node.loop_group.nodes.find(isWorkflowNode)) {
+    return `loop_group '${node.id}' body: 'workflow' (sub-run) is not supported inside a loop_group body`;
+  }
+  const scopeIds = new Set([...(enclosingIds ?? []), ...ids]);
+  const bodyError = validateDagStructure(node.loop_group.nodes, scopeIds);
+  return bodyError ? `loop_group '${node.id}' body: ${bodyError}` : null;
+}
 
-  return null; // valid
+function validateLoopGroupBodies(
+  nodes: DagNode[],
+  ids: ReadonlySet<string>,
+  enclosingIds?: ReadonlySet<string>
+): string | null {
+  for (const node of nodes) {
+    const error = validateLoopGroupBody(node, ids, enclosingIds);
+    if (error) return error;
+  }
+  return null;
+}
+
+export function validateDagStructure(
+  nodes: DagNode[],
+  enclosingIds?: ReadonlySet<string>
+): string | null {
+  const { ids, error: idError } = collectDagNodeIds(nodes, enclosingIds);
+  if (idError) return idError;
+
+  const depError = validateDependsOnRefs(nodes, ids);
+  if (depError) return depError;
+
+  const cycleError = validateDagAcyclic(nodes);
+  if (cycleError) return cycleError;
+
+  const outputRefError = validateOutputRefs(nodes, ids, enclosingIds);
+  if (outputRefError) return outputRefError;
+
+  const fanOutError = validateFanOutItemDeps(nodes);
+  if (fanOutError) return fanOutError;
+
+  return validateLoopGroupBodies(nodes, ids, enclosingIds);
 }
 
 export type ParseResult =
   | { workflow: WorkflowDefinition; error: null; warnings: string[] }
   | { workflow: null; error: WorkflowLoadError; warnings?: never };
 
+type RawWorkflow = Record<string, unknown>;
+
+interface ParsedDagNodes {
+  dagNodes: DagNode[];
+  parseWarnings: string[];
+}
+
+interface WorkflowPolicyFields {
+  interactive?: boolean;
+  worktreePolicy?: { enabled?: boolean };
+  containerPolicy?: { enabled?: boolean; write_back?: 'approve' | 'auto' };
+  evidencePolicy?: WorkflowEvidencePolicy;
+  hardenedPolicy?: WorkflowHardenedPolicy;
+  budgetPolicy?: WorkflowBudgetPolicy;
+  mutatesCheckout?: boolean;
+  tags?: string[];
+  requires?: WorkflowRequirement[];
+  effort?: z.output<typeof effortLevelSchema>;
+  thinking?: z.output<typeof thinkingConfigSchema>;
+  fallbackModel?: string;
+  betas?: string[];
+  sandbox?: z.output<typeof sandboxSettingsSchema>;
+}
+
+function workflowValidationError(filename: string, error: string): ParseResult {
+  return { workflow: null, error: { filename, error, errorType: 'validation_error' } };
+}
+
+function validateWorkflowHeader(raw: RawWorkflow, filename: string): ParseResult | null {
+  if (!raw.name || typeof raw.name !== 'string') {
+    getLog().warn({ filename }, 'workflow_missing_name');
+    return workflowValidationError(filename, "Missing required field 'name'");
+  }
+  if (!raw.description || typeof raw.description !== 'string') {
+    getLog().warn({ filename }, 'workflow_missing_description');
+    return workflowValidationError(filename, "Missing required field 'description'");
+  }
+  return null;
+}
+
+function validateWorkflowNodeContainer(raw: RawWorkflow, filename: string): ParseResult | null {
+  if (Array.isArray(raw.steps) && raw.steps.length > 0) {
+    return workflowValidationError(
+      filename,
+      '`steps:` format has been removed. Workflows now use `nodes:` (DAG) format exclusively. Your bundled defaults are already updated — custom workflows need manual migration. See docs/sequential-dag-migration-guide.md for conversion patterns, or run: claude "Read docs/sequential-dag-migration-guide.md then convert .archon/workflows/<file> to nodes: format"'
+    );
+  }
+  if (!Array.isArray(raw.nodes) || raw.nodes.length === 0) {
+    getLog().warn({ filename }, 'workflow_missing_nodes');
+    return workflowValidationError(filename, "Workflow must have 'nodes:' configuration");
+  }
+  return null;
+}
+
+function parseDagNodes(raw: RawWorkflow, filename: string): ParsedDagNodes | ParseResult {
+  const rawNodes = raw.nodes as unknown[];
+  const validationErrors: string[] = [];
+  const parseWarnings: string[] = [];
+  const dagNodes = rawNodes
+    .map((n: unknown, i: number) => parseDagNode(n, i, validationErrors, parseWarnings))
+    .filter((n): n is DagNode => n !== null);
+  if (dagNodes.length !== rawNodes.length) {
+    getLog().warn({ filename, validationErrors }, 'dag_node_validation_failed');
+    return workflowValidationError(
+      filename,
+      `DAG node validation failed: ${validationErrors.join('; ')}`
+    );
+  }
+  const structureError = validateDagStructure(dagNodes);
+  if (structureError) {
+    getLog().warn({ filename, structureError }, 'dag_structure_invalid');
+    return workflowValidationError(filename, structureError);
+  }
+  return { dagNodes, parseWarnings };
+}
+
+function validateWorkflowProviders(
+  filename: string,
+  provider: string | undefined,
+  dagNodes: readonly DagNode[]
+): ParseResult | null {
+  if (provider && !isRegisteredProvider(provider)) {
+    return workflowValidationError(
+      filename,
+      `Unknown provider '${provider}'. Registered: ${getRegisteredProviders()
+        .map(p => p.id)
+        .join(', ')}`
+    );
+  }
+  for (const node of dagNodes) {
+    if (node.provider !== undefined && !isRegisteredProvider(node.provider)) {
+      return workflowValidationError(
+        filename,
+        `Node '${node.id}': unknown provider '${node.provider}'. Registered: ${getRegisteredProviders()
+          .map(p => p.id)
+          .join(', ')}`
+      );
+    }
+  }
+  return null;
+}
+
+function validatePersistSessionCapabilities(
+  filename: string,
+  dagNodes: readonly DagNode[],
+  provider: string | undefined,
+  workflowPersistSessions: boolean
+): ParseResult | null {
+  for (const node of dagNodes) {
+    if (!isPersistableNode(node)) continue;
+    if ('context' in node && node.context === 'fresh') continue;
+    const nodePersist = 'persist_session' in node ? node.persist_session : undefined;
+    const effectivePersist = nodePersist ?? workflowPersistSessions;
+    if (!effectivePersist) continue;
+    const explicitProvider = ('provider' in node ? node.provider : undefined) ?? provider;
+    if (explicitProvider && isRegisteredProvider(explicitProvider)) {
+      const caps = getProviderCapabilities(explicitProvider);
+      if (!caps.sessionResume) {
+        return workflowValidationError(
+          filename,
+          `Node '${node.id}' has persist_session: true but provider '${explicitProvider}' does not support sessionResume. Remove persist_session, or use a provider with sessionResume capability.`
+        );
+      }
+    }
+  }
+  return null;
+}
+
+function hasInteractiveLoop(nodes: readonly DagNode[]): boolean {
+  return nodes.some(
+    n =>
+      (isLoopNode(n) && n.loop.interactive === true) ||
+      (isLoopGroupNode(n) &&
+        (n.loop_group.interactive === true || hasInteractiveLoop(n.loop_group.nodes)))
+  );
+}
+
+function hasSignalCompletesWithoutInteractive(nodes: readonly DagNode[]): boolean {
+  return nodes.some(
+    n =>
+      (isLoopNode(n) && n.loop.signal_completes === true && n.loop.interactive !== true) ||
+      (isLoopGroupNode(n) &&
+        ((n.loop_group.signal_completes === true && n.loop_group.interactive !== true) ||
+          hasSignalCompletesWithoutInteractive(n.loop_group.nodes)))
+  );
+}
+
+function parseInteractivePolicy(
+  raw: RawWorkflow,
+  filename: string,
+  dagNodes: readonly DagNode[]
+): boolean | undefined {
+  const interactive = typeof raw.interactive === 'boolean' ? raw.interactive : undefined;
+  if (raw.interactive !== undefined && typeof raw.interactive !== 'boolean') {
+    getLog().warn({ filename, value: raw.interactive }, 'invalid_interactive_value_ignored');
+  }
+  if (!interactive && hasInteractiveLoop(dagNodes)) {
+    getLog().warn({ filename }, 'interactive_loop_in_non_interactive_workflow');
+  }
+  if (hasSignalCompletesWithoutInteractive(dagNodes)) {
+    getLog().warn({ filename }, 'signal_completes_without_interactive_ignored');
+  }
+  return interactive;
+}
+
+function parseWorktreePolicy(
+  raw: RawWorkflow,
+  filename: string
+): { enabled?: boolean } | undefined {
+  if (raw.worktree === undefined) return undefined;
+  if (typeof raw.worktree !== 'object' || raw.worktree === null || Array.isArray(raw.worktree)) {
+    getLog().warn({ filename, value: raw.worktree }, 'invalid_worktree_block_ignored');
+    return undefined;
+  }
+  const rawEnabled = (raw.worktree as Record<string, unknown>).enabled;
+  if (typeof rawEnabled === 'boolean') return { enabled: rawEnabled };
+  if (rawEnabled !== undefined) {
+    getLog().warn({ filename, value: rawEnabled }, 'invalid_worktree_enabled_value_ignored');
+  }
+  return undefined;
+}
+
+function parseContainerPolicy(
+  raw: RawWorkflow,
+  filename: string
+): { enabled?: boolean; write_back?: 'approve' | 'auto' } | undefined {
+  if (raw.container === undefined) return undefined;
+  if (typeof raw.container !== 'object' || raw.container === null || Array.isArray(raw.container)) {
+    getLog().warn({ filename, value: raw.container }, 'invalid_container_block_ignored');
+    return undefined;
+  }
+  const rawContainer = raw.container as Record<string, unknown>;
+  const policy: { enabled?: boolean; write_back?: 'approve' | 'auto' } = {};
+  if (typeof rawContainer.enabled === 'boolean') policy.enabled = rawContainer.enabled;
+  else if (rawContainer.enabled !== undefined) {
+    getLog().warn(
+      { filename, value: rawContainer.enabled },
+      'invalid_container_enabled_value_ignored'
+    );
+  }
+  if (rawContainer.write_back === 'approve' || rawContainer.write_back === 'auto') {
+    policy.write_back = rawContainer.write_back;
+  } else if (rawContainer.write_back !== undefined) {
+    getLog().warn(
+      { filename, value: rawContainer.write_back },
+      'invalid_container_write_back_value_ignored'
+    );
+  }
+  return policy.enabled !== undefined || policy.write_back !== undefined ? policy : undefined;
+}
+
+function parseStrictWorkflowPolicy<T>(
+  rawValue: unknown,
+  schema: z.ZodType<T>,
+  filename: string,
+  message: string
+): T | ParseResult | undefined {
+  if (rawValue === undefined) return undefined;
+  const parsed = schema.safeParse(rawValue);
+  if (parsed.success) return parsed.data;
+  return workflowValidationError(filename, message);
+}
+
+function parseMutatesCheckout(raw: RawWorkflow, filename: string): boolean | undefined {
+  if (raw.mutates_checkout === undefined) return undefined;
+  if (typeof raw.mutates_checkout === 'boolean') return raw.mutates_checkout;
+  getLog().warn(
+    { filename, value: raw.mutates_checkout },
+    'invalid_mutates_checkout_value_ignored'
+  );
+  return undefined;
+}
+
+function parseTags(raw: RawWorkflow, filename: string): string[] | undefined {
+  if (Array.isArray(raw.tags)) {
+    return [
+      ...new Set(
+        raw.tags
+          .filter((t): t is string => typeof t === 'string')
+          .map(t => t.trim())
+          .filter(t => t.length > 0)
+      ),
+    ];
+  }
+  if (raw.tags !== undefined)
+    getLog().warn({ filename, value: raw.tags }, 'invalid_tags_block_ignored');
+  return undefined;
+}
+
+function parseRequires(raw: RawWorkflow, filename: string): WorkflowRequirement[] | undefined {
+  if (!Array.isArray(raw.requires)) {
+    if (raw.requires !== undefined) {
+      getLog().warn({ filename, value: raw.requires }, 'invalid_workflow_requires_block_ignored');
+    }
+    return undefined;
+  }
+  const valid: WorkflowRequirement[] = [];
+  for (const entry of raw.requires) {
+    const parsed = workflowRequirementSchema.safeParse(entry);
+    if (parsed.success) valid.push(parsed.data);
+    else getLog().warn({ filename, value: entry }, 'invalid_workflow_requires_entry_ignored');
+  }
+  const deduped = [...new Set(valid)];
+  return deduped.length > 0 ? deduped : undefined;
+}
+
+function parseFallbackModel(raw: RawWorkflow, filename: string): string | undefined {
+  const trimmed = typeof raw.fallbackModel === 'string' ? raw.fallbackModel.trim() : '';
+  const fallbackModel = trimmed.length > 0 ? trimmed : undefined;
+  if (raw.fallbackModel !== undefined && fallbackModel === undefined) {
+    getLog().warn(
+      { filename, value: raw.fallbackModel, expected: 'non-empty string' },
+      'invalid_workflow_fallback_model_value_ignored'
+    );
+  }
+  return fallbackModel;
+}
+
+function parseBetas(raw: RawWorkflow, filename: string): string[] | undefined {
+  if (raw.betas === undefined) return undefined;
+  const cleaned = Array.isArray(raw.betas)
+    ? raw.betas
+        .filter((b): b is string => typeof b === 'string')
+        .map(b => b.trim())
+        .filter(b => b.length > 0)
+    : [];
+  const betasResult = betasSchema.safeParse(cleaned);
+  if (betasResult.success) return betasResult.data;
+  getLog().warn({ filename, value: raw.betas }, 'invalid_workflow_betas_value_ignored');
+  return undefined;
+}
+
+function parseWorkflowPolicies(
+  raw: RawWorkflow,
+  filename: string,
+  dagNodes: readonly DagNode[]
+): WorkflowPolicyFields | ParseResult {
+  const evidencePolicy = parseStrictWorkflowPolicy(
+    raw.evidence_policy,
+    workflowEvidencePolicySchema,
+    filename,
+    "Invalid evidence_policy: expected { required: boolean }. When required is true, the run is refused terminal 'completed' unless $ARTIFACTS_DIR/evidence.json exists."
+  );
+  if (evidencePolicy && 'error' in evidencePolicy) return evidencePolicy;
+  const hardenedPolicy = parseStrictWorkflowPolicy(
+    raw.hardened,
+    workflowHardenedPolicySchema,
+    filename,
+    'Invalid hardened policy: expected exactly { required: boolean }. Unsupported hardened fields are rejected so security settings cannot be silently dropped.'
+  );
+  if (hardenedPolicy && 'error' in hardenedPolicy) return hardenedPolicy;
+  const budgetPolicy = parseStrictWorkflowPolicy(
+    raw.budget,
+    workflowBudgetPolicySchema,
+    filename,
+    'Invalid budget policy: expected exactly { required: boolean }. Unsupported budget fields are rejected so durable budget requirements cannot be silently dropped.'
+  );
+  if (budgetPolicy && 'error' in budgetPolicy) return budgetPolicy;
+
+  return {
+    interactive: parseInteractivePolicy(raw, filename, dagNodes),
+    worktreePolicy: parseWorktreePolicy(raw, filename),
+    containerPolicy: parseContainerPolicy(raw, filename),
+    evidencePolicy,
+    hardenedPolicy,
+    budgetPolicy,
+    mutatesCheckout: parseMutatesCheckout(raw, filename),
+    tags: parseTags(raw, filename),
+    requires: parseRequires(raw, filename),
+    effort: parseOptionalField(
+      raw.effort,
+      effortLevelSchema,
+      filename,
+      'invalid_workflow_effort_value_ignored',
+      {
+        valid: effortLevelSchema.options,
+      }
+    ),
+    thinking: parseOptionalField(
+      raw.thinking,
+      thinkingConfigSchema,
+      filename,
+      'invalid_workflow_thinking_value_ignored'
+    ),
+    fallbackModel: parseFallbackModel(raw, filename),
+    betas: parseBetas(raw, filename),
+    sandbox: parseOptionalField(
+      raw.sandbox,
+      sandboxSettingsSchema,
+      filename,
+      'invalid_workflow_sandbox_value_ignored'
+    ),
+  };
+}
+
+function collectWorkflowUnknownKeyWarnings(raw: RawWorkflow, parseWarnings: string[]): void {
+  const workflowName = raw.name as string;
+  const workflowLabel = `Workflow '${workflowName}'`;
+  for (const key of Object.keys(raw)) {
+    if (!KNOWN_WORKFLOW_KEYS.has(key)) {
+      const hint = KNOWN_DAG_NODE_KEYS.has(key)
+        ? ` ('${key}' is valid on individual nodes, not at workflow level.)`
+        : '';
+      pushUnknownKeyWarning(
+        workflowName,
+        workflowLabel,
+        key,
+        hint,
+        'workflow_unknown_key_ignored',
+        parseWarnings
+      );
+      continue;
+    }
+    const nested = KNOWN_WORKFLOW_NESTED_KEYS.get(key);
+    if (nested) {
+      collectUnknownConfigKeys(
+        raw[key],
+        nested,
+        workflowName,
+        workflowLabel,
+        `${key}.`,
+        'workflow_unknown_key_ignored',
+        parseWarnings
+      );
+    }
+  }
+}
+
+function buildWorkflowDefinition(
+  raw: RawWorkflow,
+  dagNodes: DagNode[],
+  provider: string | undefined,
+  model: string | undefined,
+  modelReasoningEffort: z.output<typeof modelReasoningEffortSchema> | undefined,
+  webSearchMode: z.output<typeof webSearchModeSchema> | undefined,
+  workflowPersistSessions: boolean,
+  policies: WorkflowPolicyFields
+): WorkflowDefinition {
+  return {
+    name: raw.name as string,
+    description: raw.description as string,
+    provider,
+    model,
+    modelReasoningEffort,
+    webSearchMode,
+    interactive: policies.interactive,
+    ...(policies.mutatesCheckout !== undefined
+      ? { mutates_checkout: policies.mutatesCheckout }
+      : {}),
+    ...(policies.effort !== undefined ? { effort: policies.effort } : {}),
+    ...(policies.thinking !== undefined ? { thinking: policies.thinking } : {}),
+    ...(policies.fallbackModel !== undefined ? { fallbackModel: policies.fallbackModel } : {}),
+    ...(policies.betas !== undefined ? { betas: policies.betas } : {}),
+    ...(policies.sandbox !== undefined ? { sandbox: policies.sandbox } : {}),
+    ...(workflowPersistSessions ? { persist_sessions: true } : {}),
+    nodes: dagNodes,
+    ...(policies.worktreePolicy ? { worktree: policies.worktreePolicy } : {}),
+    ...(policies.containerPolicy ? { container: policies.containerPolicy } : {}),
+    ...(policies.evidencePolicy !== undefined ? { evidence_policy: policies.evidencePolicy } : {}),
+    ...(policies.hardenedPolicy !== undefined ? { hardened: policies.hardenedPolicy } : {}),
+    ...(policies.budgetPolicy !== undefined ? { budget: policies.budgetPolicy } : {}),
+    ...(policies.tags !== undefined ? { tags: policies.tags } : {}),
+    ...(policies.requires !== undefined ? { requires: policies.requires } : {}),
+  };
+}
+
 /**
  * Parse and validate a workflow YAML file
  */
 export function parseWorkflow(content: string, filename: string): ParseResult {
   try {
-    const raw = parseYaml(content) as Record<string, unknown>;
-
+    const raw = parseYaml(content) as RawWorkflow;
     if (!raw || typeof raw !== 'object') {
-      return {
-        workflow: null,
-        error: {
-          filename,
-          error: 'YAML file is empty or does not contain an object',
-          errorType: 'validation_error',
-        },
-      };
+      return workflowValidationError(filename, 'YAML file is empty or does not contain an object');
     }
+    const headerError = validateWorkflowHeader(raw, filename);
+    if (headerError) return headerError;
+    const nodeContainerError = validateWorkflowNodeContainer(raw, filename);
+    if (nodeContainerError) return nodeContainerError;
 
-    if (!raw.name || typeof raw.name !== 'string') {
-      getLog().warn({ filename }, 'workflow_missing_name');
-      return {
-        workflow: null,
-        error: { filename, error: "Missing required field 'name'", errorType: 'validation_error' },
-      };
-    }
-    if (!raw.description || typeof raw.description !== 'string') {
-      getLog().warn({ filename }, 'workflow_missing_description');
-      return {
-        workflow: null,
-        error: {
-          filename,
-          error: "Missing required field 'description'",
-          errorType: 'validation_error',
-        },
-      };
-    }
+    const parsedNodes = parseDagNodes(raw, filename);
+    if ('error' in parsedNodes) return parsedNodes;
+    const { dagNodes, parseWarnings } = parsedNodes;
 
-    const errors: string[] = [];
-
-    // Reject legacy steps-based workflows
-    const hasSteps = Array.isArray(raw.steps) && raw.steps.length > 0;
-    if (hasSteps) {
-      errors.push(
-        '`steps:` format has been removed. Workflows now use `nodes:` (DAG) format exclusively. Your bundled defaults are already updated — custom workflows need manual migration. See docs/sequential-dag-migration-guide.md for conversion patterns, or run: claude "Read docs/sequential-dag-migration-guide.md then convert .archon/workflows/<file> to nodes: format"'
-      );
-    }
-
-    const hasNodes = Array.isArray(raw.nodes) && (raw.nodes as unknown[]).length > 0;
-
-    if (errors.length > 0) {
-      return {
-        workflow: null,
-        error: {
-          filename,
-          error: errors.join('; '),
-          errorType: 'validation_error',
-        },
-      };
-    }
-
-    if (!hasNodes) {
-      getLog().warn({ filename }, 'workflow_missing_nodes');
-      return {
-        workflow: null,
-        error: {
-          filename,
-          error: "Workflow must have 'nodes:' configuration",
-          errorType: 'validation_error',
-        },
-      };
-    }
-
-    // Parse DAG nodes using dagNodeSchema
-    const validationErrors: string[] = [];
-    const parseWarnings: string[] = [];
-    const dagNodes = (raw.nodes as unknown[])
-      .map((n: unknown, i: number) => parseDagNode(n, i, validationErrors, parseWarnings))
-      .filter((n): n is DagNode => n !== null);
-
-    if (dagNodes.length !== (raw.nodes as unknown[]).length) {
-      getLog().warn({ filename, validationErrors }, 'dag_node_validation_failed');
-      return {
-        workflow: null,
-        error: {
-          filename,
-          error: `DAG node validation failed: ${validationErrors.join('; ')}`,
-          errorType: 'validation_error',
-        },
-      };
-    }
-
-    const structureError = validateDagStructure(dagNodes);
-    if (structureError) {
-      getLog().warn({ filename, structureError }, 'dag_structure_invalid');
-      return {
-        workflow: null,
-        error: { filename, error: structureError, errorType: 'validation_error' },
-      };
-    }
-
-    // Parse workflow-level fields using WorkflowBaseSchema for validation
-    // Note: modelReasoningEffort and webSearchMode use warn-and-ignore for invalid values
-    // (consistent with original behavior) rather than schema-level rejection.
     const provider =
       typeof raw.provider === 'string' && raw.provider.length > 0 ? raw.provider : undefined;
     const model = typeof raw.model === 'string' ? raw.model : undefined;
+    const providerError = validateWorkflowProviders(filename, provider, dagNodes);
+    if (providerError) return providerError;
 
-    // Validate provider identity at load time, both at the workflow level and
-    // per node. Model strings are NOT validated — they pass through to the SDK
-    // at run time, which is the source of truth for what model names exist
-    // (vendor SDKs ship new models faster than Archon can update).
-    if (provider && !isRegisteredProvider(provider)) {
-      return {
-        workflow: null,
-        error: {
-          filename,
-          error: `Unknown provider '${provider}'. Registered: ${getRegisteredProviders()
-            .map(p => p.id)
-            .join(', ')}`,
-          errorType: 'validation_error',
-        },
-      };
-    }
-    for (const node of dagNodes) {
-      if (node.provider !== undefined && !isRegisteredProvider(node.provider)) {
-        return {
-          workflow: null,
-          error: {
-            filename,
-            error: `Node '${node.id}': unknown provider '${node.provider}'. Registered: ${getRegisteredProviders()
-              .map(p => p.id)
-              .join(', ')}`,
-            errorType: 'validation_error',
-          },
-        };
-      }
-    }
-
-    // persist_session capability gating: when the effective provider is known at
-    // load time (explicit at node or workflow level), reject the workflow if the
-    // provider doesn't support session resume. When the provider is implicit (set
-    // via .archon/config.yaml defaults), the check defers to runtime in
-    // dag-executor.
-    //
-    // Only command + prompt nodes participate in cross-run session persistence today
-    // (see `isPersistableNode` for the exclusion list):
-    //   - bash / script / approval / cancel nodes don't invoke a provider at all.
-    //   - loop nodes manage their own per-iteration session threading; cross-run
-    //     persistence for loops isn't wired. `parseDagNode` emits a
-    //     `loop_node_ai_fields_ignored` warning when `persist_session` appears on one.
-    //   - context:'fresh' nodes explicitly bypass persistence in the executor.
-    // Skipping these here prevents false validation failures when a workflow opts
-    // in via workflow-level `persist_sessions: true` and contains, e.g., a bash node.
     const workflowPersistSessions = raw.persist_sessions === true;
-    for (const node of dagNodes) {
-      if (!isPersistableNode(node)) continue;
-      if ('context' in node && node.context === 'fresh') continue;
+    const persistError = validatePersistSessionCapabilities(
+      filename,
+      dagNodes,
+      provider,
+      workflowPersistSessions
+    );
+    if (persistError) return persistError;
 
-      const nodePersist = 'persist_session' in node ? node.persist_session : undefined;
-      const effectivePersist = nodePersist ?? workflowPersistSessions;
-      if (!effectivePersist) continue;
-
-      const explicitProvider = ('provider' in node ? node.provider : undefined) ?? provider;
-      if (explicitProvider && isRegisteredProvider(explicitProvider)) {
-        const caps = getProviderCapabilities(explicitProvider);
-        if (!caps.sessionResume) {
-          return {
-            workflow: null,
-            error: {
-              filename,
-              error: `Node '${node.id}' has persist_session: true but provider '${explicitProvider}' does not support sessionResume. Remove persist_session, or use a provider with sessionResume capability.`,
-              errorType: 'validation_error',
-            },
-          };
-        }
-      }
-    }
-
-    // Validate modelReasoningEffort / webSearchMode — warn and ignore invalid values.
     const modelReasoningEffort = parseOptionalField(
       raw.modelReasoningEffort,
       modelReasoningEffortSchema,
@@ -728,338 +1001,26 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
       'invalid_web_search_mode',
       { valid: webSearchModeSchema.options }
     );
-
-    const interactive = typeof raw.interactive === 'boolean' ? raw.interactive : undefined;
-    if (raw.interactive !== undefined && typeof raw.interactive !== 'boolean') {
-      getLog().warn({ filename, value: raw.interactive }, 'invalid_interactive_value_ignored');
-    }
-
-    // Warn if any interactive loop node exists in a non-interactive workflow
-    // (approval messages won't reach the user in web background runs)
-    if (!interactive) {
-      // Covers loop: and loop_group: gates, including loops nested inside loop_group bodies.
-      const hasInteractiveLoop = (ns: DagNode[]): boolean =>
-        ns.some(
-          n =>
-            (isLoopNode(n) && n.loop.interactive === true) ||
-            (isLoopGroupNode(n) &&
-              (n.loop_group.interactive === true || hasInteractiveLoop(n.loop_group.nodes)))
-        );
-      if (hasInteractiveLoop(dagNodes)) {
-        getLog().warn({ filename }, 'interactive_loop_in_non_interactive_workflow');
-      }
-    }
-
-    // Warn (non-blocking) when signal_completes is set without interactive: the flag
-    // only changes interactive-gate behavior — a non-interactive loop already
-    // completes on the signal, so the author's intent is likely a missing
-    // `interactive: true`. The workflow still loads.
-    const hasSignalCompletesWithoutInteractive = (ns: DagNode[]): boolean =>
-      ns.some(
-        n =>
-          (isLoopNode(n) && n.loop.signal_completes === true && n.loop.interactive !== true) ||
-          (isLoopGroupNode(n) &&
-            ((n.loop_group.signal_completes === true && n.loop_group.interactive !== true) ||
-              hasSignalCompletesWithoutInteractive(n.loop_group.nodes)))
-      );
-    if (hasSignalCompletesWithoutInteractive(dagNodes)) {
-      getLog().warn({ filename }, 'signal_completes_without_interactive_ignored');
-    }
-
-    // Parse workflow-level worktree policy. Same warn-and-ignore pattern used
-    // for `interactive` / `modelReasoningEffort` — invalid values are dropped
-    // rather than rejected, so a typo in one workflow doesn't nuke the whole
-    // discovery pass. Only `worktree.enabled` is recognised today.
-    let worktreePolicy: { enabled?: boolean } | undefined;
-    if (raw.worktree !== undefined) {
-      if (
-        typeof raw.worktree === 'object' &&
-        raw.worktree !== null &&
-        !Array.isArray(raw.worktree)
-      ) {
-        const rawEnabled = (raw.worktree as Record<string, unknown>).enabled;
-        if (typeof rawEnabled === 'boolean') {
-          worktreePolicy = { enabled: rawEnabled };
-        } else if (rawEnabled !== undefined) {
-          getLog().warn({ filename, value: rawEnabled }, 'invalid_worktree_enabled_value_ignored');
-        }
-      } else {
-        getLog().warn({ filename, value: raw.worktree }, 'invalid_worktree_block_ignored');
-      }
-    }
-
-    // Parse workflow-level container policy (folder-project container backend).
-    // Same warn-and-ignore pattern as `worktree`. `enabled` pins the container
-    // backend on without `--container`; `write_back` ('approve' | 'auto') chooses
-    // whether the finished run's overlay diff pauses for review or applies directly.
-    let containerPolicy: { enabled?: boolean; write_back?: 'approve' | 'auto' } | undefined;
-    if (raw.container !== undefined) {
-      if (
-        typeof raw.container === 'object' &&
-        raw.container !== null &&
-        !Array.isArray(raw.container)
-      ) {
-        const rawContainer = raw.container as Record<string, unknown>;
-        const rawEnabled = rawContainer.enabled;
-        const rawWriteBack = rawContainer.write_back;
-        const policy: { enabled?: boolean; write_back?: 'approve' | 'auto' } = {};
-        if (typeof rawEnabled === 'boolean') {
-          policy.enabled = rawEnabled;
-        } else if (rawEnabled !== undefined) {
-          getLog().warn({ filename, value: rawEnabled }, 'invalid_container_enabled_value_ignored');
-        }
-        if (rawWriteBack === 'approve' || rawWriteBack === 'auto') {
-          policy.write_back = rawWriteBack;
-        } else if (rawWriteBack !== undefined) {
-          getLog().warn(
-            { filename, value: rawWriteBack },
-            'invalid_container_write_back_value_ignored'
-          );
-        }
-        if (policy.enabled !== undefined || policy.write_back !== undefined) {
-          containerPolicy = policy;
-        }
-      } else {
-        getLog().warn({ filename, value: raw.container }, 'invalid_container_block_ignored');
-      }
-    }
-
-    // Parse workflow-level evidence policy (#2230). Unlike the worktree/container
-    // convenience policies, a malformed block REJECTS the workflow instead of
-    // warn-and-ignore: silently dropping a declared terminal-success gate would
-    // let a run complete ungated — not fail-safe. Same hard-reject posture as
-    // unknown-provider and persist_session capability validation above.
-    let evidencePolicy: WorkflowEvidencePolicy | undefined;
-    if (raw.evidence_policy !== undefined) {
-      const parsedEvidence = workflowEvidencePolicySchema.safeParse(raw.evidence_policy);
-      if (!parsedEvidence.success) {
-        return {
-          workflow: null,
-          error: {
-            filename,
-            error:
-              "Invalid evidence_policy: expected { required: boolean }. When required is true, the run is refused terminal 'completed' unless $ARTIFACTS_DIR/evidence.json exists.",
-            errorType: 'validation_error',
-          },
-        };
-      }
-      evidencePolicy = parsedEvidence.data;
-    }
-
-    let hardenedPolicy: WorkflowHardenedPolicy | undefined;
-    if (raw.hardened !== undefined) {
-      const parsedHardened = workflowHardenedPolicySchema.safeParse(raw.hardened);
-      if (!parsedHardened.success) {
-        return {
-          workflow: null,
-          error: {
-            filename,
-            error:
-              'Invalid hardened policy: expected exactly { required: boolean }. Unsupported hardened fields are rejected so security settings cannot be silently dropped.',
-            errorType: 'validation_error',
-          },
-        };
-      }
-      hardenedPolicy = parsedHardened.data;
-    }
-
-    let budgetPolicy: WorkflowBudgetPolicy | undefined;
-    if (raw.budget !== undefined) {
-      const parsedBudget = workflowBudgetPolicySchema.safeParse(raw.budget);
-      if (!parsedBudget.success) {
-        return {
-          workflow: null,
-          error: {
-            filename,
-            error:
-              'Invalid budget policy: expected exactly { required: boolean }. Unsupported budget fields are rejected so durable budget requirements cannot be silently dropped.',
-            errorType: 'validation_error',
-          },
-        };
-      }
-      budgetPolicy = parsedBudget.data;
-    }
-
-    // Parse mutates_checkout — boolean, omitted means true (run the path-lock guard).
-    // Same parse/warn pattern as `interactive` (invalid non-boolean values are dropped).
-    // When false, the executor skips the path-lock guard and allows concurrent runs on the same checkout.
-    let mutatesCheckout: boolean | undefined;
-    if (raw.mutates_checkout !== undefined) {
-      if (typeof raw.mutates_checkout === 'boolean') {
-        mutatesCheckout = raw.mutates_checkout;
-      } else {
-        getLog().warn(
-          { filename, value: raw.mutates_checkout },
-          'invalid_mutates_checkout_value_ignored'
-        );
-      }
-    }
-
-    // Parse optional tags — type-narrow, trim, and dedupe so authors can't
-    // ship ["GitLab", "GitLab ", "gitlab"] as three distinct values.
-    // An explicit empty array is preserved (suppresses keyword inference in the
-    // UI); an absent or invalid block leaves `tags` undefined (falls back to
-    // inference). Same warn-and-ignore pattern as the worktree block above.
-    let tags: string[] | undefined;
-    if (Array.isArray(raw.tags)) {
-      tags = [
-        ...new Set(
-          raw.tags
-            .filter((t): t is string => typeof t === 'string')
-            .map(t => t.trim())
-            .filter(t => t.length > 0)
-        ),
-      ];
-    } else if (raw.tags !== undefined) {
-      getLog().warn({ filename, value: raw.tags }, 'invalid_tags_block_ignored');
-    }
-
-    // Parse optional requires — the external-capability enum list (today only
-    // `github`) that hard-blocks invocation when the originating user hasn't connected
-    // that identity (see assertWorkflowRequirementsMet). Same warn-and-drop policy as
-    // `tags`: invalid entries are dropped with a warning; an absent/empty list leaves
-    // `requires` undefined. Without this block the field is silently discarded here and
-    // the capability gate can never fire for a discovered workflow.
-    let requires: WorkflowRequirement[] | undefined;
-    if (Array.isArray(raw.requires)) {
-      const valid: WorkflowRequirement[] = [];
-      for (const entry of raw.requires) {
-        const parsed = workflowRequirementSchema.safeParse(entry);
-        if (parsed.success) valid.push(parsed.data);
-        else getLog().warn({ filename, value: entry }, 'invalid_workflow_requires_entry_ignored');
-      }
-      const deduped = [...new Set(valid)];
-      if (deduped.length > 0) requires = deduped;
-    } else if (raw.requires !== undefined) {
-      getLog().warn({ filename, value: raw.requires }, 'invalid_workflow_requires_block_ignored');
-    }
-
-    // Parse workflow-level fallback fields. Same warn-and-drop pattern as
-    // `modelReasoningEffort` / `webSearchMode` above. These are declared on
-    // `workflowBaseSchema` and consumed by the DAG executor's
-    // `workflowLevelOptions` (the object literal at the top of
-    // `executeDagWorkflow`, reading `workflow.effort` etc.) as defaults that
-    // per-node options inherit when unset. Without this block, a workflow YAML
-    // that sets e.g. `effort: high` at the root would be dropped here and the
-    // executor would read undefined, so a node without its own `effort` would
-    // never inherit the workflow-level default.
-    const effort = parseOptionalField(
-      raw.effort,
-      effortLevelSchema,
-      filename,
-      'invalid_workflow_effort_value_ignored',
-      { valid: effortLevelSchema.options }
-    );
-    const thinking = parseOptionalField(
-      raw.thinking,
-      thinkingConfigSchema,
-      filename,
-      'invalid_workflow_thinking_value_ignored'
-    );
-    const sandbox = parseOptionalField(
-      raw.sandbox,
-      sandboxSettingsSchema,
-      filename,
-      'invalid_workflow_sandbox_value_ignored'
-    );
-
-    // fallbackModel: non-empty trimmed string. Inline trim rather than
-    // `safeParse` so a stray surrounding space is normalised rather than rejected.
-    const fallbackModelTrimmed =
-      typeof raw.fallbackModel === 'string' ? raw.fallbackModel.trim() : '';
-    const fallbackModel = fallbackModelTrimmed.length > 0 ? fallbackModelTrimmed : undefined;
-    if (raw.fallbackModel !== undefined && fallbackModel === undefined) {
-      getLog().warn(
-        { filename, value: raw.fallbackModel, expected: 'non-empty string' },
-        'invalid_workflow_fallback_model_value_ignored'
-      );
-    }
-
-    // betas: trim, drop empties, then validate the cleaned list through
-    // `betasSchema` (non-empty array of non-empty strings). An empty result
-    // drops the field entirely — the Claude SDK expects a populated beta header
-    // or none at all. The schema's `.nonempty()` enforces non-emptiness at
-    // runtime, so the cleaned list reaches the SDK validated without a cast.
-    let betas: string[] | undefined;
-    if (raw.betas !== undefined) {
-      const cleaned = Array.isArray(raw.betas)
-        ? raw.betas
-            .filter((b): b is string => typeof b === 'string')
-            .map(b => b.trim())
-            .filter(b => b.length > 0)
-        : [];
-      const betasResult = betasSchema.safeParse(cleaned);
-      if (betasResult.success) {
-        betas = betasResult.data;
-      } else {
-        getLog().warn({ filename, value: raw.betas }, 'invalid_workflow_betas_value_ignored');
-      }
-    }
-
-    // Detect unknown workflow-level keys, and unknown keys inside the nested
-    // workflow-level configs (#2213)
-    const workflowName = raw.name;
-    const workflowLabel = `Workflow '${workflowName}'`;
-    for (const key of Object.keys(raw)) {
-      if (!KNOWN_WORKFLOW_KEYS.has(key)) {
-        const hint = KNOWN_DAG_NODE_KEYS.has(key)
-          ? ` ('${key}' is valid on individual nodes, not at workflow level.)`
-          : '';
-        pushUnknownKeyWarning(
-          workflowName,
-          workflowLabel,
-          key,
-          hint,
-          'workflow_unknown_key_ignored',
-          parseWarnings
-        );
-        continue;
-      }
-      const nested = KNOWN_WORKFLOW_NESTED_KEYS.get(key);
-      if (nested) {
-        collectUnknownConfigKeys(
-          raw[key],
-          nested,
-          workflowName,
-          workflowLabel,
-          `${key}.`,
-          'workflow_unknown_key_ignored',
-          parseWarnings
-        );
-      }
-    }
+    const policies = parseWorkflowPolicies(raw, filename, dagNodes);
+    if ('error' in policies) return policies;
+    collectWorkflowUnknownKeyWarnings(raw, parseWarnings);
 
     return {
-      workflow: {
-        name: raw.name,
-        description: raw.description,
+      workflow: buildWorkflowDefinition(
+        raw,
+        dagNodes,
         provider,
         model,
         modelReasoningEffort,
         webSearchMode,
-        interactive,
-        ...(mutatesCheckout !== undefined ? { mutates_checkout: mutatesCheckout } : {}),
-        ...(effort !== undefined ? { effort } : {}),
-        ...(thinking !== undefined ? { thinking } : {}),
-        ...(fallbackModel !== undefined ? { fallbackModel } : {}),
-        ...(betas !== undefined ? { betas } : {}),
-        ...(sandbox !== undefined ? { sandbox } : {}),
-        ...(workflowPersistSessions ? { persist_sessions: true } : {}),
-        nodes: dagNodes,
-        ...(worktreePolicy ? { worktree: worktreePolicy } : {}),
-        ...(containerPolicy ? { container: containerPolicy } : {}),
-        ...(evidencePolicy !== undefined ? { evidence_policy: evidencePolicy } : {}),
-        ...(hardenedPolicy !== undefined ? { hardened: hardenedPolicy } : {}),
-        ...(budgetPolicy !== undefined ? { budget: budgetPolicy } : {}),
-        ...(tags !== undefined ? { tags } : {}),
-        ...(requires !== undefined ? { requires } : {}),
-      },
+        workflowPersistSessions,
+        policies
+      ),
       error: null,
       warnings: parseWarnings,
     };
   } catch (error) {
     const err = error as Error;
-    // Extract line number from YAML parse errors if available
     const linePattern = /line (\d+)/i;
     const lineMatch = linePattern.exec(err.message);
     const lineInfo = lineMatch ? ` (near line ${lineMatch[1]})` : '';
