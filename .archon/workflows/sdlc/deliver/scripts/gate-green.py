@@ -1,8 +1,8 @@
 """The green gate: run success never certifies green — this does, deterministically.
 
-The delivery tail asks the question three times, and the same script answers it each
-time: after the implementation, after each correction, and after the project's own
-full gate runs post-review. A node that produced a verdict is not a node that passed;
+The delivery tail asks the question after implementation, after corrections, and
+after the project's own full gate runs post-review. The same script answers it each
+time. A node that produced a verdict is not a node that passed;
 the loop completes on `done`, blocked declines included, so no spend and no public
 step happens until this reads the verdict itself.
 
@@ -14,8 +14,8 @@ process held the database this run needed, is not evidence about the change at a
 and reality gets checked again downstream regardless: flip-ready refuses to make the
 PR ready while its real CI is not green. So this fails on `introduced` and lets
 `inherited` and `environment` through with the claim recorded where every downstream
-reader meets it. An inherited base break stays red on the PR too, and holds at the
-durable CI wait, which is the honest place to hold it.
+reader meets it. An inherited base break stays red on the PR too, where the tail
+pauses for explicit operator action instead of retrying or flipping the PR ready.
 
 That trade is only safe while it stays loud, so a passed red is never silent: the
 record below is what the terminal report and the pull request body repeat. A record
@@ -123,7 +123,8 @@ def main() -> int:
 
     print(
         f"{stage} is red, and declared that red {cause} rather than introduced. "
-        "Proceeding: the pull request's own CI is the gate that still stands.",
+        "Proceeding so the pull request's own CI can be observed; a red conclusion "
+        "requires explicit operator action.",
         file=sys.stderr,
     )
     print(json.dumps({"gate": "green", "red_cause": cause}))

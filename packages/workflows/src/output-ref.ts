@@ -125,6 +125,15 @@ export function canonicalValueText(value: unknown): string {
 export const OUTPUT_REF_SOURCE = String.raw`\$([a-zA-Z_][a-zA-Z0-9_-]*)\.output`;
 
 /**
+ * The prior-iteration form of the same reference, used inside loop and loop_group
+ * bodies. Kept beside OUTPUT_REF_SOURCE so every ref grammar has one home. The two
+ * are disjoint: `$LOOP_PREV.<id>.output` does not match OUTPUT_REF_SOURCE, so a
+ * consumer that must see both (the include expander's rewrite, the validator's
+ * quoting lint) has to look for both.
+ */
+export const LOOP_PREV_OUTPUT_REF_SOURCE = String.raw`\$LOOP_PREV\.([a-zA-Z_][a-zA-Z0-9_-]*)\.output`;
+
+/**
  * The one shape of a declared-input NAME — `with:` keys, `inputs:` keys, and the
  * `<name>` of a `$INPUTS.<name>` reference all share it. Lives here beside
  * OUTPUT_REF_SOURCE so every ref grammar has one home; schemas/dag-node re-exports
@@ -358,10 +367,10 @@ export function resolveNodeOutputField(
     const obj = structuredObj ?? parseOutputObject(nodeOutput.output);
     // No parseable object AT ALL is not a declared-optional field — it is a producer
     // that did not honour its schema, and it must fail exactly as loudly as the
-    // schemaless path below (#2456). Returning empty here made declaring
-    // `output_format` QUIETER than declaring nothing, which is backwards: a
-    // `workflow:` node's output_format is never validated against the child (it only
-    // populates declaredFields), so every declared field silently became ''.
+    // schemaless path below (#2456). Returning empty here made declaring a contract
+    // QUIETER than declaring nothing, which is backwards: a `workflow:` node carries no
+    // schema of its own — its declaredFields are the child's `returns:` node projection
+    // (#2453) — so every declared field would silently have become ''.
     if (obj === undefined) {
       throw new OutputRefError(nodeId, field, unparseableReason(nodeOutput.output));
     }

@@ -1,7 +1,7 @@
 /**
  * Database operations for workflow events (lean UI-relevant events).
  *
- * Stores step transitions, parallel agent status, artifacts, and errors.
+ * Stores node lifecycle, parallel agent status, artifacts, and errors.
  * Verbose assistant/tool content stays in JSONL logs only.
  *
  * Ordinary observability writes are fire-and-forget. Correctness-critical lifecycle
@@ -15,7 +15,11 @@ import { createLogger } from '@archon/paths';
 import { mergeTokenUsage, type TokenUsage } from '@archon/providers/types';
 import { readFile } from 'node:fs/promises';
 import type { FanOutInstanceSnapshot } from '@archon/workflows/fan-out-identity';
-import type { WorkflowEventType } from '@archon/workflows/store';
+import {
+  NODE_LIFECYCLE_EVENT_TYPES,
+  type NodeLifecycleEventType,
+  type WorkflowEventType,
+} from '@archon/workflows/store';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -350,10 +354,64 @@ function parseFanOutSnapshots(value: unknown): FanOutInstanceSnapshot[] | undefi
   return snapshots;
 }
 
+interface NodeLifecycleEvent {
+  step_name: string | null;
+  event_type: NodeLifecycleEventType;
+}
+
+interface NodeLifecycleEventRow extends NodeLifecycleEvent {
+  workflow_run_id: string;
+}
+
+function foldActiveNodeIds(
+  activeNodeIds: Set<string>,
+  stepName: string | null,
+  eventType: NodeLifecycleEventType
+): void {
+  if (!stepName) return;
+  if (eventType === 'node_started') {
+    activeNodeIds.add(stepName);
+  } else {
+    activeNodeIds.delete(stepName);
+  }
+}
+
+export async function listActiveWorkflowNodeIds(
+  workflowRunIds: readonly string[]
+): Promise<Map<string, string[]>> {
+  if (workflowRunIds.length === 0) return new Map();
+
+  const activeByRun = new Map(workflowRunIds.map(id => [id, new Set<string>()]));
+  const runPlaceholders = workflowRunIds.map((_, index) => `$${String(index + 1)}`);
+  const eventPlaceholders = NODE_LIFECYCLE_EVENT_TYPES.map(
+    (_, index) => `$${String(workflowRunIds.length + index + 1)}`
+  );
+  const result = await pool.query<NodeLifecycleEventRow>(
+    `SELECT workflow_run_id, step_name, event_type
+     FROM remote_agent_workflow_events
+     WHERE workflow_run_id IN (${runPlaceholders.join(', ')})
+       AND event_type IN (${eventPlaceholders.join(', ')})
+     ORDER BY workflow_run_id, created_at ASC, COALESCE(event_order, 0) ASC, id ASC`,
+    [...workflowRunIds, ...NODE_LIFECYCLE_EVENT_TYPES]
+  );
+
+  for (const row of result.rows) {
+    const activeNodeIds = activeByRun.get(row.workflow_run_id);
+    if (activeNodeIds) foldActiveNodeIds(activeNodeIds, row.step_name, row.event_type);
+  }
+
+  return new Map([...activeByRun].map(([runId, activeNodeIds]) => [runId, [...activeNodeIds]]));
+}
+
 export async function getDagResumeSnapshot(workflowRunId: string): Promise<{
   completedNodeOutputs: Map<
     string,
-    { output: string; structuredOutput?: unknown; iteration?: number }
+    {
+      output: string;
+      structuredOutput?: unknown;
+      iteration?: number;
+      declaredFields?: readonly string[];
+    }
   >;
   fanOutSnapshots: Map<string, readonly FanOutInstanceSnapshot[]>;
   unresolvedNodeStarts: Set<string>;
@@ -362,21 +420,20 @@ export async function getDagResumeSnapshot(workflowRunId: string): Promise<{
 }> {
   const result = await pool.query<{
     step_name: string | null;
-    event_type:
-      | 'node_started'
-      | 'node_completed'
-      | 'node_failed'
-      | 'node_skipped'
-      | 'node_skipped_prior_success'
-      | 'fan_out_instances';
+    event_type: NodeLifecycleEventType | 'fan_out_instances';
     data: string | Record<string, unknown>;
   }>(
     `SELECT step_name, event_type, data FROM remote_agent_workflow_events
-     WHERE workflow_run_id = $1 AND event_type IN ('node_started', 'node_completed', 'node_failed', 'node_skipped', 'node_skipped_prior_success', 'fan_out_instances')
+     WHERE workflow_run_id = $1 AND event_type IN (${NODE_LIFECYCLE_EVENT_TYPES.map(
+       (_, index) => `$${String(index + 2)}`
+     ).join(', ')}, $${String(NODE_LIFECYCLE_EVENT_TYPES.length + 2)})
      ORDER BY created_at ASC, COALESCE(event_order, 0) ASC, id ASC`,
-    [workflowRunId]
+    [workflowRunId, ...NODE_LIFECYCLE_EVENT_TYPES, 'fan_out_instances']
   );
-  const completedNodeOutputs = new Map<string, { output: string; structuredOutput?: unknown }>();
+  const completedNodeOutputs = new Map<
+    string,
+    { output: string; structuredOutput?: unknown; declaredFields?: readonly string[] }
+  >();
   const fanOutSnapshots = new Map<string, readonly FanOutInstanceSnapshot[]>();
   const unresolvedNodeStarts = new Set<string>();
   // Collected and merged once at the end rather than folded pairwise: a pairwise fold
@@ -385,15 +442,8 @@ export async function getDagResumeSnapshot(workflowRunId: string): Promise<{
   const authoritativeInstanceScopes = new Set<string>();
   for (const row of result.rows) {
     if (!row.step_name) continue;
-    if (row.event_type === 'node_started') {
-      unresolvedNodeStarts.add(row.step_name);
-    } else if (
-      row.event_type === 'node_completed' ||
-      row.event_type === 'node_failed' ||
-      row.event_type === 'node_skipped' ||
-      row.event_type === 'node_skipped_prior_success'
-    ) {
-      unresolvedNodeStarts.delete(row.step_name);
+    if (row.event_type !== 'fan_out_instances') {
+      foldActiveNodeIds(unresolvedNodeStarts, row.step_name, row.event_type);
     }
     let data: Record<string, unknown>;
     try {
@@ -471,6 +521,15 @@ export async function getDagResumeSnapshot(workflowRunId: string): Promise<{
           );
         }
       }
+      // The field-access contract this node completed under (#2453), written only by
+      // `workflow:` nodes — the child owns that projection, so re-deriving it from the
+      // parent's own definition on resume would lose it. Accepted only as an array of
+      // strings; anything else is corrupt and degrades to "no persisted contract".
+      const rawDeclaredFields = data.declared_fields;
+      const declaredFields =
+        Array.isArray(rawDeclaredFields) && rawDeclaredFields.every(f => typeof f === 'string')
+          ? rawDeclaredFields
+          : undefined;
       completedNodeOutputs.set(row.step_name, {
         output,
         // The node's logical value (#2637), persisted beside its text by the emit
@@ -480,6 +539,7 @@ export async function getDagResumeSnapshot(workflowRunId: string): Promise<{
           ? { structuredOutput: data.structured_output }
           : {}),
         ...(Number.isInteger(data.iteration) ? { iteration: data.iteration as number } : {}),
+        ...(declaredFields !== undefined ? { declaredFields } : {}),
       });
     }
     // Composed-instance terminals are the durable accounting source for their whole

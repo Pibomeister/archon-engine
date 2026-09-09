@@ -1,9 +1,8 @@
 import { mock, describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { createMockLogger } from '../test/mocks/logger';
-import { createQueryResult, mockPostgresDialect } from '../test/mocks/database';
+import { createMockQuery, createQueryResult, mockPostgresDialect } from '../test/mocks/database';
 import type { WorkflowEventRow } from './workflow-events';
-import { AXIS_SPECIMEN } from '../test/token-usage-axes';
-import { mergeTokenUsage } from '@archon/providers/types';
+import { mergeTokenUsage, type TokenUsage } from '@archon/providers/types';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -20,7 +19,7 @@ mock.module('@archon/paths', () => ({
   getDefaultWorkflowsPath: mock(() => '/app/.archon/workflows/defaults'),
 }));
 
-const mockQuery = mock(() => Promise.resolve(createQueryResult([])));
+const mockQuery = createMockQuery();
 
 // Mock the connection module before importing the module under test
 mock.module('./connection', () => ({
@@ -41,6 +40,7 @@ import {
   persistWorkflowEventIfRunning,
   listWorkflowEvents,
   listRecentEvents,
+  listActiveWorkflowNodeIds,
   getDagResumeSnapshot,
 } from './workflow-events';
 
@@ -53,7 +53,7 @@ describe('workflow-events', () => {
   const mockEvent: WorkflowEventRow = {
     id: 'evt-123',
     workflow_run_id: 'run-456',
-    event_type: 'step_started',
+    event_type: 'node_started',
     step_index: 0,
     step_name: 'plan',
     data: {},
@@ -66,7 +66,7 @@ describe('workflow-events', () => {
 
       await createWorkflowEvent({
         workflow_run_id: 'run-456',
-        event_type: 'step_started',
+        event_type: 'node_started',
         step_index: 0,
         step_name: 'plan',
         data: { duration: 100 },
@@ -78,7 +78,7 @@ describe('workflow-events', () => {
         [
           expect.any(String), // generated UUID
           'run-456',
-          'step_started',
+          'node_started',
           0,
           'plan',
           JSON.stringify({ duration: 100 }),
@@ -110,7 +110,7 @@ describe('workflow-events', () => {
       // Should NOT throw — fire-and-forget logs error internally
       await createWorkflowEvent({
         workflow_run_id: 'run-456',
-        event_type: 'step_started',
+        event_type: 'node_started',
       });
     });
   });
@@ -265,6 +265,90 @@ describe('workflow-events', () => {
     });
   });
 
+  describe('listActiveWorkflowNodeIds', () => {
+    test('folds parallel, terminal, skipped, duplicate, and retry lifecycle rows in order', async () => {
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([
+          { workflow_run_id: 'run-a', step_name: 'alpha', event_type: 'node_started' },
+          { workflow_run_id: 'run-a', step_name: 'alpha', event_type: 'node_started' },
+          { workflow_run_id: 'run-a', step_name: 'completed', event_type: 'node_started' },
+          { workflow_run_id: 'run-a', step_name: 'completed', event_type: 'node_completed' },
+          { workflow_run_id: 'run-a', step_name: 'alpha', event_type: 'node_failed' },
+          { workflow_run_id: 'run-a', step_name: 'alpha', event_type: 'node_started' },
+          { workflow_run_id: 'run-a', step_name: 'skipped', event_type: 'node_started' },
+          { workflow_run_id: 'run-a', step_name: 'skipped', event_type: 'node_skipped' },
+          { workflow_run_id: 'run-a', step_name: 'cached', event_type: 'node_started' },
+          {
+            workflow_run_id: 'run-a',
+            step_name: 'cached',
+            event_type: 'node_skipped_prior_success',
+          },
+          { workflow_run_id: 'run-b', step_name: 'parallel-a', event_type: 'node_started' },
+          { workflow_run_id: 'run-b', step_name: 'parallel-b', event_type: 'node_started' },
+          { workflow_run_id: 'run-b', step_name: null, event_type: 'node_started' },
+        ])
+      );
+
+      const result = await listActiveWorkflowNodeIds(['run-a', 'run-b', 'run-c']);
+
+      expect(result).toEqual(
+        new Map([
+          ['run-a', ['alpha']],
+          ['run-b', ['parallel-a', 'parallel-b']],
+          ['run-c', []],
+        ])
+      );
+      expect(mockQuery).toHaveBeenCalledWith(
+        expect.stringContaining(
+          'ORDER BY workflow_run_id, created_at ASC, COALESCE(event_order, 0) ASC, id ASC'
+        ),
+        [
+          'run-a',
+          'run-b',
+          'run-c',
+          'node_started',
+          'node_completed',
+          'node_failed',
+          'node_skipped',
+          'node_skipped_prior_success',
+        ]
+      );
+    });
+
+    test('preserves activation order when a terminal node retries', async () => {
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([
+          { workflow_run_id: 'run-active', step_name: 'zeta', event_type: 'node_started' },
+          { workflow_run_id: 'run-active', step_name: 'alpha', event_type: 'node_started' },
+          { workflow_run_id: 'run-retry', step_name: 'zeta', event_type: 'node_started' },
+          { workflow_run_id: 'run-retry', step_name: 'alpha', event_type: 'node_started' },
+          { workflow_run_id: 'run-retry', step_name: 'zeta', event_type: 'node_failed' },
+          { workflow_run_id: 'run-retry', step_name: 'zeta', event_type: 'node_started' },
+        ])
+      );
+
+      const result = await listActiveWorkflowNodeIds(['run-active', 'run-retry']);
+
+      expect(result).toEqual(
+        new Map([
+          ['run-active', ['zeta', 'alpha']],
+          ['run-retry', ['alpha', 'zeta']],
+        ])
+      );
+    });
+
+    test('returns an empty map without querying for an empty run list', async () => {
+      expect(await listActiveWorkflowNodeIds([])).toEqual(new Map());
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    test('propagates query failures', async () => {
+      mockQuery.mockRejectedValueOnce(new Error('connection refused'));
+
+      await expect(listActiveWorkflowNodeIds(['run-a'])).rejects.toThrow('connection refused');
+    });
+  });
+
   describe('getDagResumeSnapshot', () => {
     test('returns outputs and summed tokens from node_completed events', async () => {
       mockQuery.mockResolvedValueOnce(
@@ -302,9 +386,10 @@ describe('workflow-events', () => {
         cacheRead: 50,
         cacheWrite: 5,
       });
-      expect(mockQuery).toHaveBeenCalledWith(expect.stringContaining('node_completed'), [
-        'run-123',
-      ]);
+      expect(mockQuery).toHaveBeenCalledWith(
+        expect.stringContaining('event_type IN'),
+        expect.arrayContaining(['run-123', 'node_completed'])
+      );
     });
 
     test('carries structured_output back out; rows without it stay text-only (#2637)', async () => {
@@ -350,6 +435,60 @@ describe('workflow-events', () => {
         output: 'false',
         structuredOutput: false,
       });
+    });
+
+    test('carries declared_fields back out; rows without it re-derive from the schema (#2453)', async () => {
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([
+          {
+            // A `workflow:` node completes under the CHILD's contract, which the parent's
+            // own definition does not state — so resume has to read it back, not re-derive it.
+            step_name: 'sub',
+            event_type: 'node_completed',
+            data: {
+              node_output: '{"green":true}',
+              structured_output: { green: true },
+              declared_fields: ['green', 'note'],
+            },
+          },
+          {
+            // The resume re-emit copies it forward for a SECOND resume.
+            step_name: 'replayed-sub',
+            event_type: 'node_skipped_prior_success',
+            data: { node_output: '{"n":1}', declared_fields: ['n'] },
+          },
+          {
+            // Pre-#2453 row: absent key, so the executor re-derives from the loaded schema.
+            step_name: 'legacy-sub',
+            event_type: 'node_completed',
+            data: { node_output: '{"green":true}', structured_output: { green: true } },
+          },
+          {
+            // Corrupt/foreign shape is not a contract: degrade to "none", never authorize
+            // field access from something no writer of ours produced.
+            step_name: 'corrupt-sub',
+            event_type: 'node_completed',
+            data: { node_output: '{}', declared_fields: ['ok', 7] },
+          },
+        ])
+      );
+
+      const result = await getDagResumeSnapshot('run-contracts');
+
+      expect(result.completedNodeOutputs.get('sub')).toEqual({
+        output: '{"green":true}',
+        structuredOutput: { green: true },
+        declaredFields: ['green', 'note'],
+      });
+      expect(result.completedNodeOutputs.get('replayed-sub')).toEqual({
+        output: '{"n":1}',
+        declaredFields: ['n'],
+      });
+      expect(result.completedNodeOutputs.get('legacy-sub')).toEqual({
+        output: '{"green":true}',
+        structuredOutput: { green: true },
+      });
+      expect(result.completedNodeOutputs.get('corrupt-sub')).toEqual({ output: '{}' });
     });
 
     test('reports cache from a mixed run as a floor instead of withholding it', async () => {
@@ -468,9 +607,10 @@ describe('workflow-events', () => {
         cacheWrite: 0,
         cachePartial: true,
       });
-      expect(mockQuery).toHaveBeenCalledWith(expect.stringContaining("'node_failed'"), [
-        'run-failed-usage',
-      ]);
+      expect(mockQuery).toHaveBeenCalledWith(
+        expect.stringContaining('event_type IN'),
+        expect.arrayContaining(['run-failed-usage', 'node_failed'])
+      );
     });
 
     test('a later node_failed row supersedes an earlier node_completed row for the same step (#2705 R2)', async () => {
@@ -589,8 +729,8 @@ describe('workflow-events', () => {
       expect(result.completedNodeOutputs.get('node-b')).toEqual({ output: 'output B' });
       expect(result.tokens).toEqual({ input: 40, output: 4 });
       expect(mockQuery).toHaveBeenCalledWith(
-        expect.stringContaining('node_skipped_prior_success'),
-        ['run-resume']
+        expect.stringContaining('event_type IN'),
+        expect.arrayContaining(['run-resume', 'node_skipped_prior_success'])
       );
     });
 
@@ -1132,10 +1272,19 @@ describe('workflow-events', () => {
 // drop the axis — while the writer next door carries it, and both packages
 // would stay green. Pinning to the fold makes that disagreement a failure.
 //
-// The type anchor is `AXIS_SPECIMEN` in `src/test/token-usage-axes.ts`, NOT in
-// this file: core's tsconfig excludes `**/*.test.ts` from type-check, so an
-// anchor placed here would never fire. That module explains the rest.
+// The `Required<TokenUsage>` specimen below is the type anchor: adding an axis
+// fails core's normal type-check before this runtime proof can run.
 // ───────────────────────────────────────────────────────────────────────────
+const AXIS_SPECIMEN: Required<TokenUsage> = {
+  input: 5000,
+  output: 1200,
+  cacheRead: 4000,
+  cacheWrite: 250,
+  cachePartial: true,
+  total: 6400,
+  cost: 0.25,
+};
+
 describe('TokenUsage axis seam guard', () => {
   test('getDagResumeSnapshot carries every axis the fold keeps', async () => {
     mockQuery.mockClear();

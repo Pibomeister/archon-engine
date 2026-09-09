@@ -54,6 +54,11 @@ const workflowWaitEventFields = {
   signaledAt: z.string().datetime().optional(),
   payload: z.unknown().optional(),
 } as const;
+const workflowWaitAttentionFields = {
+  kind: z.literal('attention'),
+  waitingSince: z.string().datetime(),
+  message: z.string().trim().min(1),
+} as const;
 const workflowWaitNodeOwnerFields = {
   owner: z.literal('node'),
   nodeId: z.string().min(1),
@@ -68,17 +73,20 @@ const workflowWaitLoopOwnerFields = {
 } as const;
 
 /**
- * Persisted reason a run is waiting on the outside world rather than a person.
+ * Persisted reason a run is waiting outside its current execution.
  * Loop-owned cursors carry their complete owner path in the initial pause write;
  * there is no externally visible body-owned intermediate state.
  */
 export const workflowWaitContextSchema = z.union([
   z.strictObject({ ...workflowWaitNodeOwnerFields, ...workflowWaitTimeFields }),
   z.strictObject({ ...workflowWaitNodeOwnerFields, ...workflowWaitEventFields }),
+  z.strictObject({ ...workflowWaitNodeOwnerFields, ...workflowWaitAttentionFields }),
   z.strictObject({ ...workflowWaitLoopOwnerFields, ...workflowWaitTimeFields }),
   z.strictObject({ ...workflowWaitLoopOwnerFields, ...workflowWaitEventFields }),
+  z.strictObject({ ...workflowWaitLoopOwnerFields, ...workflowWaitAttentionFields }),
 ]);
 export type WorkflowWaitContext = z.infer<typeof workflowWaitContextSchema>;
+export type WorkflowAttentionWaitContext = Extract<WorkflowWaitContext, { kind: 'attention' }>;
 
 export function isWorkflowWaitContext(value: unknown): value is WorkflowWaitContext {
   return workflowWaitContextSchema.safeParse(value).success;
@@ -240,6 +248,12 @@ export const nodeOutputSchema = z.discriminatedUnion('state', [
     error: z.string(),
     structuredOutput: z.unknown().optional(),
     declaredFields: z.array(z.string()).optional(),
+    /** Set by a producer whose failure is a deterministic diagnosis of its own output
+     *  (an exec node's stdout missing its declared `output_format`): re-running yields
+     *  the same stdout, so the retry loop must not consult the error text, which quotes
+     *  that stdout and can read as transient. Only `false` is expressible: a producer can
+     *  refuse retry, never force one past a FATAL classification. */
+    retryable: z.literal(false).optional(),
   }),
   z.object({
     state: z.enum(['pending', 'skipped']),
@@ -329,6 +343,13 @@ export type WorkflowRun = z.infer<typeof workflowRunSchema>;
  * `summary_value`  — additive sibling of `summary` (#2637): the child's terminal
  *                    structured value, stamped at completion alongside the text summary
  *                    so a parent `workflow:` node threads the logical value back.
+ * `summary_declared_fields` — additive sibling of `summary_value` (#2453): the top-level
+ *                    field names the child's selected `returns:` node declared, so a
+ *                    parent reads `$<node>.output.field` under the CHILD's contract — a
+ *                    `workflow:` node cannot declare a schema of its own. Only the
+ *                    derived projection travels; the schema itself stays in captured
+ *                    workflow source. Absent on schemaless children and pre-#2453 rows,
+ *                    which carry no field contract.
  */
 export const SUBRUN_METADATA_KEYS = {
   parentNodeId: 'parent_node_id',
@@ -337,6 +358,7 @@ export const SUBRUN_METADATA_KEYS = {
   inputs: 'inputs',
   inputsValues: 'inputs_values',
   summaryValue: 'summary_value',
+  summaryDeclaredFields: 'summary_declared_fields',
 } as const;
 
 /** Typed view of the sub-run keys on a run's metadata; each is undefined when unset. */
@@ -346,6 +368,7 @@ export function readSubrunMetadata(metadata: Record<string, unknown> | undefined
   fanOutItemHash: string | undefined;
   inputs: Record<string, JsonValue> | undefined;
   summaryValue: unknown;
+  summaryDeclaredFields: string[] | undefined;
 } {
   const parentNodeId = metadata?.[SUBRUN_METADATA_KEYS.parentNodeId];
   const childIndex = metadata?.[SUBRUN_METADATA_KEYS.childIndex];
@@ -367,6 +390,14 @@ export function readSubrunMetadata(metadata: Record<string, unknown> | undefined
     rawLegacy !== undefined && Object.values(rawLegacy).every(v => typeof v === 'string')
       ? (rawLegacy as Record<string, string>)
       : undefined;
+  // A field projection is only usable as a field-access contract when it is exactly an
+  // array of strings. Anything else is corrupt or foreign metadata: degrade to
+  // "no contract" rather than authorize access from a shape nobody wrote.
+  const rawDeclaredFields = metadata?.[SUBRUN_METADATA_KEYS.summaryDeclaredFields];
+  const summaryDeclaredFields =
+    Array.isArray(rawDeclaredFields) && rawDeclaredFields.every(f => typeof f === 'string')
+      ? rawDeclaredFields
+      : undefined;
   return {
     parentNodeId: typeof parentNodeId === 'string' ? parentNodeId : undefined,
     childIndex: typeof childIndex === 'number' ? childIndex : undefined,
@@ -377,6 +408,7 @@ export function readSubrunMetadata(metadata: Record<string, unknown> | undefined
       metadata !== undefined && Object.hasOwn(metadata, SUBRUN_METADATA_KEYS.summaryValue)
         ? metadata[SUBRUN_METADATA_KEYS.summaryValue]
         : undefined,
+    summaryDeclaredFields,
   };
 }
 
@@ -444,13 +476,21 @@ export function readIdentityUnresolved(
  */
 export const WORKFLOW_SOURCE_METADATA_KEY = 'workflow_source';
 
+/** Source-side settings that decide which executable files a workflow resolves. */
+export const workflowSourceConfigSchema = z.object({
+  load_default_workflows: z.boolean(),
+  load_default_commands: z.boolean(),
+  command_folder: z.string().optional(),
+});
+
+export type WorkflowSourceConfig = Readonly<z.infer<typeof workflowSourceConfigSchema>>;
+
 /**
  * A run's recorded executable source.
  *
  * `version` exists so a future capture layout can be recognized rather than
- * misread. A reader that does not know a version treats the record as absent and
- * falls back to live discovery with a warning — never as an error, because a paused
- * run must stay resumable across an Archon upgrade.
+ * misread. An unrecognized record fails closed: only a run with no source record
+ * may resume against live discovery.
  */
 export const workflowSourceMetadataSchema = z.object({
   version: z.literal(1),
@@ -458,13 +498,12 @@ export const workflowSourceMetadataSchema = z.object({
    * Absolute path to the captured source; usable directly as a project root.
    *
    * Absoluteness is enforced rather than assumed: every root reaching here is built from
-   * the run's own artifacts path, so a relative or blank one means the record is corrupt
+   * the run's own workspace path, so a relative or blank one means the record is corrupt
    * or foreign. Resolving it against whatever `process.cwd()` happens to be would send
-   * every command and script lookup somewhere arbitrary, so it reads as absent instead
-   * and the run falls back to live source with a warning.
+   * every command and script lookup somewhere arbitrary, so the record is unreadable.
    */
   root: z.string().refine(p => isAbsolute(p), { message: 'must be an absolute path' }),
-  /** The authoring directory it was captured from (provenance; never read for lookup). */
+  /** The authoring directory a not-yet-started child captures from. */
   origin: z.string().refine(p => isAbsolute(p), { message: 'must be an absolute path' }),
   captured_at: z.string(),
   /**
@@ -475,23 +514,16 @@ export const workflowSourceMetadataSchema = z.object({
    * which may since have been reclaimed. Verification still reads the manifest.
    */
   digest: z.string(),
+  /**
+   * Resolution settings pinned beside the digest, outside the mutable capture.
+   * Optional only for runs created before this field shipped.
+   */
+  source_config: workflowSourceConfigSchema.optional(),
   file_count: z.number(),
   byte_count: z.number(),
 });
 
 export type WorkflowSourceMetadata = z.infer<typeof workflowSourceMetadataSchema>;
-
-/**
- * Typed view of a run's recorded source, or `undefined` when it has none this reader
- * understands. Validation is deliberately total: an unparseable record means "resolve
- * live", not "fail the resume", so a shape change cannot strand paused work.
- */
-export function readWorkflowSourceMetadata(
-  metadata: Record<string, unknown> | undefined
-): WorkflowSourceMetadata | undefined {
-  const state = readWorkflowSourceState(metadata);
-  return state.kind === 'recorded' ? state.record : undefined;
-}
 
 /**
  * What a run says about its executable source.
@@ -804,6 +836,12 @@ export type RunAttentionUnreadableReason =
 export type RunAttention =
   | { kind: 'terminal'; runId: string; status: RunTerminalStatus; at: Date | null }
   | { kind: 'awaiting_response'; runId: string; respondTo: GateAddress; message: string }
+  | {
+      kind: 'action_required';
+      runId: string;
+      nodeId: string;
+      message: string;
+    }
   | { kind: 'blocked_on_child'; runId: string; childRunId: string; nodeId: string }
   | { kind: 'unreadable'; runId: string; reason: RunAttentionUnreadableReason; detail: string };
 
@@ -843,11 +881,21 @@ export function runAttention(run: RunAttentionInput): RunAttention | null {
   }
   if (run.status !== 'paused') return null;
 
+  const wait = run.metadata?.wait;
+  if (isWorkflowWaitContext(wait) && wait.kind === 'attention') {
+    return {
+      kind: 'action_required',
+      runId: run.id,
+      nodeId: workflowWaitStepName(wait),
+      message: wait.message,
+    };
+  }
+
   const raw = run.metadata?.approval;
   if (raw === undefined) {
-    // No gate recorded. A durable `wait:` owns its own resumption — the clock or the
-    // awaited event, not a person. Anything else is a run parked with nothing that
-    // describes why, which nothing but an outside response can unstick.
+    // No gate recorded. A durable `wait:` owns its own resumption. Anything else is
+    // a run parked with nothing that describes why, which nothing but an outside
+    // response can unstick.
     return isWorkflowWaitContext(run.metadata?.wait)
       ? null
       : unreadableAttention(

@@ -26,6 +26,7 @@ import { InvalidProviderRunConfigError, UnknownProviderError } from './errors';
 import { createLogger } from '@archon/paths';
 import { isFactoryManaged, getFactoryBroker } from './factory-mode';
 import { createAdmittedProvider } from './factory-admission';
+import { EFFORT_LADDER } from '@archon/paths/effort';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -114,6 +115,7 @@ export function getProviderInfoList(): ProviderInfo[] {
     displayName,
     capabilities,
     builtIn,
+    ...(capabilities.effortControl ? { effortLevels: EFFORT_LADDER } : {}),
   }));
 }
 

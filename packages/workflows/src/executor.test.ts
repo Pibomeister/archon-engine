@@ -64,6 +64,7 @@ function fakeStoragePathsForRoot(root: string): {
   artifactsRoot: string;
   logsDir: string;
   stateRoot: string;
+  workflowSourceRoot: string;
 } {
   // join(), not template literals — production composes these with join(), so a
   // forward-slash fake would never match on Windows.
@@ -72,6 +73,7 @@ function fakeStoragePathsForRoot(root: string): {
     artifactsRoot: join(root, 'artifacts'),
     logsDir: join(root, 'logs'),
     stateRoot: join(root, 'state'),
+    workflowSourceRoot: join(root, 'workflow-source'),
   };
 }
 function fakeGetProjectStoragePaths(
@@ -166,10 +168,16 @@ import {
   resolveProjectPaths,
   resolveScopeArtifactsDir,
 } from './executor';
+import { resolveWorkflow } from './graph-plan';
 import { keepAwake } from './utils/keep-awake';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
 import type { IWorkflowStore } from './store';
-import type { WorkflowDefinition, WorkflowRun, WorkflowRunNodeSession } from './schemas';
+import type {
+  ResolvedWorkflow,
+  WorkflowDefinition,
+  WorkflowRun,
+  WorkflowRunNodeSession,
+} from './schemas';
 import { RUN_METADATA_KEYS, workflowDefinitionSchema } from './schemas';
 import type { WorkflowRunConfigMetadata } from './schemas/run-config';
 import { substituteWorkflowVariables } from './executor-shared';
@@ -206,6 +214,7 @@ function makeStore(overrides: Partial<IWorkflowStore> = {}): IWorkflowStore {
     completeWorkflowRun: mock(async () => {}),
     pauseWorkflowRun: mock(async () => {}),
     pauseWorkflowRunForWait: mock(async () => {}),
+    failPausedAttentionWait: mock(async () => ({ failed: true })),
     clearWorkflowWaitContext: mock(async () => ({ cleared: true })),
     rewriteApprovalContext: mock(async () => ({ resolved: true })),
     claimWriteback: mock(async () => ({ claimed: true })),
@@ -248,13 +257,13 @@ function makeDeps(store?: IWorkflowStore): WorkflowDeps {
   } as unknown as WorkflowDeps;
 }
 
-function makeWorkflow(overrides: Partial<WorkflowDefinition> = {}): WorkflowDefinition {
-  return {
+function makeWorkflow(overrides: Partial<WorkflowDefinition> = {}): ResolvedWorkflow {
+  return resolveWorkflow({
     name: 'test-workflow',
     description: 'Test',
     nodes: [{ id: 'node1', kind: 'agent', source: { kind: 'inline', prompt: 'Do something' } }],
     ...overrides,
-  };
+  });
 }
 
 function makeRun(overrides: Partial<WorkflowRun> = {}): WorkflowRun {
@@ -293,12 +302,14 @@ describe('executeWorkflow', () => {
   });
 
   it('rejects a structurally valid but semantically invalid outcome declaration before side effects', async () => {
-    const workflow = workflowDefinitionSchema.parse({
-      name: 'invalid-authored-outcome',
-      description: 'missing selected return node',
-      outcome_field: 'green',
-      nodes: [{ id: 'node1', prompt: 'Do something' }],
-    });
+    const workflow = resolveWorkflow(
+      workflowDefinitionSchema.parse({
+        name: 'invalid-authored-outcome',
+        description: 'missing selected return node',
+        outcome_field: 'green',
+        nodes: [{ id: 'node1', prompt: 'Do something' }],
+      })
+    );
     const store = makeStore();
     const deps = makeDeps(store);
 
@@ -311,17 +322,57 @@ describe('executeWorkflow', () => {
     expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
   });
 
+  it('does not report a notification-failed attention wait as a successful pause', async () => {
+    const wait = {
+      owner: 'node' as const,
+      nodeId: 'rerun-ci',
+      kind: 'attention' as const,
+      waitingSince: '2026-09-01T10:00:00.000Z',
+      message: 'Re-run the failing check, then resume.',
+    };
+    const store = makeStore({
+      getWorkflowRun: mock(async () =>
+        makeRun({
+          status: 'failed',
+          metadata: {
+            wait,
+            error: "Wait node 'rerun-ci' could not deliver its action-required notification",
+          },
+        })
+      ),
+      getWorkflowRunStatus: mock(async () => 'failed' as const),
+    });
+
+    const result = await executeWorkflow(
+      makeDeps(store),
+      makePlatform(),
+      'conv-1',
+      '/tmp/ops',
+      makeWorkflow(),
+      'msg',
+      'db-conv-1'
+    );
+
+    expect(result).toEqual({
+      success: false,
+      workflowRunId: 'run-123',
+      error: 'Workflow did not complete successfully',
+    });
+  });
+
   // -------------------------------------------------------------------------
   // Container resume guard (Phase C)
   // -------------------------------------------------------------------------
 
   describe('container resume guard', () => {
     it('rejects a fresh container workflow with a durable wait before creating a run', async () => {
-      const workflow = workflowDefinitionSchema.parse({
-        name: 'container-wait',
-        description: 'unsupported durable wait in container isolation',
-        nodes: [{ id: 'delay', wait: { duration_ms: 1000 } }],
-      });
+      const workflow = resolveWorkflow(
+        workflowDefinitionSchema.parse({
+          name: 'container-wait',
+          description: 'unsupported durable wait in container isolation',
+          nodes: [{ id: 'delay', wait: { duration_ms: 1000 } }],
+        })
+      );
       const store = makeStore();
 
       await expect(
@@ -344,11 +395,13 @@ describe('executeWorkflow', () => {
     // The guard keys on "is this a fresh dispatch", not on who wrote the row. A row
     // pre-created by a launching process (#2872, `--detach`) is still a fresh dispatch.
     it('refuses the same durable wait when the fresh run row was pre-created', async () => {
-      const workflow = workflowDefinitionSchema.parse({
-        name: 'container-wait',
-        description: 'unsupported durable wait in container isolation',
-        nodes: [{ id: 'delay', wait: { duration_ms: 1000 } }],
-      });
+      const workflow = resolveWorkflow(
+        workflowDefinitionSchema.parse({
+          name: 'container-wait',
+          description: 'unsupported durable wait in container isolation',
+          nodes: [{ id: 'delay', wait: { duration_ms: 1000 } }],
+        })
+      );
 
       await expect(
         executeWorkflow(
@@ -421,7 +474,7 @@ describe('executeWorkflow', () => {
       );
       // Guard passed → DAG entered (mocked no-op) → run completes.
       expect(mockExecuteDagWorkflow).toHaveBeenCalledTimes(1);
-      expect(mockExecuteDagWorkflow.mock.calls[0]?.[24]).toEqual({
+      expect(mockExecuteDagWorkflow.mock.calls[0]?.[0].priorUsage).toEqual({
         tokens: { input: 40, output: 4 },
         costUsd: 0.5,
       });
@@ -435,10 +488,11 @@ describe('executeWorkflow', () => {
 
   describe('adopted run dir on resume', () => {
     it('resolves $ADOPTED_RUN_DIR on a resumed run from its persisted adopted_from_run_id', async () => {
+      const trustedOutputRoot = join(WS, 'workspaces', 'acme', 'widget');
       const store = makeStore({
         getWorkflowRun: mock(async (id: string) =>
           id === 'prior-run'
-            ? makeRun({ id: 'prior-run', status: 'completed', output_root: '/tmp/roots/prior' })
+            ? makeRun({ id: 'prior-run', status: 'completed', output_root: trustedOutputRoot })
             : { ...makeRun(), status: 'completed' as const }
         ),
       });
@@ -472,7 +526,7 @@ describe('executeWorkflow', () => {
       // path.join resolves platform-separator natively; the template's own
       // '/report.md' suffix stays a literal POSIX slash
       expect(substituted).toBe(
-        `Read ${join('/tmp/roots/prior', 'artifacts', 'runs', 'prior-run')}/report.md`
+        `Read ${join(trustedOutputRoot, 'artifacts', 'runs', 'prior-run')}/report.md`
       );
       // The adoption announcement is creation-only — a resume must not re-emit it.
       const adoptedEvents = (
@@ -481,6 +535,342 @@ describe('executeWorkflow', () => {
         c => (c[0] as { event_type: string }).event_type === 'workflow.run_adopted'
       );
       expect(adoptedEvents).toHaveLength(0);
+    });
+  });
+
+  // --- Supersession is metadata-only (#3064): no estate, no output_root gate ---
+
+  describe('supersession does not gate on output_root', () => {
+    it('starts normally when the superseded run has no output_root (preflight-failed)', async () => {
+      const supersededId = 'superseded-run';
+      const store = makeStore({
+        getWorkflowRun: mock(async (id: string) =>
+          id === supersededId
+            ? makeRun({ id: supersededId, status: 'failed', output_root: null })
+            : { ...makeRun(), status: 'completed' as const }
+        ),
+      });
+      const result = await executeWorkflow(
+        makeDeps(store),
+        makePlatform(),
+        'conv-1',
+        '/tmp/ops',
+        makeWorkflow(),
+        'msg',
+        'db-conv-1',
+        {
+          adoptedFromRunId: supersededId,
+          continuationMode: 'supersede',
+        }
+      );
+      expect(result.success).toBe(true);
+      // Metadata stamp must record the continuation mode so resume reads it.
+      expect(store.createWorkflowRun).toHaveBeenCalledWith(
+        expect.objectContaining({
+          metadata: expect.objectContaining({
+            continuation: { mode: 'supersede' },
+          }),
+        })
+      );
+      // Must NOT attempt to resolve output_root for supersession.
+      expect(store.getWorkflowRun).not.toHaveBeenCalledWith(supersededId);
+    });
+
+    it('starts normally on resume when the superseded run has no output_root', async () => {
+      const supersededId = 'superseded-run';
+      const store = makeStore({
+        getWorkflowRun: mock(async () => makeRun({ status: 'completed' as const })),
+      });
+      const result = await executeWorkflow(
+        makeDeps(store),
+        makePlatform(),
+        'conv-1',
+        '/tmp/ops',
+        makeWorkflow(),
+        'msg',
+        'db-conv-1',
+        {
+          preCreatedRun: makeRun({
+            status: 'running',
+            adopted_from_run_id: supersededId,
+            metadata: { continuation: { mode: 'supersede' } },
+          }),
+          priorCompletedNodes: new Map([['node1', { output: 'out' }]]),
+        }
+      );
+      expect(result.success).toBe(true);
+      // The resumed supersession must not fetch the superseded run at all.
+      expect(store.getWorkflowRun).not.toHaveBeenCalledWith(supersededId);
+    });
+
+    it('adoption with output_root still works (unchanged)', async () => {
+      const adoptedId = 'prior-run';
+      const trustedOutputRoot = join(WS, 'workspaces', 'acme', 'widget');
+      let capturedVar: string | undefined;
+      mockExecuteDagWorkflow.mockImplementationOnce(async () => {
+        capturedVar = substituteWorkflowVariables(
+          'Read $ADOPTED_RUN_DIR/report.md',
+          'run-123',
+          'msg',
+          '/artifacts',
+          'main',
+          'docs'
+        ).prompt;
+        return undefined;
+      });
+      const store = makeStore({
+        getWorkflowRun: mock(async (id: string) =>
+          id === adoptedId
+            ? makeRun({ id: adoptedId, status: 'completed', output_root: trustedOutputRoot })
+            : id === 'run-123'
+              ? makeRun({ id: 'run-123', status: 'completed' as const })
+              : { ...makeRun(), status: 'completed' as const }
+        ),
+      });
+      const result = await executeWorkflow(
+        makeDeps(store),
+        makePlatform(),
+        'conv-1',
+        '/tmp/ops',
+        makeWorkflow(),
+        'msg',
+        'db-conv-1',
+        {
+          adoptedFromRunId: adoptedId,
+          continuationMode: 'adopt',
+        }
+      );
+      expect(result.success).toBe(true);
+      expect(capturedVar!).toBe(
+        `Read ${join(trustedOutputRoot, 'artifacts', 'runs', adoptedId)}/report.md`
+      );
+    });
+
+    it('emits the run_adopted event with mode in data', async () => {
+      const supersededId = 'superseded-run';
+      const store = makeStore();
+      await executeWorkflow(
+        makeDeps(store),
+        makePlatform(),
+        'conv-1',
+        '/tmp/ops',
+        makeWorkflow(),
+        'msg',
+        'db-conv-1',
+        {
+          adoptedFromRunId: supersededId,
+          continuationMode: 'supersede',
+        }
+      );
+      const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.filter(
+        c => (c[0] as { event_type: string }).event_type === 'workflow.run_adopted'
+      );
+      expect(eventCalls).toHaveLength(1);
+      const eventData = (eventCalls[0]![0] as { data: Record<string, unknown> }).data;
+      expect(eventData.adopted_from_run_id).toBe(supersededId);
+      expect(eventData.mode).toBe('supersede');
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Adopted-run dir containment (#3097) — the persisted output_root reader in
+  // $ADOPTED_RUN_DIR resolution must go through the shared resolver, matching
+  // the CLI leave-behind and server artifact routes. Out-of-tree values with
+  // no codebase row to re-derive from are refused; relocated roots that the
+  // adopted run's codebase can re-derive under the current ARCHON_HOME resolve
+  // and list as before.
+  // -------------------------------------------------------------------------
+
+  describe('adopted run dir containment (#3097)', () => {
+    it('refuses to adopt from a run whose persisted output_root is outside ARCHON_HOME with no codebase re-derivation', async () => {
+      const adoptedId = 'prior-run';
+      const store = makeStore({
+        getWorkflowRun: mock(async (id: string) =>
+          id === adoptedId
+            ? makeRun({
+                id: adoptedId,
+                status: 'completed',
+                // Out-of-tree root — not under /tmp/ws (this suite's fake
+                // ARCHON_HOME), and no codebase row to re-derive from. The
+                // shared resolver returns null and the executor refuses,
+                // matching the CLI leave-behind and server readers.
+                output_root: '/old-machine/.archon/workspaces/old/name',
+                codebase_id: null,
+              })
+            : { ...makeRun(), status: 'completed' as const }
+        ),
+      });
+      await expect(
+        executeWorkflow(
+          makeDeps(store),
+          makePlatform(),
+          'conv-1',
+          '/tmp/ops',
+          makeWorkflow(),
+          'msg',
+          'db-conv-1',
+          {
+            adoptedFromRunId: adoptedId,
+            continuationMode: 'adopt',
+          }
+        )
+      ).rejects.toThrow(/outside ARCHON_HOME/);
+    });
+
+    it('re-derives a relocated adopted run dir through the adopted codebase', async () => {
+      const adoptedId = 'prior-run';
+      let capturedVar: string | undefined;
+      mockExecuteDagWorkflow.mockImplementationOnce(async () => {
+        capturedVar = substituteWorkflowVariables(
+          'Read $ADOPTED_RUN_DIR/report.md',
+          'run-123',
+          'msg',
+          '/artifacts',
+          'main',
+          'docs'
+        ).prompt;
+        return undefined;
+      });
+      const store = makeStore({
+        getWorkflowRun: mock(async (id: string) =>
+          id === adoptedId
+            ? makeRun({
+                id: adoptedId,
+                status: 'completed',
+                // Out-of-tree persisted root from another machine — must be
+                // re-derived under the current ARCHON_HOME via the adopted
+                // run's codebase row, not walked verbatim.
+                output_root: '/old-machine/.archon/workspaces/old/name',
+                codebase_id: 'cb-adopted',
+              })
+            : id === 'run-123'
+              ? makeRun({ id: 'run-123', status: 'completed' as const })
+              : { ...makeRun(), status: 'completed' as const }
+        ),
+        getCodebase: mock(async (id: string) =>
+          id === 'cb-adopted'
+            ? {
+                id: 'cb-adopted',
+                name: 'acme/widget',
+                repository_url: 'https://github.com/acme/widget',
+                default_cwd: '/repos/widget',
+                kind: 'repo' as const,
+              }
+            : null
+        ),
+      });
+      const result = await executeWorkflow(
+        makeDeps(store),
+        makePlatform(),
+        'conv-1',
+        '/tmp/ops',
+        makeWorkflow(),
+        'msg',
+        'db-conv-1',
+        {
+          adoptedFromRunId: adoptedId,
+          continuationMode: 'adopt',
+        }
+      );
+      expect(result.success).toBe(true);
+      expect(capturedVar!).toBe(
+        `Read ${join(WS, 'acme', 'widget', 'artifacts', 'runs', adoptedId)}/report.md`
+      );
+    });
+
+    // Same containment rules apply on the RESUME path — `adoptedFromRunId`
+    // is not in opts; the executor reads `adopted_from_run_id` from the
+    // pre-created persisted row. The resolver call site is identical
+    // (executor.ts:2578), but a future regression that adds a resume-specific
+    // bypass before the resolver would not fail the fresh-path tests above.
+
+    it('resume: refuses adoption when the persisted output_root is outside ARCHON_HOME with no codebase', async () => {
+      const adoptedId = 'prior-run';
+      const store = makeStore({
+        getWorkflowRun: mock(async (id: string) =>
+          id === adoptedId
+            ? makeRun({
+                id: adoptedId,
+                status: 'completed',
+                output_root: '/old-machine/.archon/workspaces/old/name',
+                codebase_id: null,
+              })
+            : { ...makeRun(), status: 'completed' as const }
+        ),
+      });
+      await expect(
+        executeWorkflow(
+          makeDeps(store),
+          makePlatform(),
+          'conv-1',
+          '/tmp/ops',
+          makeWorkflow(),
+          'msg',
+          'db-conv-1',
+          {
+            preCreatedRun: makeRun({ status: 'running', adopted_from_run_id: adoptedId }),
+            priorCompletedNodes: new Map([['node1', { output: 'out' }]]),
+          }
+        )
+      ).rejects.toThrow(/outside ARCHON_HOME/);
+    });
+
+    it('resume: re-derives a relocated adopted run dir through the adopted codebase', async () => {
+      const adoptedId = 'prior-run';
+      let capturedVar: string | undefined;
+      mockExecuteDagWorkflow.mockImplementationOnce(async () => {
+        capturedVar = substituteWorkflowVariables(
+          'Read $ADOPTED_RUN_DIR/report.md',
+          'run-123',
+          'msg',
+          '/artifacts',
+          'main',
+          'docs'
+        ).prompt;
+        return undefined;
+      });
+      const store = makeStore({
+        getWorkflowRun: mock(async (id: string) =>
+          id === adoptedId
+            ? makeRun({
+                id: adoptedId,
+                status: 'completed',
+                output_root: '/old-machine/.archon/workspaces/old/name',
+                codebase_id: 'cb-adopted',
+              })
+            : id === 'run-123'
+              ? makeRun({ id: 'run-123', status: 'completed' as const })
+              : { ...makeRun(), status: 'completed' as const }
+        ),
+        getCodebase: mock(async (id: string) =>
+          id === 'cb-adopted'
+            ? {
+                id: 'cb-adopted',
+                name: 'acme/widget',
+                repository_url: 'https://github.com/acme/widget',
+                default_cwd: '/repos/widget',
+                kind: 'repo' as const,
+              }
+            : null
+        ),
+      });
+      const result = await executeWorkflow(
+        makeDeps(store),
+        makePlatform(),
+        'conv-1',
+        '/tmp/ops',
+        makeWorkflow(),
+        'msg',
+        'db-conv-1',
+        {
+          preCreatedRun: makeRun({ status: 'running', adopted_from_run_id: adoptedId }),
+          priorCompletedNodes: new Map([['node1', { output: 'out' }]]),
+        }
+      );
+      expect(result.success).toBe(true);
+      expect(capturedVar!).toBe(
+        `Read ${join(WS, 'acme', 'widget', 'artifacts', 'runs', adoptedId)}/report.md`
+      );
     });
   });
 
@@ -875,9 +1265,9 @@ describe('executeWorkflow', () => {
         }
       );
 
-      expect(mockExecuteDagWorkflow.mock.calls[0]?.[6]).toBe('pi');
-      expect(mockExecuteDagWorkflow.mock.calls[0]?.[7]).toBe('openai/gpt-5.6');
-      const profile = mockExecuteDagWorkflow.mock.calls[0]?.[18];
+      expect(mockExecuteDagWorkflow.mock.calls[0]?.[0].workflowProvider).toBe('pi');
+      expect(mockExecuteDagWorkflow.mock.calls[0]?.[0].workflowModel).toBe('openai/gpt-5.6');
+      const profile = mockExecuteDagWorkflow.mock.calls[0]?.[0].aiProfile;
       expect(profile?.aliases.large).toEqual({ provider: 'pi', model: 'openai/gpt-5.6' });
       expect(profile?.aliases.small?.provider).toBe('claude');
       expect(profile?.aliases.medium?.provider).toBe('claude');
@@ -924,7 +1314,7 @@ describe('executeWorkflow', () => {
           metadata: expect.objectContaining({ model_bindings: expect.any(Object) }),
         })
       );
-      expect(mockExecuteDagWorkflow.mock.calls[0]?.[6]).toBe('codex');
+      expect(mockExecuteDagWorkflow.mock.calls[0]?.[0].workflowProvider).toBe('codex');
     });
 
     // #2872 — `run --detach` writes the row before it forks, so `Started` names a
@@ -1076,8 +1466,8 @@ describe('executeWorkflow', () => {
         'db-conv-1',
         { preCreatedRun, priorCompletedNodes: new Map() }
       );
-      expect(mockExecuteDagWorkflow.mock.calls[0]?.[6]).toBe('pi');
-      expect(mockExecuteDagWorkflow.mock.calls[0]?.[7]).toBe('openai/gpt-5.6');
+      expect(mockExecuteDagWorkflow.mock.calls[0]?.[0].workflowProvider).toBe('pi');
+      expect(mockExecuteDagWorkflow.mock.calls[0]?.[0].workflowModel).toBe('openai/gpt-5.6');
 
       await expect(
         executeWorkflow(
@@ -1230,7 +1620,7 @@ describe('executeWorkflow', () => {
       expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
     });
 
-    it('terminalizes a resumed run before dispatch when persisted thinking is ineffective', async () => {
+    it('terminalizes a resumed run when persisted metadata uses retired thinking config', async () => {
       const failRun = mock<IWorkflowStore['failWorkflowRun']>(async () => {});
       const preset = {
         provider: 'copilot',
@@ -1262,11 +1652,11 @@ describe('executeWorkflow', () => {
           'db-conv-1',
           { preCreatedRun, priorCompletedNodes: new Map() }
         )
-      ).rejects.toThrow(/cannot apply Claude-shaped thinking options/);
+      ).rejects.toThrow(/thinking:.*effort:/);
 
       expect(failRun).toHaveBeenCalledWith(
         'resume-ignored-thinking-run',
-        expect.stringContaining('cannot apply Claude-shaped thinking options')
+        expect.stringMatching(/thinking:.*effort:/)
       );
       expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
     });
@@ -1336,8 +1726,8 @@ describe('executeWorkflow', () => {
       ]);
 
       const concurrent = mockExecuteDagWorkflow.mock.calls.slice(0, 2).map(call => ({
-        provider: call[6],
-        model: call[7],
+        provider: call[0].workflowProvider,
+        model: call[0].workflowModel,
       }));
       expect(concurrent).toContainEqual({ provider: 'pi', model: 'openai/gpt-5.6' });
       expect(concurrent).toContainEqual({ provider: 'codex', model: 'gpt-5.6-sol' });
@@ -1352,9 +1742,9 @@ describe('executeWorkflow', () => {
         'db-c'
       );
       const cleanCall = mockExecuteDagWorkflow.mock.calls[2];
-      expect(cleanCall?.[6]).toBe('claude');
-      expect(cleanCall?.[7]).not.toBe('openai/gpt-5.6');
-      expect(cleanCall?.[7]).not.toBe('gpt-5.6-sol');
+      expect(cleanCall?.[0].workflowProvider).toBe('claude');
+      expect(cleanCall?.[0].workflowModel).not.toBe('openai/gpt-5.6');
+      expect(cleanCall?.[0].workflowModel).not.toBe('gpt-5.6-sol');
     });
   });
 
@@ -1424,9 +1814,9 @@ describe('executeWorkflow', () => {
       );
 
       expect(sealRunConfig).toHaveBeenCalledTimes(1);
-      expect(mockExecuteDagWorkflow.mock.calls[0]?.[6]).toBe('pi');
-      expect(mockExecuteDagWorkflow.mock.calls[0]?.[7]).toBe('openai/gpt-5.6');
-      expect(mockExecuteDagWorkflow.mock.calls[0]?.[13]).toMatchObject({
+      expect(mockExecuteDagWorkflow.mock.calls[0]?.[0].workflowProvider).toBe('pi');
+      expect(mockExecuteDagWorkflow.mock.calls[0]?.[0].workflowModel).toBe('openai/gpt-5.6');
+      expect(mockExecuteDagWorkflow.mock.calls[0]?.[0].config).toMatchObject({
         assistant: 'pi',
         envVars: {
           REPO_ONLY: 'kept',
@@ -1471,8 +1861,8 @@ describe('executeWorkflow', () => {
       );
 
       expect(unsealRunConfig).toHaveBeenCalledWith(sealedMetadata);
-      expect(mockExecuteDagWorkflow.mock.calls[0]?.[12]).toBe('handbook');
-      expect(mockExecuteDagWorkflow.mock.calls[0]?.[13]).toMatchObject({
+      expect(mockExecuteDagWorkflow.mock.calls[0]?.[0].docsDir).toBe('handbook');
+      expect(mockExecuteDagWorkflow.mock.calls[0]?.[0].config).toMatchObject({
         envVars: { RUN_ONLY: 'restored' },
       });
     });
@@ -1540,9 +1930,9 @@ describe('executeWorkflow', () => {
       ]);
 
       const concurrent = mockExecuteDagWorkflow.mock.calls.slice(0, 2).map(call => ({
-        provider: call[6],
-        model: call[7],
-        marker: (call[13] as WorkflowConfig | undefined)?.envVars?.RUN_MARKER,
+        provider: call[0].workflowProvider,
+        model: call[0].workflowModel,
+        marker: call[0].config.envVars?.RUN_MARKER,
       }));
       expect(concurrent).toContainEqual({
         provider: 'pi',
@@ -1566,9 +1956,9 @@ describe('executeWorkflow', () => {
         'clean',
         'db-clean'
       );
-      const cleanConfig = mockExecuteDagWorkflow.mock.calls[2]?.[13] as WorkflowConfig | undefined;
+      const cleanConfig = mockExecuteDagWorkflow.mock.calls[2]?.[0].config;
       expect(cleanConfig?.envVars?.RUN_MARKER).toBeUndefined();
-      expect(mockExecuteDagWorkflow.mock.calls[2]?.[6]).toBe('claude');
+      expect(mockExecuteDagWorkflow.mock.calls[2]?.[0].workflowProvider).toBe('claude');
     });
   });
 
@@ -1902,8 +2292,7 @@ describe('executeWorkflow', () => {
         'db-conv-1'
       );
       expect(mockExecuteDagWorkflow).toHaveBeenCalledTimes(1);
-      // docsDir is arg index 11 (0-indexed) of executeDagWorkflow
-      const docsDir = mockExecuteDagWorkflow.mock.calls[0]?.[12];
+      const docsDir = mockExecuteDagWorkflow.mock.calls[0]?.[0].docsDir;
       expect(docsDir).toBe('docs/');
     });
 
@@ -1934,7 +2323,7 @@ describe('executeWorkflow', () => {
         'db-conv-1'
       );
       expect(mockExecuteDagWorkflow).toHaveBeenCalledTimes(1);
-      const docsDir = mockExecuteDagWorkflow.mock.calls[0]?.[12];
+      const docsDir = mockExecuteDagWorkflow.mock.calls[0]?.[0].docsDir;
       expect(docsDir).toBe('packages/docs-web/src/content/docs');
     });
   });
@@ -1963,7 +2352,7 @@ describe('executeWorkflow', () => {
       );
 
       expect(mockGetDefaultBranch).not.toHaveBeenCalled();
-      expect(mockExecuteDagWorkflow.mock.calls[0]?.[11]).toBe('develop');
+      expect(mockExecuteDagWorkflow.mock.calls[0]?.[0].baseBranch).toBe('develop');
     });
 
     it('prefers repo config baseBranch over caller-provided baseBranch', async () => {
@@ -1989,7 +2378,7 @@ describe('executeWorkflow', () => {
       );
 
       expect(mockGetDefaultBranch).not.toHaveBeenCalled();
-      expect(mockExecuteDagWorkflow.mock.calls[0]?.[11]).toBe('main');
+      expect(mockExecuteDagWorkflow.mock.calls[0]?.[0].baseBranch).toBe('main');
     });
 
     it('prefers baseOverride over repo config baseBranch', async () => {
@@ -2020,7 +2409,7 @@ describe('executeWorkflow', () => {
       );
 
       expect(mockGetDefaultBranch).not.toHaveBeenCalled();
-      expect(mockExecuteDagWorkflow.mock.calls[0]?.[11]).toBe('epic/foo');
+      expect(mockExecuteDagWorkflow.mock.calls[0]?.[0].baseBranch).toBe('epic/foo');
     });
 
     it('falls back to git auto-detection when config and caller branch are unset', async () => {
@@ -2037,7 +2426,7 @@ describe('executeWorkflow', () => {
       );
 
       expect(mockGetDefaultBranch).toHaveBeenCalledWith('/tmp/worktree');
-      expect(mockExecuteDagWorkflow.mock.calls[0]?.[11]).toBe('main');
+      expect(mockExecuteDagWorkflow.mock.calls[0]?.[0].baseBranch).toBe('main');
     });
 
     it('skips git auto-detection for a folder-kind codebase, no ERROR/WARN spam (#2159)', async () => {
@@ -2067,7 +2456,7 @@ describe('executeWorkflow', () => {
       // benign auto-detect WARN is never emitted and $BASE_BRANCH resolves to
       // empty (unresolved-but-not-referenced).
       expect(mockGetDefaultBranch).not.toHaveBeenCalled();
-      expect(mockExecuteDagWorkflow.mock.calls[0]?.[11]).toBe('');
+      expect(mockExecuteDagWorkflow.mock.calls[0]?.[0].baseBranch).toBe('');
       const warnedAutoDetect = (mockLogFn.mock.calls as unknown[][]).some(
         args => args[1] === 'workflow.base_branch_auto_detect_failed'
       );
@@ -2098,7 +2487,7 @@ describe('executeWorkflow', () => {
       );
 
       expect(mockGetDefaultBranch).toHaveBeenCalledWith('/tmp/worktree');
-      expect(mockExecuteDagWorkflow.mock.calls[0]?.[11]).toBe('main');
+      expect(mockExecuteDagWorkflow.mock.calls[0]?.[0].baseBranch).toBe('main');
     });
   });
 
@@ -2146,11 +2535,7 @@ describe('executeWorkflow', () => {
         'db-conv-1',
         { preCreatedRun: resumed, priorCompletedNodes }
       );
-      // dag-executor receives the priorCompletedNodes map at arg index 15.
-      // dag-executor signature: deps, platform, conversationId, cwd, workflow,
-      // workflowRun, provider, model, artifactsDir, logDir, baseBranch,
-      // docsDir, config, configuredCommandFolder, issueContext, priorCompletedNodes
-      const passedPriors = mockExecuteDagWorkflow.mock.calls[0]?.[16] as
+      const passedPriors = mockExecuteDagWorkflow.mock.calls[0]?.[0].priorCompletedNodes as
         | Map<string, { output: string }>
         | undefined;
       expect(passedPriors).toBe(priorCompletedNodes);
@@ -2237,11 +2622,11 @@ describe('executeWorkflow', () => {
       );
 
       const dagCall = mockExecuteDagWorkflow.mock.calls[0];
-      expect(dagCall?.[16]).toBe(completedNodeOutputs);
+      expect(dagCall?.[0].priorCompletedNodes).toBe(completedNodeOutputs);
       // Both usage axes travel as one `priorUsage` bundle (#2469) — cost is restored
       // across resume exactly like tokens, so a resumed run's total never regresses.
-      expect(dagCall?.[24]).toEqual({ tokens, costUsd });
-      expect(dagCall?.[25]).toEqual(hydrated.priorNodeSessions);
+      expect(dagCall?.[0].priorUsage).toEqual({ tokens, costUsd });
+      expect(dagCall?.[0].priorNodeSessions).toEqual(hydrated.priorNodeSessions);
       expect(store.createWorkflowRun).not.toHaveBeenCalled();
     });
   });
@@ -2322,7 +2707,7 @@ describe('executeWorkflow', () => {
       // unregistered-cwd project (`_cwd/tmp`, #2200); scope = workflow name +
       // conversation UUID ('conv-1' from the createWorkflowRun mock;
       // getScopeArtifactsPath is mocked to `${root}/scopes/${wf}/${scope}`).
-      const scopeArg = mockExecuteDagWorkflow.mock.calls[0]?.[20] as string | undefined;
+      const scopeArg = mockExecuteDagWorkflow.mock.calls[0]?.[0].scopeArtifactsDir;
       expect(scopeArg).toBe(
         wsPath('_cwd', 'tmp', 'artifacts', 'scopes', 'test-workflow', 'conv-1')
       );
@@ -2340,7 +2725,7 @@ describe('executeWorkflow', () => {
         'test message',
         'db-conv-1'
       );
-      const scopeArg = mockExecuteDagWorkflow.mock.calls[0]?.[20] as string | undefined;
+      const scopeArg = mockExecuteDagWorkflow.mock.calls[0]?.[0].scopeArtifactsDir;
       expect(scopeArg).toBeUndefined();
     });
   });
@@ -2405,8 +2790,7 @@ describe('executeWorkflow', () => {
       // DB env vars should have been fetched for the codebaseId
       expect(store.getCodebaseEnvVars).toHaveBeenCalledWith('codebase-1');
 
-      // The config passed to executeDagWorkflow (arg index 12) should have merged envVars
-      const configArg = mockExecuteDagWorkflow.mock.calls[0]?.[13] as WorkflowConfig | undefined;
+      const configArg = mockExecuteDagWorkflow.mock.calls[0]?.[0].config;
       expect(configArg?.envVars).toEqual({ FILE_KEY: 'file_val', DB_KEY: 'db_val' });
     });
 
@@ -2510,7 +2894,7 @@ describe('executeWorkflow', () => {
         'db-c1',
         { codebaseId: 'codebase-1', userId: 'u-1' }
       );
-      const configArg = mockExecuteDagWorkflow.mock.calls[0]?.[13] as WorkflowConfig | undefined;
+      const configArg = mockExecuteDagWorkflow.mock.calls[0]?.[0].config;
       expect(configArg?.envVars).toMatchObject({
         DATABASE_URL: 'db_val',
         BASE_BRANCH: 'reserved-db-secret',
@@ -2560,7 +2944,7 @@ describe('executeWorkflow', () => {
         { codebaseId: 'codebase-1', userId: 'u-1' }
       );
 
-      const configArg = mockExecuteDagWorkflow.mock.calls[0]?.[13] as WorkflowConfig | undefined;
+      const configArg = mockExecuteDagWorkflow.mock.calls[0]?.[0].config;
       expect(configArg?.envVars).toMatchObject({
         GH_TOKEN: 'user-token',
         GITHUB_TOKEN: 'user-token',
@@ -2630,7 +3014,7 @@ describe('executeWorkflow', () => {
           })
         ).resolves.toBeDefined();
 
-        const configArg = mockExecuteDagWorkflow.mock.calls[0]?.[13] as WorkflowConfig | undefined;
+        const configArg = mockExecuteDagWorkflow.mock.calls[0]?.[0].config;
         expect(await readFile(firstFile, 'utf8')).toBe(credentialValue);
         expect(configArg?.envVars).not.toHaveProperty('CODEX_HOME');
         expect(configArg?.protectedCredentialValues).toEqual([credentialValue]);
@@ -2666,7 +3050,7 @@ describe('executeWorkflow', () => {
       );
 
       expect(getUserProviderEnv).toHaveBeenCalledWith('persisted-user', expect.any(String));
-      const configArg = mockExecuteDagWorkflow.mock.calls[0]?.[13] as WorkflowConfig | undefined;
+      const configArg = mockExecuteDagWorkflow.mock.calls[0]?.[0].config;
       expect(configArg?.protectedCredentialValues).toEqual(['persisted-user-token']);
     });
   });
@@ -2879,6 +3263,44 @@ describe('executeWorkflow', () => {
           ] !== undefined
       );
       expect(flagWrite).toBeUndefined();
+    });
+
+    it('mirrors the persisted output_root onto the in-memory run row', async () => {
+      // #2453 — the artifact-pointer gate resolves a run's artifacts through its
+      // `output_root`, and the very first reader is the run that just recorded its own.
+      // A row left NULL in memory would make a run unable to point at its own artifacts
+      // until a resume reloaded it.
+      const created = makeRun({ id: 'run-mirror', output_root: null });
+      const updateSpy = mock(async () => {});
+      const store = makeStore({
+        createWorkflowRun: mock(async () => created),
+        getCodebase: mock(async () => ({
+          id: 'cb-repo',
+          name: 'acme/widget',
+          repository_url: 'https://github.com/acme/widget',
+          default_cwd: '/repos/widget',
+          kind: 'repo' as const,
+        })),
+        updateWorkflowRun: updateSpy,
+      });
+
+      await executeWorkflow(
+        makeDeps(store),
+        makePlatform(),
+        'conv-1',
+        '/repos/widget',
+        makeWorkflow(),
+        'test',
+        'db-conv-1',
+        { codebaseId: 'cb-repo' }
+      );
+
+      const write = updateSpy.mock.calls.find(
+        (call: unknown[]) => typeof (call[1] as { output_root?: unknown })?.output_root === 'string'
+      );
+      const patch = (write as unknown as [unknown, { output_root?: string }] | undefined)?.[1];
+      expect(typeof patch?.output_root).toBe('string');
+      expect(created.output_root).toBe(patch?.output_root ?? null);
     });
 
     // #2304 — the contract is "Cleared by the same persistence block the moment
@@ -3350,7 +3772,7 @@ describe('telemetry wiring', () => {
     expect(mockCaptureWorkflowCompleted).not.toHaveBeenCalled();
   });
 
-  it('threads source through to executeDagWorkflow (arg index 16)', async () => {
+  it('threads source through to executeDagWorkflow', async () => {
     const store = makeStore();
     const deps = makeDeps(store);
 
@@ -3367,7 +3789,7 @@ describe('telemetry wiring', () => {
       }
     );
 
-    expect(mockExecuteDagWorkflow.mock.calls[0]?.[17]).toBe('bundled');
+    expect(mockExecuteDagWorkflow.mock.calls[0]?.[0].source).toBe('bundled');
   });
 
   it('resolves top-level workflow tier refs before calling the DAG executor', async () => {
@@ -3397,16 +3819,16 @@ describe('telemetry wiring', () => {
       'db-conv-1'
     );
 
-    expect(mockExecuteDagWorkflow.mock.calls[0]?.[6]).toBe('codex');
-    expect(mockExecuteDagWorkflow.mock.calls[0]?.[7]).toBe('gpt-5.5');
-    expect(mockExecuteDagWorkflow.mock.calls[0]?.[18]).toEqual(
+    expect(mockExecuteDagWorkflow.mock.calls[0]?.[0].workflowProvider).toBe('codex');
+    expect(mockExecuteDagWorkflow.mock.calls[0]?.[0].workflowModel).toBe('gpt-5.5');
+    expect(mockExecuteDagWorkflow.mock.calls[0]?.[0].aiProfile).toEqual(
       expect.objectContaining({
         aliases: expect.objectContaining({
           large: { provider: 'codex', model: 'gpt-5.5', effort: 'high' },
         }),
       })
     );
-    expect(mockExecuteDagWorkflow.mock.calls[0]?.[19]).toEqual({
+    expect(mockExecuteDagWorkflow.mock.calls[0]?.[0].workflowPreset).toEqual({
       provider: 'codex',
       model: 'gpt-5.5',
       effort: 'high',
@@ -3447,8 +3869,8 @@ describe('telemetry wiring', () => {
 
     expect(getUserAiPrefs).toHaveBeenCalledWith('user-1');
     // User tier wins over the config tier for the same key.
-    expect(mockExecuteDagWorkflow.mock.calls[0]?.[6]).toBe('codex');
-    expect(mockExecuteDagWorkflow.mock.calls[0]?.[7]).toBe('gpt-5.5');
+    expect(mockExecuteDagWorkflow.mock.calls[0]?.[0].workflowProvider).toBe('codex');
+    expect(mockExecuteDagWorkflow.mock.calls[0]?.[0].workflowModel).toBe('gpt-5.5');
   });
 
   it('does not consult per-user AI prefs without a userId (solo unchanged)', async () => {
@@ -3490,7 +3912,7 @@ describe('telemetry wiring', () => {
     );
 
     // Config default is claude → built-in tier defaults resolve 'large'.
-    expect(mockExecuteDagWorkflow.mock.calls[0]?.[6]).toBe('claude');
+    expect(mockExecuteDagWorkflow.mock.calls[0]?.[0].workflowProvider).toBe('claude');
   });
 
   it('structurally invalid stored prefs degrade to config-only (run still starts)', async () => {
@@ -3514,7 +3936,7 @@ describe('telemetry wiring', () => {
       { userId: 'user-1' }
     );
 
-    expect(mockExecuteDagWorkflow.mock.calls[0]?.[6]).toBe('claude');
+    expect(mockExecuteDagWorkflow.mock.calls[0]?.[0].workflowProvider).toBe('claude');
   });
 
   it("per-user default provider rebases tier defaults for the run's profile", async () => {
@@ -3537,7 +3959,7 @@ describe('telemetry wiring', () => {
 
     // No tiers configured anywhere → built-in tier defaults follow the
     // user's default provider, not the install config's.
-    expect(mockExecuteDagWorkflow.mock.calls[0]?.[6]).toBe('codex');
+    expect(mockExecuteDagWorkflow.mock.calls[0]?.[0].workflowProvider).toBe('codex');
   });
 
   it('passes undefined source when the caller does not supply one', async () => {
@@ -3554,7 +3976,7 @@ describe('telemetry wiring', () => {
       'db-conv-1'
     );
 
-    expect(mockExecuteDagWorkflow.mock.calls[0]?.[17]).toBeUndefined();
+    expect(mockExecuteDagWorkflow.mock.calls[0]?.[0].source).toBeUndefined();
   });
 });
 

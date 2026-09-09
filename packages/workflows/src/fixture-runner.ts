@@ -7,10 +7,14 @@
  *
  *   fixture:
  *     expect: completed          # or failed / paused / cancelled
- *     fail-node: gate-ready      # required iff expect: failed
+ *     fail-node: gate-ready      # required iff expect: failed; a list names the
+ *                                # exact failed set (a loop body failure is two
+ *                                # entries: the node and its group)
  *     reached: [review__docs]    # nodes that must complete or be stubbed, under any expect
  *     inputs:                    # caller-supplied declared-input values
  *       branch: "task-123"
+ *     resolved-text-contains:    # fragments that must appear in a reached node's resolved text
+ *       implement: "task-123"
  *   exec-code: false             # execute script/bash nodes instead of stubbing
  *
  * Every remaining key is a node-id → stub-output entry, exactly what
@@ -40,6 +44,7 @@ import {
 import type { WorkflowWithSource } from './schemas/workflow';
 import type { WorkflowConfig } from './deps';
 import type { ResolvedAiProfile } from './model-validation';
+import { resolveTopLevelInputs } from './utils/workflow-requirements';
 import {
   captureWorkflowSource,
   capturedSourceRoots,
@@ -58,9 +63,13 @@ function getLog(): ReturnType<typeof createLogger> {
 export const fixtureDeclarationSchema = z
   .object({
     expect: z.enum(['completed', 'failed', 'paused', 'cancelled']).default('completed'),
-    'fail-node': z.string().optional(),
+    // A single node id, or the exact set of failed entries when one failure
+    // implies another — a node failing inside a loop_group fails the group
+    // too, so that shape is always two entries and was inexpressible before.
+    'fail-node': z.union([z.string(), z.array(z.string()).nonempty()]).optional(),
     reached: z.array(z.string()).optional(),
     inputs: z.record(z.string(), z.string()).optional(),
+    'resolved-text-contains': z.record(z.string(), z.string()).optional(),
   })
   .refine(decl => decl.expect !== 'failed' || decl['fail-node'] !== undefined, {
     message: "fail-node is required when expect is 'failed'",
@@ -239,6 +248,7 @@ export interface FixtureCheckResult {
   readonly workflow: string;
   readonly expect: DryRunResult['outcome'];
   readonly outcome?: DryRunResult['outcome'];
+  readonly authoredOutcome?: DryRunResult['authoredOutcome'];
   readonly pass: boolean;
   readonly failureReason?: string;
   readonly missingStubs: readonly string[];
@@ -338,7 +348,7 @@ async function withCapturedFixtureSource<T>(
     );
   }
   try {
-    return await fn(capturedSourceRoots(capture.captureRoot, capture.manifest.source_config));
+    return await fn(capturedSourceRoots(capture.anchor));
   } finally {
     await rm(captureRoot, { recursive: true, force: true }).catch((error: unknown) => {
       getLog().warn(
@@ -559,13 +569,14 @@ async function checkFixture(
   };
   try {
     const execCode = parsed.execCode;
+    const inputs = resolveTopLevelInputs(ws.workflow, parsed.declaration.inputs);
     const run = (workspace: string): Promise<DryRunResult> =>
       dryRunWorkflow({
         workflow: ws.workflow,
         userMessage: '',
         cwd: options.cwd,
         stubs: parsed.stubs,
-        ...(parsed.declaration.inputs ? { inputs: parsed.declaration.inputs } : {}),
+        ...(inputs ? { inputs } : {}),
         execCode,
         execWorkspace: workspace,
         sourceRoots: captured,
@@ -579,10 +590,13 @@ async function checkFixture(
       failureReason = `expected ${parsed.declaration.expect}, dry-run reported ${result.outcome}`;
     } else if (parsed.declaration.expect === 'failed') {
       const failures = result.trace.filter(entry => entry.state === 'failed');
-      if (failures.length !== 1 || failures[0].nodeId !== parsed.declaration['fail-node']) {
+      const declared = parsed.declaration['fail-node'];
+      const expected = (typeof declared === 'string' ? [declared] : [...(declared ?? [])]).sort();
+      const actual = failures.map(f => f.nodeId).sort();
+      if (expected.length !== actual.length || expected.some((id, i) => id !== actual[i])) {
         failureReason =
-          `expected exactly one failed trace entry on '${parsed.declaration['fail-node']}', got ` +
-          failures.map(f => f.nodeId).join(', ');
+          `expected exactly the failed trace entries [${expected.join(', ')}], got ` +
+          (actual.join(', ') || '(none)');
       }
     }
     // Checked whenever declared, never chained after the outcome branches above: a
@@ -598,6 +612,25 @@ async function checkFixture(
       );
       if (missingReached.length > 0) {
         failureReason = `required nodes did not complete: ${missingReached.join(', ')}`;
+      }
+    }
+    if (failureReason === undefined && parsed.declaration['resolved-text-contains'] !== undefined) {
+      for (const [nodeId, expectedText] of Object.entries(
+        parsed.declaration['resolved-text-contains']
+      )) {
+        const traceEntries = result.trace.filter(
+          entry =>
+            entry.nodeId === nodeId &&
+            (entry.state === 'completed' || entry.state === 'stubbed' || entry.state === 'paused')
+        );
+        if (traceEntries.length === 0) {
+          failureReason = `expected resolved text for node '${nodeId}', but it was not reached`;
+          break;
+        }
+        if (!traceEntries.some(entry => entry.resolvedText?.includes(expectedText) === true)) {
+          failureReason = `expected node '${nodeId}' resolved text to contain ${JSON.stringify(expectedText)}`;
+          break;
+        }
       }
     }
     // A `trigger_rule: all_done` join tolerates its own missing stub (#2869) — it never
@@ -617,6 +650,7 @@ async function checkFixture(
     return {
       ...base,
       outcome: result.outcome,
+      authoredOutcome: result.authoredOutcome,
       pass: failureReason === undefined,
       ...(failureReason !== undefined ? { failureReason } : {}),
       missingStubs: result.missingStubs,
@@ -640,8 +674,11 @@ export function formatFixtureReport(report: FixtureReport): string {
   const lines: string[] = [];
   for (const r of report.results) {
     const mark = r.pass ? '✔' : '✘';
-    const outcome = r.outcome ? ` (${r.outcome})` : '';
-    lines.push(`${mark} ${r.fixture} → ${r.workflow}${outcome}`);
+    lines.push(`${mark} ${r.fixture} → ${r.workflow}`);
+    if (r.outcome !== undefined) {
+      lines.push(`    Simulation outcome: ${r.outcome}`);
+      lines.push(`    Authored outcome: ${r.authoredOutcome ?? 'undeclared'}`);
+    }
     if (r.failureReason) lines.push(`    ${r.failureReason}`);
     if (r.unusedStubs.length > 0) {
       lines.push(`    warning: unused stubs — ${r.unusedStubs.join(', ')}`);

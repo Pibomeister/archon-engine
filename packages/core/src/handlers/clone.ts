@@ -5,8 +5,13 @@
 import { access, rm, stat } from 'fs/promises';
 import { join, basename, resolve } from 'path';
 import * as codebaseDb from '../db/codebases';
-import { sanitizeError } from '../utils/credential-sanitizer';
-import { execFileAsync } from '@archon/git';
+import {
+  cloneRepository as cloneGitRepository,
+  execFileAsync,
+  toRepoPath,
+  validateCloneUrl,
+  type CloneCredentials,
+} from '@archon/git';
 import { findCodebaseForCheckoutPath } from '../services/codebase-checkout-resolver';
 import {
   expandTilde,
@@ -23,6 +28,7 @@ import {
 import { findMarkdownFilesRecursive } from '../utils/commands';
 import { createLogger } from '@archon/paths';
 import { resolveDefaultAssistant } from '../config/resolve-assistant';
+import { resolveGitHubTokenFromEnv } from '../github-auth/config';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -42,33 +48,57 @@ function safeParseUrl(url: string): URL | null {
   }
 }
 
-/** Forge auth config: which env var to check and what auth URL scheme to use. */
+type BuildForgeCredentials = (token: string) => CloneCredentials;
+
+const tokenAsUsername: BuildForgeCredentials = token => ({ username: token, password: '' });
+const tokenAsOAuth2Password: BuildForgeCredentials = token => ({
+  username: 'oauth2',
+  password: token,
+});
+
+/** Forge auth config: how to resolve a token and turn it into clone credentials. */
 interface ForgeAuthEntry {
   hostPattern: string;
-  envVar: string;
-  /** URL user-info prefix (e.g. 'oauth2:' for GitLab, empty for GitHub). */
-  scheme: string;
+  resolveToken: () => string | undefined;
+  buildCredentials: BuildForgeCredentials;
 }
 
-/** Known exact-hostname → env-var + scheme mappings. */
+/** Known exact-hostname → credential source + clone credential mappings. */
 const FORGE_AUTH: ForgeAuthEntry[] = [
-  { hostPattern: 'github.com', envVar: 'GH_TOKEN', scheme: '' },
-  { hostPattern: 'gitlab.com', envVar: 'GITLAB_TOKEN', scheme: 'oauth2:' },
-  { hostPattern: 'gitea.com', envVar: 'GITEA_TOKEN', scheme: '' },
+  {
+    hostPattern: 'github.com',
+    resolveToken: resolveGitHubTokenFromEnv,
+    buildCredentials: tokenAsUsername,
+  },
+  {
+    hostPattern: 'gitlab.com',
+    resolveToken: () => process.env.GITLAB_TOKEN,
+    buildCredentials: tokenAsOAuth2Password,
+  },
+  {
+    hostPattern: 'gitea.com',
+    resolveToken: () => process.env.GITEA_TOKEN,
+    buildCredentials: tokenAsUsername,
+  },
 ];
 
-/**
- * Resolve forge-specific authentication token and URL scheme for a repository URL.
- * Returns the token and auth scheme prefix, or empty values if no token is available.
- */
-/** Well-known self-hosted hostname label patterns → env var + scheme. */
-const SELF_HOSTED_FORGE: { label: string; envVar: string; scheme: string }[] = [
-  { label: 'gitlab', envVar: 'GITLAB_TOKEN', scheme: 'oauth2:' },
-  { label: 'gitea', envVar: 'GITEA_TOKEN', scheme: '' },
-  { label: 'forgejo', envVar: 'GITEA_TOKEN', scheme: '' },
+/** Well-known self-hosted hostname label patterns → env var + clone credentials. */
+const SELF_HOSTED_FORGE: {
+  label: string;
+  envVar: string;
+  buildCredentials: BuildForgeCredentials;
+}[] = [
+  {
+    label: 'gitlab',
+    envVar: 'GITLAB_TOKEN',
+    buildCredentials: tokenAsOAuth2Password,
+  },
+  { label: 'gitea', envVar: 'GITEA_TOKEN', buildCredentials: tokenAsUsername },
+  { label: 'forgejo', envVar: 'GITEA_TOKEN', buildCredentials: tokenAsUsername },
 ];
 
-export function resolveForgeAuth(url: string): { token: string | undefined; scheme: string } {
+/** Resolve forge-specific credentials without adding them to the repository URL. */
+export function resolveForgeAuth(url: string): CloneCredentials | undefined {
   // Extract hostname from URL (or from bare host/path like "github.com/owner/repo")
   let hostname: string;
   const parsed = safeParseUrl(url);
@@ -78,15 +108,13 @@ export function resolveForgeAuth(url: string): { token: string | undefined; sche
     // Bare host/path form: take everything before the first slash
     hostname = url.split('/')[0].toLowerCase();
   }
+  const authority = parsed?.host.toLowerCase() ?? hostname;
 
   // 1. Exact known-host match
   for (const entry of FORGE_AUTH) {
     if (hostname === entry.hostPattern) {
-      const token = process.env[entry.envVar];
-      if (token) {
-        return { token, scheme: entry.scheme };
-      }
-      return { token: undefined, scheme: '' };
+      const token = entry.resolveToken();
+      return token ? entry.buildCredentials(token) : undefined;
     }
   }
 
@@ -96,35 +124,46 @@ export function resolveForgeAuth(url: string): { token: string | undefined; sche
   for (const entry of SELF_HOSTED_FORGE) {
     if (labels.includes(entry.label)) {
       const token = process.env[entry.envVar];
-      if (token) {
-        return { token, scheme: entry.scheme };
-      }
-      return { token: undefined, scheme: '' };
+      return token ? entry.buildCredentials(token) : undefined;
     }
   }
 
-  // 3. Explicit URL match: compare clone hostname against configured *_URL env vars.
+  // 3. Explicit URL match: compare clone authority against configured *_URL env vars.
   //    Handles self-hosted instances where the hostname doesn't contain a forge name
   //    (e.g. git.example.com with GITEA_URL=https://git.example.com).
-  const URL_FORGE: { urlEnvVar: string; tokenEnvVar: string; scheme: string }[] = [
-    { urlEnvVar: 'GITEA_URL', tokenEnvVar: 'GITEA_TOKEN', scheme: '' },
-    { urlEnvVar: 'GITLAB_URL', tokenEnvVar: 'GITLAB_TOKEN', scheme: 'oauth2:' },
-    { urlEnvVar: 'FORGEJO_URL', tokenEnvVar: 'GITEA_TOKEN', scheme: '' },
+  const URL_FORGE: {
+    urlEnvVar: string;
+    tokenEnvVar: string;
+    buildCredentials: BuildForgeCredentials;
+  }[] = [
+    {
+      urlEnvVar: 'GITEA_URL',
+      tokenEnvVar: 'GITEA_TOKEN',
+      buildCredentials: tokenAsUsername,
+    },
+    {
+      urlEnvVar: 'GITLAB_URL',
+      tokenEnvVar: 'GITLAB_TOKEN',
+      buildCredentials: tokenAsOAuth2Password,
+    },
+    {
+      urlEnvVar: 'FORGEJO_URL',
+      tokenEnvVar: 'GITEA_TOKEN',
+      buildCredentials: tokenAsUsername,
+    },
   ];
   for (const entry of URL_FORGE) {
     const forgeUrl = process.env[entry.urlEnvVar];
     if (forgeUrl) {
       const forgeParsed = safeParseUrl(forgeUrl);
-      if (forgeParsed?.hostname.toLowerCase() === hostname) {
+      if (forgeParsed?.host.toLowerCase() === authority) {
         const token = process.env[entry.tokenEnvVar];
-        if (token) {
-          return { token, scheme: entry.scheme };
-        }
+        if (token) return entry.buildCredentials(token);
       }
     }
   }
 
-  return { token: undefined, scheme: '' };
+  return undefined;
 }
 
 export interface RegisterResult {
@@ -274,23 +313,13 @@ async function registerRepoAtPath(
   };
 }
 
-/**
- * Normalize a repo URL: strip trailing slashes and convert SSH to HTTPS.
- */
-function normalizeRepoUrl(rawUrl: string): {
+function deriveRepoCloneTarget(validatedUrl: string): {
   workingUrl: string;
   ownerName: string;
   repoName: string;
   targetPath: string;
 } {
-  const normalizedUrl = rawUrl.replace(/\/+$/, '');
-
-  let workingUrl = normalizedUrl;
-  // Convert SSH URLs (git@host:owner/repo) to HTTPS for any host
-  const sshMatch = /^git@([^:]+):(.+)$/.exec(normalizedUrl);
-  if (sshMatch) {
-    workingUrl = `https://${sshMatch[1]}/${sshMatch[2]}`;
-  }
+  const workingUrl = validatedUrl.replace(/\/+$/, '');
 
   const urlParts = workingUrl.replace(/\.git$/, '').split('/');
   const repoName = urlParts.pop() ?? 'unknown';
@@ -308,13 +337,19 @@ function normalizeRepoUrl(rawUrl: string): {
  * to avoid wrong owner/repo naming. See #383 for broader rethink.
  */
 export async function cloneRepository(repoUrl: string): Promise<RegisterResult> {
+  const validatedUrl = validateCloneUrl(repoUrl);
+  if (!validatedUrl.ok) {
+    throw new Error(`Failed to clone repository: ${validatedUrl.error}`);
+  }
+  repoUrl = validatedUrl.url;
+
   // Local paths should be registered (symlink), not cloned (copied)
   if (repoUrl.startsWith('/') || repoUrl.startsWith('~') || repoUrl.startsWith('.')) {
     const resolvedPath = repoUrl.startsWith('~') ? expandTilde(repoUrl) : resolve(repoUrl);
     return registerRepository(resolvedPath);
   }
 
-  const { workingUrl, ownerName, repoName, targetPath } = normalizeRepoUrl(repoUrl);
+  const { workingUrl, ownerName, repoName, targetPath } = deriveRepoCloneTarget(repoUrl);
 
   // Check if source directory already has a git repo
   let directoryExists = false;
@@ -355,22 +390,8 @@ export async function cloneRepository(repoUrl: string): Promise<RegisterResult> 
   // Create project structure (source/, worktrees/, artifacts/, logs/)
   await ensureProjectStructure(ownerName, repoName);
 
-  getLog().info({ url: workingUrl, targetPath }, 'clone_started');
-
-  // Build clone command with authentication using forge-specific tokens
-  let cloneUrl = workingUrl;
-  const { token: forgeToken, scheme: authScheme } = resolveForgeAuth(workingUrl);
-
-  if (forgeToken) {
-    const parsed = safeParseUrl(workingUrl);
-    if (parsed) {
-      cloneUrl = `https://${authScheme}${forgeToken}@${parsed.hostname}${parsed.pathname}`;
-    } else if (!workingUrl.startsWith('http')) {
-      // Bare host/path form (e.g. github.com/owner/repo)
-      cloneUrl = `https://${authScheme}${forgeToken}@${workingUrl}`;
-    }
-    getLog().debug('clone_authenticated');
-  }
+  // Resolve authentication without putting it into the repository URL.
+  const credentials = resolveForgeAuth(workingUrl);
 
   // Remove the empty source/ directory before cloning (git clone requires non-existent target)
   try {
@@ -382,15 +403,31 @@ export async function cloneRepository(repoUrl: string): Promise<RegisterResult> 
     }
   }
 
-  try {
-    // GIT_TERMINAL_PROMPT=0 turns any missing-creds scenario into an
-    // immediate, readable error instead of a hung stdin credential prompt.
-    await execFileAsync('git', ['clone', cloneUrl, targetPath], {
-      env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
-    });
-  } catch (error) {
-    const safeErr = sanitizeError(error as Error);
-    throw new Error(`Failed to clone repository: ${safeErr.message}`);
+  const cloneResult = await cloneGitRepository(
+    workingUrl,
+    toRepoPath(targetPath),
+    credentials ? { credentials } : undefined
+  );
+  if (!cloneResult.ok) {
+    let detail: string;
+    switch (cloneResult.error.code) {
+      case 'not_a_repo':
+        detail = 'Repository not found or unavailable. Check the URL and repository access.';
+        break;
+      case 'permission_denied':
+        detail = 'Authentication failed. Check the configured forge token and repository access.';
+        break;
+      case 'no_space':
+        detail = 'No space left at the clone destination.';
+        break;
+      case 'unknown':
+        detail = cloneResult.error.message;
+        break;
+      default:
+        detail = 'Git clone failed.';
+        break;
+    }
+    throw new Error(`Failed to clone repository: ${detail}`);
   }
 
   // Add to git safe.directory

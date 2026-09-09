@@ -373,6 +373,8 @@ export interface WorkflowState {
   runId: string;
   workflowName: string;
   status: WorkflowRunStatus;
+  /** Complete dashboard snapshot; absent until the run-list projection has been hydrated. */
+  activeNodeIds?: string[];
   dagNodes: DagNodeState[];
   artifacts: WorkflowArtifact[];
   currentIteration?: number;

@@ -29,7 +29,6 @@ export const PI_CAPABILITIES: ProviderCapabilities = {
   envInjection: true,
   costControl: false,
   effortControl: true,
-  thinkingControl: true,
   fallbackModel: false,
   sandbox: false,
   settingSources: false, // Claude Agent SDK-only knob (which setting sources the agent loads)

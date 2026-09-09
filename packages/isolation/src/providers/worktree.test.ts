@@ -564,11 +564,12 @@ describe('WorktreeProvider', () => {
 
       await provider.create(request);
 
-      // Verify fetch with actual branch name
-      expect(execSpy).toHaveBeenCalledWith(
-        'git',
-        expect.arrayContaining(['-C', '/workspace/repo', 'fetch', 'origin', 'feature/auth']),
-        expect.any(Object)
+      // PR branch fetch is delegated to syncWorkspace with fetch-only mode so
+      // the bounded ref-lock retry lives in @archon/git.
+      expect(syncWorkspaceSpy).toHaveBeenCalledWith(
+        '/workspace/repo',
+        git.toBranchName('feature/auth'),
+        { mode: 'fetch-only', remote: 'origin' }
       );
 
       // Verify worktree add with actual branch
@@ -972,16 +973,164 @@ describe('WorktreeProvider', () => {
         isForkPR: false,
       };
 
-      execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
-        if (args.includes('fetch')) {
-          throw new Error('fatal: unable to access repository');
+      // Base branch sync succeeds; the PR branch fetch (delegated to
+      // syncWorkspace) is what fails. This mirrors the failure surface the
+      // operator sees when the remote becomes unreachable mid-launch.
+      syncWorkspaceSpy.mockImplementation(async (_repo, branch) => {
+        if (branch === git.toBranchName('feature/auth')) {
+          throw new Error(
+            'Sync fetch from origin/feature/auth failed: fatal: unable to access repository'
+          );
         }
-        return { stdout: '', stderr: '' };
+        return {
+          branch: git.toBranchName('main'),
+          synced: true,
+          mode: 'fast-forward',
+          state: 'in_sync',
+          previousHead: '',
+          newHead: '',
+          updated: false,
+        };
       });
 
       await expect(provider.create(request)).rejects.toThrow(
         'Failed to create worktree for PR #42'
       );
+    });
+
+    test('delegates same-repo PR fetch to syncWorkspace so ref-lock race is absorbed', async () => {
+      // Mirrors syncWorkspace's race-recovery contract: the bounded ref-lock
+      // retry lives in syncWorkspace, so createFromSameRepoPR must delegate
+      // the fetch there. Concurrent launches that would collide on the
+      // shared remote-tracking ref now succeed because syncWorkspace retries
+      // internally (its own tests cover the retry mechanics).
+      syncWorkspaceSpy.mockImplementation(async (_repo, branch) => {
+        if (branch === git.toBranchName('feature/auth')) {
+          return {
+            branch: git.toBranchName('feature/auth'),
+            synced: true,
+            mode: 'fetch-only',
+            state: 'in_sync',
+            previousHead: '',
+            newHead: '',
+            updated: false,
+          };
+        }
+        return {
+          branch: git.toBranchName('main'),
+          synced: true,
+          mode: 'fast-forward',
+          state: 'in_sync',
+          previousHead: '',
+          newHead: '',
+          updated: false,
+        };
+      });
+
+      const request: IsolationRequest = {
+        ...baseRequest,
+        workflowType: 'pr',
+        identifier: '42',
+        prBranch: git.toBranchName('feature/auth'),
+        isForkPR: false,
+      };
+
+      await Promise.all([provider.create(request), provider.create(request)]);
+
+      // Both launches succeeded past the fetch race; syncWorkspace absorbed it.
+      expect(syncWorkspaceSpy).toHaveBeenCalledWith(
+        '/workspace/repo',
+        git.toBranchName('feature/auth'),
+        { mode: 'fetch-only', remote: 'origin' }
+      );
+    });
+
+    test('throws when syncWorkspace exhausts its retry budget on persistent same-repo PR fetch lock-race error', async () => {
+      // When syncWorkspace exhausts its ref-lock retry budget it throws;
+      // createFromSameRepoPR must surface that failure as a loud launch error
+      // before any worktree is created.
+      syncWorkspaceSpy.mockImplementation(async (_repo, branch) => {
+        if (branch === git.toBranchName('feature/auth')) {
+          throw new Error(
+            "Sync fetch from origin/feature/auth failed: error: cannot lock ref 'refs/remotes/origin/feature/auth': is at de581e24 but expected 8eaa8d42\n" +
+              '! 8eaa8d420..de581e24b feature/auth -> origin/feature/auth (unable to update local ref)'
+          );
+        }
+        return {
+          branch: git.toBranchName('main'),
+          synced: true,
+          mode: 'fast-forward',
+          state: 'in_sync',
+          previousHead: '',
+          newHead: '',
+          updated: false,
+        };
+      });
+
+      let worktreeAddCalls = 0;
+      execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
+        if (args.includes('worktree') && args.includes('add')) worktreeAddCalls++;
+        return { stdout: '', stderr: '' };
+      });
+
+      const request: IsolationRequest = {
+        ...baseRequest,
+        workflowType: 'pr',
+        identifier: '42',
+        prBranch: git.toBranchName('feature/auth'),
+        isForkPR: false,
+      };
+
+      // Outer wrap (createFromPR) preserves the surrounding prefix and the
+      // inner wrap (createFromSameRepoPR) keeps the contract that
+      // distinguishes fetch failures from worktree-add failures.
+      await expect(provider.create(request)).rejects.toThrow(
+        'Failed to create worktree for PR #42: Fetch origin/feature/auth failed: error: cannot lock ref'
+      );
+
+      expect(syncWorkspaceSpy).toHaveBeenCalledTimes(2);
+      // Failed launch must fail before any estate (worktree) is created.
+      expect(worktreeAddCalls).toBe(0);
+    });
+
+    test('does not retry non-race same-repo PR fetch errors and preserves the inner wrap', async () => {
+      // syncWorkspace surfaces non-race fetch errors immediately without
+      // retrying. createFromSameRepoPR must wrap that error so the surrounding
+      // createFromPR prefix still distinguishes fetch failures from worktree-add
+      // failures.
+      syncWorkspaceSpy.mockImplementation(async (_repo, branch) => {
+        if (branch === git.toBranchName('feature/auth')) {
+          throw new Error(
+            "Sync fetch from origin/feature/auth failed: fatal: 'origin' does not appear to be a git repository"
+          );
+        }
+        return {
+          branch: git.toBranchName('main'),
+          synced: true,
+          mode: 'fast-forward',
+          state: 'in_sync',
+          previousHead: '',
+          newHead: '',
+          updated: false,
+        };
+      });
+
+      const request: IsolationRequest = {
+        ...baseRequest,
+        workflowType: 'pr',
+        identifier: '42',
+        prBranch: git.toBranchName('feature/auth'),
+        isForkPR: false,
+      };
+
+      // Outer wrap + inner wrap together verify that the non-race fetch error
+      // is preserved as `Fetch <remote>/<branch> failed: <original>` inside
+      // the surrounding `createFromPR` prefix.
+      await expect(provider.create(request)).rejects.toThrow(
+        "Failed to create worktree for PR #42: Fetch origin/feature/auth failed: fatal: 'origin' does not appear to be a git repository"
+      );
+
+      expect(syncWorkspaceSpy).toHaveBeenCalledTimes(2);
     });
 
     test('throws error if PR fetch fails (fork PR)', async () => {
@@ -1145,6 +1294,115 @@ describe('WorktreeProvider', () => {
       await expect(provider.create(request)).rejects.toThrow(
         'Failed to create worktree for PR #42'
       );
+    });
+
+    test('absorbs ref-lock race on concurrent fork-PR launches', async () => {
+      // Two concurrent fork-PR launches race on the local branch refspec's
+      // ref lock (refs/heads/pr-42-review). The first attempt per launch fails
+      // with the lock-race error; the bounded retry absorbs it.
+      const request: IsolationRequest = {
+        ...baseRequest,
+        workflowType: 'pr',
+        identifier: '42',
+        prBranch: git.toBranchName('feature/auth'),
+        isForkPR: true,
+      };
+
+      const raceText =
+        "error: cannot lock ref 'refs/heads/pr-42-review': is at de581e24 but expected 8eaa8d42\n" +
+        '! 8eaa8d420..de581e24b pr-42-review -> pr-42-review (unable to update local ref)';
+      const raceError = new Error(raceText) as Error & { stderr?: string };
+      raceError.stderr = raceText;
+      let fetchCalls = 0;
+
+      execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
+        if (args.includes('fetch') && args.some(a => a.includes('pull/42/head:pr-42-review'))) {
+          fetchCalls++;
+          if (fetchCalls <= 2) {
+            throw raceError;
+          }
+        }
+        return { stdout: '', stderr: '' };
+      });
+
+      await Promise.all([provider.create(request), provider.create(request)]);
+
+      expect(fetchCalls).toBeGreaterThan(2);
+      expect(execSpy).toHaveBeenCalledWith(
+        'git',
+        expect.arrayContaining([
+          '-C',
+          '/workspace/repo',
+          'worktree',
+          'add',
+          expect.any(String),
+          'pr-42-review',
+        ]),
+        expect.any(Object)
+      );
+    });
+
+    test('exhausts the bounded budget on persistent fork-PR fetch lock-race and fails before worktree creation', async () => {
+      const request: IsolationRequest = {
+        ...baseRequest,
+        workflowType: 'pr',
+        identifier: '42',
+        prBranch: git.toBranchName('feature/auth'),
+        isForkPR: true,
+      };
+
+      const raceText =
+        "error: cannot lock ref 'refs/heads/pr-42-review': is at de581e24 but expected 8eaa8d42\n" +
+        '! 8eaa8d420..de581e24b pr-42-review -> pr-42-review (unable to update local ref)';
+      const raceError = new Error(raceText) as Error & { stderr?: string };
+      raceError.stderr = raceText;
+      let fetchCalls = 0;
+
+      execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
+        if (args.includes('fetch') && args.some(a => a.includes('pull/42/head:pr-42-review'))) {
+          fetchCalls++;
+          throw raceError;
+        }
+        return { stdout: '', stderr: '' };
+      });
+
+      await expect(provider.create(request)).rejects.toThrow(
+        'Failed to create worktree for PR #42: Fetch origin pull/42/head:pr-42-review failed: error: cannot lock ref'
+      );
+
+      expect(fetchCalls).toBe(4); // 1 initial + 3 retries
+
+      const addCalls = execSpy.mock.calls.filter((call: unknown[]) => {
+        const args = call[1] as string[];
+        return args.includes('add');
+      });
+      expect(addCalls).toHaveLength(0);
+    });
+
+    test('does not retry non-race fork-PR fetch errors', async () => {
+      const request: IsolationRequest = {
+        ...baseRequest,
+        workflowType: 'pr',
+        identifier: '42',
+        prBranch: git.toBranchName('feature/auth'),
+        isForkPR: true,
+      };
+
+      let fetchCalls = 0;
+
+      execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
+        if (args.includes('fetch') && args.some(a => a.includes('pull/42/head:pr-42-review'))) {
+          fetchCalls++;
+          throw new Error("fatal: 'origin' does not appear to be a git repository");
+        }
+        return { stdout: '', stderr: '' };
+      });
+
+      await expect(provider.create(request)).rejects.toThrow(
+        'Failed to create worktree for PR #42'
+      );
+
+      expect(fetchCalls).toBe(1);
     });
 
     test('propagates permission error when workspace sync fails during creation', async () => {
@@ -2012,12 +2270,12 @@ describe('WorktreeProvider', () => {
     test('copies configured files after worktree creation', async () => {
       const configLoader: RepoConfigLoader = async () => ({
         baseBranch: git.toBranchName('main'),
-        copyFiles: ['.env.example -> .env', '.vscode/settings.json'],
+        copyFiles: ['.env', '.vscode/settings.json'],
       });
       provider = new WorktreeProvider(configLoader);
 
       copyWorktreeFilesSpy.mockResolvedValue([
-        { source: '.env.example', destination: '.env' },
+        { source: '.env', destination: '.env' },
         { source: '.vscode/settings.json', destination: '.vscode/settings.json' },
       ]);
 
@@ -2027,7 +2285,7 @@ describe('WorktreeProvider', () => {
       expect(copyWorktreeFilesSpy).toHaveBeenCalledWith(
         '/.archon/workspaces/owner/repo',
         expect.stringContaining('issue-42'),
-        ['.env.example -> .env', '.vscode/settings.json']
+        ['.env', '.vscode/settings.json']
       );
     });
 
@@ -2092,7 +2350,7 @@ describe('WorktreeProvider', () => {
         'gitdir: /.archon/workspaces/owner/repo/.git/worktrees/archon/issue-42\n'
       );
       const configLoader: RepoConfigLoader = async () => ({
-        copyFiles: ['.env.example -> .env'],
+        copyFiles: ['.env'],
       });
       provider = new WorktreeProvider(configLoader);
 
@@ -3458,11 +3716,11 @@ describe('WorktreeProvider', () => {
 
       await customProvider.create(prRequest);
 
-      // Fetch uses the custom remote
-      expect(execSpy).toHaveBeenCalledWith(
-        'git',
-        expect.arrayContaining(['-C', '/workspace/repo', 'fetch', 'upstream', 'feature/auth']),
-        expect.any(Object)
+      // PR fetch is delegated to syncWorkspace with the custom remote.
+      expect(syncWorkspaceSpy).toHaveBeenCalledWith(
+        '/workspace/repo',
+        git.toBranchName('feature/auth'),
+        { mode: 'fetch-only', remote: 'upstream' }
       );
 
       // Branch tracking uses the custom remote

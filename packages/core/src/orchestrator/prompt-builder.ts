@@ -12,6 +12,10 @@ import {
 } from '@archon/workflows/schemas/workflow-run';
 import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
 
+type PromptWorkflow = Pick<WorkflowDefinition, 'name' | 'description'> & {
+  readonly nodes: readonly unknown[];
+};
+
 /**
  * Format a single project for the orchestrator prompt.
  */
@@ -28,7 +32,7 @@ export function formatProjectSection(codebase: Codebase): string {
 /**
  * Format workflow list for the orchestrator prompt.
  */
-export function formatWorkflowSection(workflows: readonly WorkflowDefinition[]): string {
+export function formatWorkflowSection(workflows: readonly PromptWorkflow[]): string {
   if (workflows.length === 0) {
     return 'No workflows available. Users can create workflows in `.archon/workflows/` as YAML files.\n';
   }
@@ -132,6 +136,16 @@ export function formatPausedGateSection(gate: PausedGateContext): string {
       `\`${attention.childRunId}\`, which has a gate of its own. This run has no gate you can resolve — ` +
       'the decision belongs to the child run, and this one continues on its own once the child ' +
       'finishes.'
+    );
+  }
+
+  if (attention.kind === 'action_required') {
+    return (
+      '## Paused action required\n\n' +
+      `Run \`${runId}\` (**${workflowName}**) is paused until someone completes this outside action:\n\n` +
+      `> ${attention.message.replace(/\n/g, '\n> ')}\n\n` +
+      `After the action is complete, run \`archon workflow resume ${runId}\`. Abandon it if it should not continue. ` +
+      'Do not approve or reject this pause.'
     );
   }
 
@@ -286,7 +300,7 @@ IMPORTANT: Always clone into ~/.archon/workspaces/{owner}/{repo}/source unless t
  */
 export function buildOrchestratorPrompt(
   codebases: readonly Codebase[],
-  workflows: readonly WorkflowDefinition[]
+  workflows: readonly PromptWorkflow[]
 ): string {
   let prompt = `# Archon Orchestrator
 
@@ -324,7 +338,7 @@ You can answer questions directly or invoke workflows for structured development
 export function buildProjectScopedPrompt(
   scopedCodebase: Codebase,
   allCodebases: readonly Codebase[],
-  workflows: readonly WorkflowDefinition[]
+  workflows: readonly PromptWorkflow[]
 ): string {
   const otherCodebases = allCodebases.filter(c => c.id !== scopedCodebase.id);
 
@@ -375,11 +389,11 @@ export function buildRunManagementSection(): string {
 
 You can inspect and control this project's workflow runs directly via the \`archon\` CLI (bash) — you do NOT need to invoke a workflow for run management. Add \`--json\` to any command for a single clean, machine-readable line.
 
-Run these from within the project's git repo (any subdirectory works — they resolve to the repo root, which also scopes \`runs\` to this project). They fail with "Not in a git repository" if the working directory is \`~/.archon/workspaces/\` or another non-repo path.
+Run these from within the project's git repo (any subdirectory works — they resolve to the repo root, which also scopes \`runs\` and \`status\` to this project). In an unregistered git checkout, \`workflow status\` falls back to install-wide active runs and reports \`scopeFallback: true\` in JSON. A non-repo path such as \`~/.archon/workspaces/\` still fails with "Not in a git repository".
 
 - \`archon workflow runs [--json]\` — recent runs of ALL statuses for this project
 - \`archon workflow get <run-id> [--json]\` — one run's status/error (add \`--verbose\` for per-node detail)
-- \`archon workflow status [--json]\` — active runs only (running/paused)
+- \`archon workflow status [--json]\` — active runs only (running/paused) for this project; add \`--all\` only for install-wide visibility
 - \`archon workflow run <workflow> "<message>" --detach\` — start a run in the background (returns immediately)
 - \`archon workflow approve <run-id> [comment]\` / \`archon workflow reject <run-id> [reason]\` — resolve a paused approval gate AND continue the run in one step. Pass the user's own words as the comment or reason, never a summary: a workflow may read the comment as the gate node's output, and the reason is what an \`on_reject\` prompt reworks from. Add \`--json\` only when you need a machine-readable ack: \`--json\` records the decision WITHOUT continuing, and you must then drive \`archon workflow resume <run-id>\` yourself or the run stays stranded.
 - \`archon workflow respond <run-id> <decision> [text]\` — same shape as approve/reject, but for a gate that declares decisions beyond the default pair (check the paused run's message for the declared options). \`approve\`/\`reject\` remain the shortcuts above; use \`respond\` only when the gate offers a different vocabulary.
@@ -400,7 +414,7 @@ When the user asks what's running, whether a run passed/failed, or to approve / 
 export function buildOrchestratorSystemAppend(
   conversation: Conversation,
   codebases: readonly Codebase[],
-  workflows: readonly WorkflowDefinition[]
+  workflows: readonly PromptWorkflow[]
 ): string {
   const scopedCodebase = conversation.codebase_id
     ? codebases.find(c => c.id === conversation.codebase_id)

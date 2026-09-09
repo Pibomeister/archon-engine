@@ -40,7 +40,8 @@ Archon provides a unified directory and configuration system with:
 │       │   ├── scopes/<workflow>/<scope>/   # cross-invocation artifacts (persist_session)
 │       │   └── uploads/<conv-id>/  #   Web UI file uploads (ephemeral)
 │       ├── logs/<run-id>.jsonl     # Workflow execution logs
-│       └── state/                  # $STATE_DIR — cross-run state, shared per project
+│       ├── state/                  # $STATE_DIR — cross-run state, shared per project
+│       └── workflow-source/runs/<run-id>/  # The frozen workflow source one run executes
 ├── workflows/  commands/  scripts/ # Home-scoped ("global") definitions
 ├── temp/                           # Ephemeral scratch (per-simulation dry-run dirs; removed when the run ends)
 ├── worktrees/                      # Legacy global worktrees (repos not in workspaces/)

@@ -138,7 +138,9 @@ mkdir -p .archon/workflows/my-pack/my-workflow/{commands,scripts,fixtures}
 Substantive prompts live in command files, not inline. Inline `bash:` only for
 one-or-two-line glue; anything with branching is a script file. Never shell as a
 script language for logic. Ask the user their script-language preference if they
-will maintain it.
+will maintain it. Each script is one self-contained file: declare dependencies
+inline (`deps:` for `uv`), never import a sibling script, and never keep a
+`node_modules` or virtual environment beside it.
 
 ## Node types — one per node
 

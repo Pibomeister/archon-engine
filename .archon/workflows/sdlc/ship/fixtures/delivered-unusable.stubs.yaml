@@ -1,12 +1,14 @@
 # Dry-run fixture: the guard seen RED (run with --default-stubs --exec-code).
 #
-# Delivery runs to completion, but the record it hands back has lost its `url`.
-# The terminal report has nothing left to say, so it says so and fails, instead
-# of printing an empty line under a completed run. Nothing else in the pack reads
-# that field, so the defect surfaces here or nowhere.
+# Delivery hands back a flip value that is not a pull request URL, and the
+# terminal report refuses instead of printing garbage under a completed run.
+# The pr node's record below is deliberately COMPLETE, url included: the report
+# must be built from the flip's read-back value and nothing else, so a perfect
+# record must not rescue an unusable flip. If a future change quietly reads the
+# record again, this fixture goes green-to-red the other way and catches it.
 #
-# This is the shared record read that ship, stabilize, and upkeep all use, so one
-# red fixture covers the refusal for the pack. What differs between the three
+# This is the shared delivered read that ship and upkeep both use, so one red
+# fixture covers the refusal for the pack. What differs between the two
 # tails is which verdict reaches the node, and their delivered fixtures cover that.
 triage__triage:
   route: deliver
@@ -20,8 +22,7 @@ deliver__impl__implement:
   summary: "stub: direct work implemented and green"
 deliver__impl__assert-changed: "2 files changed"
 deliver__gate-green: '{"gate":"green"}'
-# The mutation: every other field survives, and the report still cannot be written.
-deliver__pr__pr: { number: 5, head: "fixture-branch", base: "dev", is_draft: true }
+deliver__pr__pr: { number: 5, url: "https://github.com/example/repo/pull/5", head: "fixture-branch", base: "dev", is_draft: true }
 deliver__classify:
   errors: false
   docs: false
@@ -47,7 +48,9 @@ deliver__validate__validate:
   summary: "stub: project gate green"
 deliver__gate-validated: '{"gate":"green"}'
 ci-probe: '{"state":"concluded","detail":"all checks green"}'
-deliver__flip-ready: "https://github.com/example/repo/pull/5"
+# The mutation: the flip printed something that is not a URL.
+deliver__ci-verdict: '{"state":"concluded","detail":"all checks green"}'
+deliver__flip-ready: "flip printed something that is not a pull request URL"
 deliver__outcome: "https://github.com/example/repo/pull/5"
 fixture:
   expect: failed

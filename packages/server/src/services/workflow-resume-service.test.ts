@@ -1,7 +1,9 @@
 import { beforeEach, describe, expect, mock, test } from 'bun:test';
 import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
 import type { IWorkflowPlatform } from '@archon/workflows/deps';
+import type { WorkflowResumeCursor } from '@archon/workflows/store';
 import type { resolveRunContinuation } from '@archon/core/handlers';
+import { makeTestResolvedWorkflow } from '@archon/workflows/test-utils';
 
 type RunContinuationResult = Awaited<ReturnType<typeof resolveRunContinuation>>;
 
@@ -10,12 +12,16 @@ const mockDeferWorkflowContinuation = mock(async () => undefined);
 const mockResolveRunContinuation = mock(
   async (): Promise<RunContinuationResult> => ({ ok: false, message: 'unused' })
 );
-const mockHydrateResumableRun = mock(async () => null as null | Record<string, unknown>);
-const mockExecuteWorkflow = mock(async () => ({
-  success: true as const,
-  workflowRunId: 'run-1',
-  summary: 'done',
-}));
+const mockHydrateResumableRun = mock<
+  (typeof import('@archon/workflows/executor'))['hydrateResumableRun']
+>(async () => null);
+const mockExecuteWorkflow = mock<(typeof import('@archon/workflows/executor'))['executeWorkflow']>(
+  async () => ({
+    success: true,
+    workflowRunId: 'run-1',
+    summary: 'done',
+  })
+);
 
 mock.module('@archon/core', () => ({
   createChildWorktreeResolver: mock(() => undefined),
@@ -25,7 +31,9 @@ mock.module('@archon/core/handlers', () => ({
   resolveRunContinuation: mockResolveRunContinuation,
 }));
 mock.module('@archon/core/db/codebases', () => ({ getCodebase: mock(async () => null) }));
-const mockFailWorkflowRun = mock(async () => undefined);
+const mockFailWorkflowRun = mock<(typeof import('@archon/core/db/workflows'))['failWorkflowRun']>(
+  async () => undefined
+);
 mock.module('@archon/core/db/workflows', () => ({
   listDueWorkflowContinuations: mockListDueWorkflowContinuations,
   deferWorkflowContinuation: mockDeferWorkflowContinuation,
@@ -76,6 +84,7 @@ function run(
     working_path: '/tmp/worktree',
     user_id: null,
     parent_run_id: null,
+    adopted_from_run_id: null,
     output_root: null,
   };
 }
@@ -109,7 +118,7 @@ describe('workflow continuation scanner', () => {
       mockResolveRunContinuation.mockResolvedValueOnce({
         ok: true,
         workflowName: 'deliver',
-        workflow: { definition: { name: 'deliver', nodes: [] } },
+        workflow: { definition: makeTestResolvedWorkflow({ name: 'deliver' }), args: '' },
       });
       mockHydrateResumableRun.mockResolvedValueOnce({
         preCreatedRun: { ...paused, status: 'running' },
@@ -143,7 +152,7 @@ describe('workflow continuation scanner', () => {
       mockResolveRunContinuation.mockResolvedValueOnce({
         ok: true,
         workflowName: 'deliver',
-        workflow: { definition: { name: 'deliver', nodes: [] } },
+        workflow: { definition: makeTestResolvedWorkflow({ name: 'deliver' }), args: '' },
       });
       mockHydrateResumableRun.mockResolvedValueOnce({
         preCreatedRun: { ...paused, status: 'running' },
@@ -202,7 +211,7 @@ describe('workflow continuation scanner', () => {
       }),
       run('quota-1', 'failed', { scheduled_resume: scheduled }),
     ]);
-    const resume = mock(async (_run: WorkflowRun) => true);
+    const resume = mock(async (_run: WorkflowRun, _cursor: WorkflowResumeCursor) => true);
 
     await expect(
       scanDueWorkflowContinuations(new Date('2026-08-24T11:00:01.000Z'), resume)
@@ -216,6 +225,27 @@ describe('workflow continuation scanner', () => {
       expect.objectContaining({ id: 'quota-1' }),
       { kind: 'quota', attempt: 1, resumeAt: '2026-08-24T11:00:00.000Z' },
     ]);
+  });
+
+  test('does not schedule an action-required wait even if a malformed due query returns it', async () => {
+    mockListDueWorkflowContinuations.mockResolvedValue([
+      run('attention-1', 'paused', {
+        wait: {
+          owner: 'node',
+          nodeId: 'rerun-ci',
+          kind: 'attention',
+          waitingSince: '2026-08-24T10:00:00.000Z',
+          message: 'Re-run CI, then resume.',
+        },
+      }),
+    ]);
+    const resume = mock(async () => true);
+
+    await expect(
+      scanDueWorkflowContinuations(new Date('2026-08-24T11:00:01.000Z'), resume)
+    ).resolves.toBe(0);
+    expect(resume).not.toHaveBeenCalled();
+    expect(mockDeferWorkflowContinuation).not.toHaveBeenCalled();
   });
 
   test('routes background web execution through its worker and results through the parent', () => {
@@ -306,7 +336,7 @@ describe('workflow continuation scanner', () => {
         scheduled_resume: scheduled,
       }),
     ]);
-    const resume = mock(async (_run: WorkflowRun) => true);
+    const resume = mock(async (_run: WorkflowRun, _cursor: WorkflowResumeCursor) => true);
 
     await expect(
       scanDueWorkflowContinuations(new Date('2026-08-24T11:00:01.000Z'), resume)
@@ -324,7 +354,7 @@ describe('workflow continuation scanner', () => {
     mockResolveRunContinuation.mockResolvedValueOnce({
       ok: true,
       workflowName: 'deliver',
-      workflow: { definition: { name: 'deliver', nodes: [] } },
+      workflow: { definition: makeTestResolvedWorkflow({ name: 'deliver' }), args: '' },
     });
     mockHydrateResumableRun.mockResolvedValueOnce({
       preCreatedRun: { ...paused, status: 'running' },
@@ -361,7 +391,7 @@ describe('workflow continuation scanner', () => {
     mockResolveRunContinuation.mockResolvedValueOnce({
       ok: true,
       workflowName: 'deliver',
-      workflow: { definition: { name: 'deliver', nodes: [] } },
+      workflow: { definition: makeTestResolvedWorkflow({ name: 'deliver' }), args: '' },
     });
     mockHydrateResumableRun.mockResolvedValueOnce({
       preCreatedRun: { ...paused, status: 'running' },

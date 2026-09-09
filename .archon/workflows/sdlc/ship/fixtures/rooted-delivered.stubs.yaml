@@ -1,14 +1,15 @@
-# Dry-run fixture: the full chain — rooted investigation flows through the
-# spend gate into the delivery tail, initial review ready, PR flips. SPARSE:
+# Dry-run fixture: a bound target takes the full investigation chain — rooted
+# investigation flows through the spend gate into the delivery tail, initial
+# review ready, PR flips. SPARSE:
 # the dry-run engine auto-defaults every node it can and names the ones it
 # cannot; this file stubs exactly those plus the verdict fields that steer
 # branches. Structured stubs are YAML mappings (they hydrate structuredOutput).
 # Run with --default-stubs --exec-code.
 #
 # `outcome` is deliberately unstubbed: the real script runs and must report pull
-# request 2 from the delivered record alone. The exec workspace is a DETACHED
+# request 2 from the delivered flip value alone. The exec workspace is a DETACHED
 # worktree, so there is no current branch for an ambient pull request lookup to
-# resolve — a pass here is proof the report is built from the record and nothing
+# resolve — a pass here is proof the report is built from the delivered value and nothing
 # the checkout happens to be sitting on.
 triage__triage:
   route: investigate
@@ -25,6 +26,7 @@ deliver__impl__assert-changed: "3 files changed"
 deliver__gate-green: '{"gate":"green"}'
 deliver__pr__pr: { number: 2, url: "https://github.com/example/repo/pull/2", head: "fixture-branch", base: "dev", is_draft: true }
 ci-probe: '{"state":"concluded","detail":"all checks passed"}'
+deliver__ci-verdict: '{"state":"concluded","detail":"all checks green"}'
 deliver__flip-ready: "https://github.com/example/repo/pull/2"
 deliver__outcome: "https://github.com/example/repo/pull/2"
 deliver__validate__validate:
@@ -56,4 +58,8 @@ deliver__classify:
 deliver__resolve-scope: '{"errors":"false"}'
 fixture:
   expect: completed
+  inputs:
+    target: "issue #3031"
+  resolved-text-contains:
+    triage__triage: "target):\n\nissue #3031\n\nThe operator's request"
 exec-code: true

@@ -590,8 +590,8 @@ export type WorkflowExitReason =
   | 'no_nodes_completed'
   | 'node_error'
   | 'unhandled_error'
-  // Evidence gate (#2230): all nodes succeeded but `evidence_policy.required`
-  // found no `$ARTIFACTS_DIR/evidence.json`, so the run was marked failed.
+  // File-presence gate (#2230): all nodes succeeded but `evidence_policy.required`
+  // found no conventional `$ARTIFACTS_DIR/evidence.json` marker, so the run failed.
   | 'evidence_missing';
 
 /**

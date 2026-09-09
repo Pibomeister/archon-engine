@@ -327,7 +327,7 @@ describe(`engine-bound command receipts (${postgresUrl ? 'PostgreSQL' : 'SQLite'
     const gate = (await getRun(run.id)).metadata.approval as SealedGate;
     await writeFile(join(artifacts, 'approval-evidence/review.txt'), 'replacement');
     const seal = (await commands.getGateEvidence(run.id, gate.occurrenceId)) as {
-      evidence: { artifacts: SealedGate };
+      evidence: { artifacts: Record<string, string> };
       evidenceDigest: string;
     };
     expect(gate.occurrenceId).not.toBe('forged');

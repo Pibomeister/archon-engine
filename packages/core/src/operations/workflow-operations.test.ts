@@ -1,28 +1,50 @@
 import { describe, test, expect, mock, beforeEach } from 'bun:test';
 import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
+import type { DashboardWorkflowRun } from '../schemas/workflow-run';
+import type * as WorkflowDb from '../db/workflows';
+import type * as WorkflowEventDb from '../db/workflow-events';
+import type * as WorkflowNodeSessionDb from '../db/workflow-node-sessions';
+import type * as CleanupService from '../services/cleanup-service';
 
 // ---------------------------------------------------------------------------
 // Mock DB modules before importing the module under test
 // ---------------------------------------------------------------------------
 
-const mockGetWorkflowRun = mock(() => Promise.resolve(null));
-const mockListWorkflowRuns = mock(() => Promise.resolve([]));
-const mockUpdateWorkflowRun = mock(() => Promise.resolve());
-const mockCancelWorkflowRun = mock(() => Promise.resolve({ cancelled: true }));
-const mockCancelResumableRunsForConversation = mock(
-  (): Promise<WorkflowRun[]> => Promise.resolve([])
+const mockGetWorkflowRun = mock<typeof WorkflowDb.getWorkflowRun>(() => Promise.resolve(null));
+const EMPTY_COUNTS = {
+  all: 0,
+  running: 0,
+  completed: 0,
+  failed: 0,
+  cancelled: 0,
+  pending: 0,
+  paused: 0,
+};
+const mockListDashboardRuns = mock<typeof WorkflowDb.listDashboardRuns>(() =>
+  Promise.resolve({ runs: [], total: 0, counts: EMPTY_COUNTS })
 );
-const mockFindChildRuns = mock((): Promise<unknown[]> => Promise.resolve([]));
+const mockUpdateWorkflowRun = mock<typeof WorkflowDb.updateWorkflowRun>(() => Promise.resolve());
+const mockCancelWorkflowRun = mock<typeof WorkflowDb.cancelWorkflowRun>(() =>
+  Promise.resolve({ cancelled: true })
+);
+const mockCancelResumableRunsForConversation = mock<
+  typeof WorkflowDb.cancelResumableRunsForConversation
+>(() => Promise.resolve([]));
+const mockFindChildRuns = mock<typeof WorkflowDb.findChildRuns>(() => Promise.resolve([]));
 // CAS gate resolvers (#2113): default to "won the race". Tests that simulate a
 // concurrent loser override with mockResolvedValueOnce({ resolved: false }).
 // resolveApprovalGate = stay-paused resolution (approve, reject stage-rework);
 // resolveAndCancelApprovalGate = atomic resolve + cancel (reject terminal paths).
-const mockResolveApprovalGate = mock(() => Promise.resolve({ resolved: true }));
-const mockResolveAndCancelApprovalGate = mock(() => Promise.resolve({ resolved: true }));
+const mockResolveApprovalGate = mock<typeof WorkflowDb.resolveApprovalGate>(() =>
+  Promise.resolve({ resolved: true })
+);
+const mockResolveAndCancelApprovalGate = mock<typeof WorkflowDb.resolveAndCancelApprovalGate>(() =>
+  Promise.resolve({ resolved: true })
+);
 
 mock.module('../db/workflows', () => ({
   getWorkflowRun: mockGetWorkflowRun,
-  listWorkflowRuns: mockListWorkflowRuns,
+  listDashboardRuns: mockListDashboardRuns,
   updateWorkflowRun: mockUpdateWorkflowRun,
   cancelWorkflowRun: mockCancelWorkflowRun,
   cancelResumableRunsForConversation: mockCancelResumableRunsForConversation,
@@ -31,13 +53,17 @@ mock.module('../db/workflows', () => ({
   resolveAndCancelApprovalGate: mockResolveAndCancelApprovalGate,
 }));
 
-const mockCreateWorkflowEvent = mock(() => Promise.resolve());
+const mockCreateWorkflowEvent = mock<typeof WorkflowEventDb.createWorkflowEvent>(() =>
+  Promise.resolve()
+);
 
 mock.module('../db/workflow-events', () => ({
   createWorkflowEvent: mockCreateWorkflowEvent,
 }));
 
-const mockDeleteWorkflowNodeSessions = mock(() => Promise.resolve({ deleted: 0 }));
+const mockDeleteWorkflowNodeSessions = mock<
+  typeof WorkflowNodeSessionDb.deleteWorkflowNodeSessions
+>(() => Promise.resolve({ deleted: 0 }));
 
 mock.module('../db/workflow-node-sessions', () => ({
   deleteWorkflowNodeSessions: mockDeleteWorkflowNodeSessions,
@@ -45,7 +71,9 @@ mock.module('../db/workflow-node-sessions', () => ({
 
 // abandonWorkflow lazily imports cleanup-service to reclaim a container run's
 // resources (M2). Mock it so the dynamic import doesn't pull the docker chain.
-const mockReclaimContainerEnv = mock(() => Promise.resolve());
+const mockReclaimContainerEnv = mock<typeof CleanupService.reclaimContainerEnv>(() =>
+  Promise.resolve()
+);
 mock.module('../services/cleanup-service', () => ({
   reclaimContainerEnv: mockReclaimContainerEnv,
 }));
@@ -82,7 +110,7 @@ const {
 // Fixtures
 // ---------------------------------------------------------------------------
 
-function makePausedRun(overrides: Record<string, unknown> = {}) {
+function makePausedRun(overrides: Partial<WorkflowRun> = {}): WorkflowRun {
   return {
     id: 'run-1',
     workflow_name: 'test-workflow',
@@ -90,6 +118,7 @@ function makePausedRun(overrides: Record<string, unknown> = {}) {
     parent_conversation_id: null,
     codebase_id: 'cb-1',
     status: 'paused',
+    outcome: null,
     user_message: 'test',
     metadata: {
       approval: {
@@ -102,6 +131,28 @@ function makePausedRun(overrides: Record<string, unknown> = {}) {
     completed_at: null,
     last_activity_at: null,
     working_path: '/workspace/worktree',
+    user_id: null,
+    parent_run_id: null,
+    adopted_from_run_id: null,
+    output_root: null,
+    ...overrides,
+  };
+}
+
+function makeDashboardRun(overrides: Partial<DashboardWorkflowRun> = {}): DashboardWorkflowRun {
+  return {
+    ...makePausedRun(),
+    codebase_name: 'Archon',
+    platform_type: 'cli',
+    worker_platform_id: null,
+    parent_platform_id: null,
+    active_nodes: [],
+    current_step_name: null,
+    total_steps: null,
+    current_step_status: null,
+    agents_completed: null,
+    agents_failed: null,
+    agents_total: null,
     ...overrides,
   };
 }
@@ -190,7 +241,7 @@ describe('approveWorkflow', () => {
 
     await approveWorkflow('run-1', 'Looks good');
 
-    const casEvents = mockResolveApprovalGate.mock.calls[0][2] as Array<Record<string, unknown>>;
+    const casEvents = mockResolveApprovalGate.mock.calls[0]?.[2] ?? [];
     const nodeCompleted = casEvents.find(e => e.event_type === 'node_completed');
     expect(nodeCompleted).toMatchObject({
       data: {
@@ -223,7 +274,7 @@ describe('approveWorkflow', () => {
 
     await approveWorkflow('run-1', 'looks good');
 
-    const casEvents = mockResolveApprovalGate.mock.calls[0][2] as Array<Record<string, unknown>>;
+    const casEvents = mockResolveApprovalGate.mock.calls[0]?.[2] ?? [];
     const nodeCompleted = casEvents.find(e => e.event_type === 'node_completed');
     expect(nodeCompleted).toMatchObject({ step_name: 'grp.check' });
     // The OTHER audit event (approval_received) is untouched — only node_completed,
@@ -248,7 +299,7 @@ describe('approveWorkflow', () => {
 
     await approveWorkflow('run-1', 'Looks good');
 
-    const casEvents = mockResolveApprovalGate.mock.calls[0][2] as Array<Record<string, unknown>>;
+    const casEvents = mockResolveApprovalGate.mock.calls[0]?.[2] ?? [];
     const nodeCompleted = casEvents.find(e => e.event_type === 'node_completed');
     // No captureResponse set → empty output, exactly as before this PR. No
     // structured_output field at all on the legacy path.
@@ -277,7 +328,7 @@ describe('approveWorkflow', () => {
     expect(mockCreateWorkflowEvent).not.toHaveBeenCalled();
     // Only approval_received rides the CAS — NOT node_completed (the executor
     // writes that on the real completion signal / at resume).
-    const casEvents = mockResolveApprovalGate.mock.calls[0][2] as Array<Record<string, unknown>>;
+    const casEvents = mockResolveApprovalGate.mock.calls[0]?.[2] ?? [];
     expect(casEvents).toHaveLength(1);
     expect(casEvents[0].event_type).toBe('approval_received');
 
@@ -433,7 +484,7 @@ describe('approveWorkflow', () => {
     await approveWorkflow('run-1', 'My review notes');
 
     // The node_output rides the CAS events (#2146), not a separate event write.
-    const casEvents = mockResolveApprovalGate.mock.calls[0][2] as Array<Record<string, unknown>>;
+    const casEvents = mockResolveApprovalGate.mock.calls[0]?.[2] ?? [];
     const nodeCompleted = casEvents.find(e => e.event_type === 'node_completed');
     expect((nodeCompleted?.data as Record<string, unknown>).node_output).toBe('My review notes');
     expect((nodeCompleted?.data as Record<string, unknown>).structured_output).toBeUndefined();
@@ -458,7 +509,7 @@ describe('approveWorkflow', () => {
 
     await approveWorkflow('run-1', 'My review notes');
 
-    const casEvents = mockResolveApprovalGate.mock.calls[0][2] as Array<Record<string, unknown>>;
+    const casEvents = mockResolveApprovalGate.mock.calls[0]?.[2] ?? [];
     const nodeCompleted = casEvents.find(e => e.event_type === 'node_completed');
     expect((nodeCompleted?.data as Record<string, unknown>).node_output).toBe(
       JSON.stringify({ decision: 'approve', text: 'My review notes' })
@@ -481,7 +532,7 @@ describe('approveWorkflow', () => {
 
     await approveWorkflow('run-1', 'My review notes');
 
-    const casEvents = mockResolveApprovalGate.mock.calls[0][2] as Array<Record<string, unknown>>;
+    const casEvents = mockResolveApprovalGate.mock.calls[0]?.[2] ?? [];
     const nodeCompleted = casEvents.find(e => e.event_type === 'node_completed');
     expect((nodeCompleted?.data as Record<string, unknown>).node_output).toBe('My review notes');
     expect((nodeCompleted?.data as Record<string, unknown>).structured_output).toBeUndefined();
@@ -539,7 +590,7 @@ describe('approveWorkflow', () => {
       ]
     );
     // No node_completed — there is no DAG node behind the write-back gate.
-    const casEvents = mockResolveApprovalGate.mock.calls[0][2] as Array<Record<string, unknown>>;
+    const casEvents = mockResolveApprovalGate.mock.calls[0]?.[2] ?? [];
     expect(casEvents.every(e => e.event_type !== 'node_completed')).toBe(true);
   });
 
@@ -855,7 +906,7 @@ describe('rejectWorkflow', () => {
 
     await rejectWorkflow('run-1', 'needs changes');
 
-    const casEvents = mockResolveApprovalGate.mock.calls[0][2] as Array<Record<string, unknown>>;
+    const casEvents = mockResolveApprovalGate.mock.calls[0]?.[2] ?? [];
     const nodeCompleted = casEvents.find(e => e.event_type === 'node_completed');
     expect(nodeCompleted).toMatchObject({ step_name: 'grp.check' });
     const approvalReceived = casEvents.find(e => e.event_type === 'approval_received');
@@ -1012,11 +1063,10 @@ describe('respondToWorkflow', () => {
 
     await respondToWorkflow('run-1', 'revise', 'please improve X');
 
-    const [, metadataPayload, events] = mockResolveApprovalGate.mock.calls[0] as [
-      string,
-      Record<string, unknown>,
-      Array<Record<string, unknown>>,
-    ];
+    const call = mockResolveApprovalGate.mock.calls[0];
+    expect(call).toBeDefined();
+    if (!call) throw new Error('Expected resolveApprovalGate to be called');
+    const [, metadataPayload, events] = call;
     expect(metadataPayload).toMatchObject({
       approval: { nodeId: 'grp', bodyGateId: 'check', resolved: 'approved' },
     });
@@ -1173,26 +1223,63 @@ describe('assertApprovable / assertRejectable — shared precondition gate', () 
     );
     expect(assertRejectable(withMeta(waiting))).toBeUndefined();
   });
+
+  test('an action-required wait is neither approvable nor rejectable', () => {
+    const waiting = {
+      wait: {
+        owner: 'node',
+        nodeId: 'rerun-ci',
+        kind: 'attention',
+        waitingSince: '2026-08-28T10:00:00.000Z',
+        message: 'Re-run CI, then resume.',
+      },
+    };
+    for (const assertFn of [assertApprovable, assertRejectable]) {
+      expect(() => assertFn(withMeta(waiting))).toThrow('Complete it, then resume the run');
+      expect(() => assertFn(withMeta(waiting))).toThrow('abandon it');
+    }
+  });
 });
 
 describe('getWorkflowStatus', () => {
   beforeEach(() => {
-    mockListWorkflowRuns.mockClear();
+    mockListDashboardRuns.mockClear();
   });
 
   test('returns running and paused runs', async () => {
     const runs = [
-      makePausedRun({ status: 'running' }),
-      makePausedRun({ id: 'run-2', status: 'paused' }),
+      makeDashboardRun({ status: 'running', active_nodes: ['plan', 'implement'] }),
+      makeDashboardRun({ id: 'run-2', status: 'paused' }),
     ];
-    mockListWorkflowRuns.mockResolvedValueOnce(runs);
+    mockListDashboardRuns.mockResolvedValueOnce({
+      runs,
+      total: 2,
+      counts: { ...EMPTY_COUNTS, all: 2, running: 1, paused: 1 },
+    });
 
     const result = await getWorkflowStatus();
 
     expect(result.runs).toHaveLength(2);
-    expect(mockListWorkflowRuns).toHaveBeenCalledWith({
+    expect(result.runs[0]?.active_nodes).toEqual(['plan', 'implement']);
+    expect(mockListDashboardRuns).toHaveBeenCalledWith({
       status: ['running', 'paused'],
       limit: 50,
+    });
+  });
+
+  test('passes an explicit codebase scope to the active-run query', async () => {
+    mockListDashboardRuns.mockResolvedValueOnce({
+      runs: [],
+      total: 0,
+      counts: EMPTY_COUNTS,
+    });
+
+    await getWorkflowStatus({ codebaseId: 'cb-project-a' });
+
+    expect(mockListDashboardRuns).toHaveBeenCalledWith({
+      status: ['running', 'paused'],
+      limit: 50,
+      codebaseId: 'cb-project-a',
     });
   });
 });
@@ -1257,15 +1344,15 @@ describe('abandonWorkflow', () => {
   test('cascade-cancels non-terminal sub-run descendants', async () => {
     mockGetWorkflowRun.mockResolvedValueOnce(makePausedRun({ status: 'running' }));
     // run-1 → [child-a (paused), child-done (completed)]; child-a → [grandchild (running)].
-    mockFindChildRuns.mockImplementation((parentId: unknown) => {
+    mockFindChildRuns.mockImplementation(parentId => {
       if (parentId === 'run-1') {
         return Promise.resolve([
-          { id: 'child-a', status: 'paused' },
-          { id: 'child-done', status: 'completed' },
+          makePausedRun({ id: 'child-a', status: 'paused' }),
+          makePausedRun({ id: 'child-done', status: 'completed' }),
         ]);
       }
       if (parentId === 'child-a') {
-        return Promise.resolve([{ id: 'grandchild', status: 'running' }]);
+        return Promise.resolve([makePausedRun({ id: 'grandchild', status: 'running' })]);
       }
       return Promise.resolve([]);
     });
@@ -1283,17 +1370,17 @@ describe('abandonWorkflow', () => {
   // walk — siblings still get cancelled, and the failure count is surfaced.
   test('cascade continues past a failing descendant and reports the failure count', async () => {
     mockGetWorkflowRun.mockResolvedValueOnce(makePausedRun({ status: 'running' }));
-    mockFindChildRuns.mockImplementation((parentId: unknown) => {
+    mockFindChildRuns.mockImplementation(parentId => {
       if (parentId === 'run-1') {
         return Promise.resolve([
-          { id: 'child-a', status: 'running' },
-          { id: 'child-b', status: 'paused' },
-          { id: 'child-c', status: 'running' },
+          makePausedRun({ id: 'child-a', status: 'running' }),
+          makePausedRun({ id: 'child-b', status: 'paused' }),
+          makePausedRun({ id: 'child-c', status: 'running' }),
         ]);
       }
       return Promise.resolve([]);
     });
-    mockCancelWorkflowRun.mockImplementation((id: unknown) =>
+    mockCancelWorkflowRun.mockImplementation(id =>
       id === 'child-b' ? Promise.reject(new Error('db blip')) : Promise.resolve({ cancelled: true })
     );
 
@@ -1312,8 +1399,8 @@ describe('abandonWorkflow', () => {
     mockGetWorkflowRun.mockResolvedValueOnce(makePausedRun({ status: 'running' }));
     // Infinite chain: every run has exactly one new, unique, non-terminal child. Only
     // the cap terminates the walk — the test completing at all proves the bound holds.
-    mockFindChildRuns.mockImplementation((parentId: unknown) =>
-      Promise.resolve([{ id: `${String(parentId)}::c`, status: 'running' }])
+    mockFindChildRuns.mockImplementation(parentId =>
+      Promise.resolve([makePausedRun({ id: `${parentId}::c`, status: 'running' })])
     );
 
     const { cascadeFailures } = await abandonWorkflow('run-1');
@@ -1470,7 +1557,7 @@ describe('abandonResumableRunsForConversation', () => {
     mockCancelResumableRunsForConversation.mockResolvedValueOnce([
       makePausedRun({ id: 'run-a' }),
       makePausedRun({ id: 'run-b' }),
-    ] as WorkflowRun[]);
+    ]);
 
     const result = await abandonResumableRunsForConversation('conv-1');
 
@@ -1491,7 +1578,7 @@ describe('abandonResumableRunsForConversation', () => {
         id: 'container-b',
         metadata: { isolation: 'container', isolation_env_id: 'env-b' },
       }),
-    ] as WorkflowRun[]);
+    ]);
 
     await abandonResumableRunsForConversation('conv-1');
 
@@ -1502,7 +1589,7 @@ describe('abandonResumableRunsForConversation', () => {
     mockCancelResumableRunsForConversation.mockResolvedValueOnce([
       makePausedRun({ id: 'run-a', parent_run_id: null }),
       makePausedRun({ id: 'run-c', parent_run_id: 'run-b' }),
-    ] as WorkflowRun[]);
+    ]);
     mockGetWorkflowRun.mockResolvedValueOnce(
       makePausedRun({ id: 'run-b', parent_run_id: 'run-a', status: 'running' })
     );
@@ -1520,7 +1607,7 @@ describe('abandonResumableRunsForConversation', () => {
   test('surfaces a blocked parent outside the selected run tree', async () => {
     mockCancelResumableRunsForConversation.mockResolvedValueOnce([
       makePausedRun({ id: 'child', parent_run_id: 'parent-paused' }),
-    ] as WorkflowRun[]);
+    ]);
     mockGetWorkflowRun.mockImplementation((id: unknown) => {
       if (id === 'parent-paused') {
         // The parent is paused blocked-on-child: a child_workflow approval

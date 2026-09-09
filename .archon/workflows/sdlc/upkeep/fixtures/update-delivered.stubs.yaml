@@ -3,9 +3,9 @@
 # Run with --default-stubs --exec-code.
 #
 # `outcome` is deliberately unstubbed: the real script runs and must report pull
-# request 7 from the delivered record alone. The exec workspace is a DETACHED
+# request 7 from the delivered flip value alone. The exec workspace is a DETACHED
 # worktree, so there is no current branch for an ambient pull request lookup to
-# resolve — a pass here is proof the report is built from the record and nothing
+# resolve — a pass here is proof the report is built from the delivered value and nothing
 # the checkout happens to be sitting on.
 assess:
   action: update
@@ -40,6 +40,7 @@ deliver__impl__record-start: '{"start":"recorded"}'
 deliver__gate-validated: '{"gate":"green"}'
 deliver__impl__assert-changed: "2 files changed"
 deliver__gate-green: '{"gate":"green"}'
+deliver__ci-verdict: '{"state":"concluded","detail":"all checks green"}'
 deliver__flip-ready: "https://github.com/example/repo/pull/7"
 deliver__outcome: "https://github.com/example/repo/pull/7"
 deliver__pr__pr: { number: 7, url: "https://github.com/example/repo/pull/7", head: "fixture-branch", base: "dev", is_draft: true }

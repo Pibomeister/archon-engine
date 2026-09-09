@@ -9,6 +9,14 @@
  * - Utility functions
  */
 
+export {
+  EFFORT_LADDER,
+  clampEffort,
+  isEffortRung,
+  type AssertNever,
+  type EffortRung,
+} from './effort';
+
 // =============================================================================
 // Types
 // =============================================================================
@@ -190,6 +198,7 @@ export {
   isPerUserGitHubEnabled,
   loadDeviceFlowConfig,
   assertEncryptionKeyAtBoot,
+  resolveGitHubTokenFromEnv,
   connectGithubForUser,
   persistGithubConnection,
   startDeviceFlow,

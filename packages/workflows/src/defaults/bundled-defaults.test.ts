@@ -25,6 +25,7 @@ import {
 } from '../packaged-workflow';
 import { parseWorkflow } from '../loader';
 import { dryRunWorkflow } from '../dry-run';
+import { resolveWorkflow } from '../graph-plan';
 import { makeTestWorkflow } from '../test-utils';
 
 // Resolve the on-disk defaults directories relative to this test file so the
@@ -299,6 +300,41 @@ describe('bundled-defaults', () => {
       expect(content).not.toContain('sed -i "s/SPRINT_COUNT_PLACEHOLDER/$SPRINT_COUNT/"');
     });
 
+    it('archon-ship carries its target through triage.md without downstream target prose', () => {
+      const content = BUNDLED_WORKFLOWS['archon-ship'];
+      const parsed = parseWorkflow(content, 'archon-ship.yaml');
+      if (parsed.workflow === null) throw new Error(parsed.error.error);
+
+      expect(parsed.workflow.inputs?.target?.default).toBe('');
+
+      const triage = parsed.workflow.nodes.find(node => node.id === 'triage');
+      expect(triage?.kind).toBe('include');
+      if (triage?.kind !== 'include') throw new Error('triage is not an include');
+      expect(triage.with).toEqual({ target: '$INPUTS.target' });
+
+      const triageCommand = BUNDLED_COMMANDS['__archon_pack__bundled:sdlc:triage::triage'];
+      expect(triageCommand).toContain('Write `$ARTIFACTS_DIR/triage.md`');
+      expect(triageCommand).toContain('**Source and outcome** — what was requested');
+
+      const downstreamBindings = [
+        { id: 'inv', input: 'target' },
+        { id: 'planned', input: 'work' },
+        { id: 'deliver', input: 'work' },
+      ] as const;
+      for (const { id, input } of downstreamBindings) {
+        const node = parsed.workflow.nodes.find(node => node.id === id);
+        expect(node?.kind).toBe('include');
+        if (node?.kind !== 'include') throw new Error(`${id} is not an include`);
+        const binding = node.with?.[input];
+        expect(binding).toBeString();
+        expect(binding).toContain('$ARTIFACTS_DIR/triage.md');
+        expect(binding).not.toContain('$INPUTS.target');
+        expect(binding).not.toContain('Original work item:');
+      }
+
+      expect(content).not.toContain('Original work item:');
+    });
+
     it('archon-deliver preserves the conditional-lens bindings', () => {
       const parsed = parseWorkflow(BUNDLED_WORKFLOWS['archon-deliver'], 'archon-deliver.yaml');
       if (parsed.workflow === null) throw new Error(parsed.error.error);
@@ -368,6 +404,15 @@ describe('bundled-defaults', () => {
         correction_ready: { from: '$corrections.output.ready', if_skipped: false },
         correction_action: { from: '$corrections.output.action', if_skipped: null },
       });
+    });
+
+    it('flip-ready directly depends on every failable gate ancestor', () => {
+      const parsed = parseWorkflow(BUNDLED_WORKFLOWS['archon-deliver'], 'archon-deliver.yaml');
+      if (parsed.workflow === null) throw new Error(parsed.error.error);
+      const flipReady = parsed.workflow.nodes.find(node => node.id === 'flip-ready');
+      expect(flipReady?.depends_on).toContain('gate-validated');
+      expect(flipReady?.depends_on).toContain('gate-ready');
+      expect(flipReady?.depends_on).toContain('validate');
     });
 
     it('archon-review exposes the three-way action contract behind a successful preflight', () => {
@@ -495,6 +540,17 @@ describe('bundled-defaults', () => {
         expect(content.includes('nodes:')).toBe(true);
       }
     });
+
+    it('archon-validate marks the validate node as always_run (#3092)', () => {
+      const parsed = parseWorkflow(BUNDLED_WORKFLOWS['archon-validate'], 'archon-validate.yaml');
+      if (parsed.workflow === null) throw new Error(parsed.error.error);
+
+      const validateNode = parsed.workflow.nodes.find(node => node.id === 'validate');
+      if (validateNode === undefined || !('always_run' in validateNode)) {
+        throw new Error('archon-validate has no executable validate node carrying always_run');
+      }
+      expect(validateNode.always_run).toBe(true);
+    });
   });
 
   describe('fork-safe PR creation (#2226)', () => {
@@ -598,7 +654,7 @@ describe('bundled-defaults', () => {
       });
       // Composition once dropped that binding while materializing the command body
       // and then reported both names as missing caller inputs, so archon-deliver
-      // declared them with empty defaults purely to load inside ship/stabilize/upkeep
+      // declared them with empty defaults purely to load inside ship/upkeep
       // (#2968 item 4). Composition keeps the binding now (#2964), so the decoys are
       // gone — and the empty default that used to be spliced in where the real value
       // belongs cannot come back with them.
@@ -655,11 +711,11 @@ describe('bundled-defaults', () => {
           },
         ],
       }).nodes[0];
-      const workflow = {
+      const workflow = resolveWorkflow({
         ...parsed.workflow,
         name: scenario.name,
         nodes: [producer!, { ...flipReady, depends_on: ['pr'] }],
-      };
+      });
       const directory = mkdtempSync(join(tmpdir(), 'archon-flip-ready-'));
       const bin = join(directory, 'bin');
       const log = join(directory, 'gh.log');
@@ -732,12 +788,14 @@ describe('bundled-defaults', () => {
             '  "remote get-url origin") printf "%s\\n" "git@github.com:owner/repo.git" ;;',
             'esac',
           ],
-          // `gh pr checks` exits 1 and explains itself on stderr when a PR carries
-          // no checks — a repository with no CI, or checks a fork PR never starts.
+          // The node reads the check context count via gh's GraphQL API.
+          // A zero count means the PR carries no checks — a repository with no
+          // CI, or checks a fork PR never starts. No `pr checks` call follows.
           gh: [
             '#!/bin/sh',
             'printf "%s\\n" "$*" >> "$GH_LOG"',
             'case "$*" in',
+            '  "api graphql"*) printf "%s\\n" "0" ;;',
             '  "pr checks"*)',
             '    printf "%s\\n" "no checks reported on the \'recorded-branch\' branch" >&2',
             '    exit 1',
@@ -763,7 +821,7 @@ describe('bundled-defaults', () => {
     );
 
     it.skipIf(process.platform === 'win32')(
-      'refuses a non-green check and names the recovery instead of flipping',
+      'refuses a non-green check instead of flipping',
       async () => {
         const { result, ghLog } = await runFlipReady({
           name: 'red-checks-ready-flip',
@@ -773,15 +831,16 @@ describe('bundled-defaults', () => {
             '  "remote get-url origin") printf "%s\\n" "git@github.com:owner/repo.git" ;;',
             'esac',
           ],
-          // Already jq-filtered, the way the node's own `--jq` leaves it: one failing
-          // check, exit 1 the way gh reports red.
+          // The count read sees checks; the classification returns one
+          // non-green check. Real gh with --json exits 0 on red (the --json
+          // exporter succeeds regardless of check outcome).
           gh: [
             '#!/bin/sh',
             'printf "%s\\n" "$*" >> "$GH_LOG"',
             'case "$*" in',
+            '  "api graphql"*) printf "%s\\n" "1" ;;',
             '  "pr checks"*)',
             '    printf "%s\\n" "test (windows-latest) (fail)"',
-            '    exit 1',
             '    ;;',
             'esac',
           ],
@@ -791,12 +850,6 @@ describe('bundled-defaults', () => {
         const flip = result.trace.find(entry => entry.nodeId === 'flip-ready');
         expect(flip?.state).toBe('failed');
         expect(flip?.reason).toContain('test (windows-latest) (fail)');
-        // A run that dies here is recoverable in seconds, and the operator is the only
-        // one who can start it: a concluded check does not re-run itself, and nothing
-        // in this node waits for one (#2976). So the refusal says so rather than
-        // leaving it as tribal knowledge.
-        expect(flip?.reason).toContain('re-run the failing check');
-        expect(flip?.reason).toContain('resume this run');
         expect(ghLog).not.toContain('pr ready');
       }
     );
@@ -837,6 +890,7 @@ describe('bundled-defaults', () => {
             gh: [
               '#!/bin/sh',
               'case "$*" in',
+              '  "api graphql"*) printf "%s\\n" "0" ;;',
               '  "pr checks"*)',
               '    printf "%s\\n" "no checks reported on the \'recorded-branch\' branch" >&2',
               '    exit 1',

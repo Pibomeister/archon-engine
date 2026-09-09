@@ -109,7 +109,8 @@ function unreadable(
  *    opportunistic, so a dropped re-entry leaves the parent paused — but a waiter
  *    cannot tell "resume in flight" from "resume dropped", and guessing is exactly
  *    what this design refuses to do.
- *  - the child is running, pending, or on a `wait:` timer → null. Normal progress.
+ *  - the child is running, pending, or on a scheduled `wait:` → null. Normal progress.
+ *    An action-required wait is returned as attention by the same projection above.
  */
 async function resolveAttention(run: WorkflowRun): Promise<RunAttention | null> {
   let attention = runAttention(run);

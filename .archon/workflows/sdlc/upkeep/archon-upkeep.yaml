@@ -95,9 +95,9 @@ nodes:
     depends_on: [gate-update]
 
   # One return for every legitimate terminal result: a no_action assessment
-  # completes with its report path; a delivered update is reported from the pull
-  # request record the deliver branch returned (if_skipped binding, so a skipped
-  # branch arrives as null). A passed gate with no delivered output means delivery
+  # completes with its report path; a delivered update is reported from the
+  # flip's verified URL the deliver branch returned (if_skipped binding, so a
+  # skipped flip arrives as null). A passed gate with no delivered output means delivery
   # died mid-flight — outcome must never attribute that to the assessment.
   - id: outcome
     script: outcome

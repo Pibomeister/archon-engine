@@ -26,6 +26,7 @@ import { isValidCommandName } from './command-validation';
 import { levenshtein, findSimilar } from './utils/fuzzy-match';
 import {
   claudeSkillSearchRoots,
+  compileOutputSchema,
   findInstalledSkillNames,
   getProviderCapabilities,
   isRegisteredProvider,
@@ -44,10 +45,13 @@ import {
   isLoopNode,
   isLoopGroupNode,
   isIncludeDirective,
+  isOutputFormatEnforced,
   isWorkflowNode,
 } from './schemas';
-import { parseWorkflow } from './loader';
+import { parseWorkflow, workflowNodeOutputFormatError } from './loader';
+import { LOOP_PREV_OUTPUT_REF_SOURCE, OUTPUT_REF_SOURCE } from './output-ref';
 import { resolveWorkflowName } from './router';
+import { visitNodeTemplateSlots } from './template-walker';
 import type { WorkflowDefinition, DagNode, IncludeDirective, WorkflowSource } from './schemas';
 import type { ScriptRuntime } from './script-discovery';
 import { discoverScriptsForCwd } from './script-discovery';
@@ -379,7 +383,9 @@ function getBundledWorkflowDefs(): WorkflowDefinition[] {
  * Call this AFTER parseWorkflow() has passed (Levels 1-2 are prerequisites).
  */
 export async function validateWorkflowResources(
-  workflow: WorkflowDefinition,
+  workflow: Omit<WorkflowDefinition, 'nodes'> & {
+    readonly nodes: readonly (DagNode | IncludeDirective)[];
+  },
   cwd: string,
   config?: ValidationConfig,
   defaultProvider?: string
@@ -464,6 +470,36 @@ export async function validateWorkflowResources(
     // runs parseWorkflow, not this resource pass). Kept so a future raw caller can't
     // crash here.
     if (isIncludeDirective(node)) continue;
+
+    // --- Declared contract belongs to a producer, and compiles (#2453) ---
+    // parseWorkflow already rejects both an `output_format` on a `workflow:` node and
+    // an uncompilable one on an enforced node, so a file-fed caller never reaches these
+    // branches. They are kept for the callers that hand this pass a definition built in
+    // memory (tests, and any future synthesized or programmatically-assembled
+    // workflow), which would otherwise validate clean and then fail at the node
+    // boundary after the spend. Same predicate as the loader, so the two gates cannot
+    // disagree on an inert schema.
+    const ownershipError = workflowNodeOutputFormatError(node);
+    if (ownershipError !== null) {
+      issues.push({
+        level: 'error',
+        nodeId: node.id,
+        field: 'output_format',
+        message: ownershipError,
+        hint: "Move the schema to the child workflow's returns: node — its declared fields travel back with the result.",
+      });
+    } else if (isOutputFormatEnforced(node) && node.output_format !== undefined) {
+      const compileError = compileOutputSchema(node.output_format);
+      if (compileError !== null) {
+        issues.push({
+          level: 'error',
+          nodeId: node.id,
+          field: 'output_format',
+          message: `Node '${node.id}' declares an output_format that cannot be compiled: ${compileError}`,
+          hint: 'Fix the JSON Schema — a declared contract is enforced against the node output, so it cannot be skipped.',
+        });
+      }
+    }
 
     const provider = resolveValidationProvider(
       node,
@@ -868,41 +904,76 @@ export async function validateWorkflowResources(
     // In bash node bodies (and loop `until_bash`, which substitutes the same way),
     // $node.output values are injected PRE-QUOTED by Archon: small values are
     // single-quoted inline ('the value'), large outputs (>32 KB) spill to a temp
-    // file as $(cat '/path'). Wrapping the substitution in double quotes breaks the
+    // file as $(cat '/path'). Wrapping the substitution in quotes breaks the
     // SMALL case — var="$n.output" becomes var="'value'", embedding the literal
     // single-quote chars as data. (For the large $(cat ...) case double-quoting is
     // actually fine, but the author can't predict the size at write time, so the
-    // rule is unconditional: never double-quote.) Numeric/boolean FIELD values are
-    // injected raw, so double-quoting is harmless for those — which is why the bug
+    // rule is unconditional: never wrap a substitution in quotes.) Numeric/boolean FIELD values are
+    // injected raw, so wrapping is harmless for those — which is why the bug
     // is intermittent and easy to miss.
-    //   wrong="$n.output.field" → wrong="'ok'" (single quotes become part of the value)
+    //   wrong="$n.output.field" → wrong="'ok'" (quote characters become part of the value)
     //   right=$n.output.field   → right='ok' → bash assigns: ok
     //
-    // The `(?:^|[=\s])"` prefix requires the opening `"` to be an operand (line
-    // start, after `=`, or after whitespace) so a *closing* quote of an unrelated
-    // earlier string doesn't cause a false positive (e.g. `echo "hi"; x=$a.output`).
-    // `[^"\n]` excludes newlines — a double-quote spanning lines is pathological.
-    const doubleQuotedOutputRef =
-      /(?:^|[=\s])"[^"\n]*\$(?:[a-zA-Z_][a-zA-Z0-9_-]*\.output|LOOP_PREV\.[a-zA-Z_][a-zA-Z0-9_-]*\.output)/m;
-    const warnDoubleQuoted = (body: string, field: string): void => {
-      if (doubleQuotedOutputRef.test(body)) {
+    // The template walker owns which fields are shell source and where the refs in
+    // them are: `surface: 'shell'` is the same tag dag-executor.ts reads to decide a
+    // slot gets the pre-quoted substitution, so a future shell slot inherits this lint
+    // instead of silently escaping it (#2996). Nothing here re-discovers either fact.
+    //
+    // Given a ref position, the only question left is whether bash sees it inside a
+    // string, and that is decided on the ref's OWN line: replay the quote state from
+    // the line start up to the ref. Two rules, each load-bearing against a real body:
+    //
+    //   Line-local — a quote that is still open at end of line does not reach the
+    //   lines below. `gh pr create --body "$(cat <<'EOF'` leaves a `"` open for the
+    //   rest of the heredoc, and the refs inside it are correctly unquoted.
+    //
+    //   Operand boundary — the opening quote must sit at line start, after `=`, or
+    //   after whitespace. Without it a mid-word apostrophe opens a phantom string
+    //   (`echo don't; x=$a.output`), and so does the *closing* quote of an earlier
+    //   string (`echo "hi"; x=$a.output`). Both are correct code.
+    //
+    // The boundary rule costs one true positive: a quoted ref reached from a
+    // non-operand position, as in `x=prefix"$n.output"` or `<<<"$n.output"`.
+    const opensAtOperandBoundary = (character: string | undefined): boolean =>
+      character === undefined || character === '=' || /\s/.test(character);
+    const isQuotedAt = (body: string, refIndex: number): boolean => {
+      let quote: string | undefined;
+      let openedAtBoundary = false;
+      for (let index = body.lastIndexOf('\n', refIndex - 1) + 1; index < refIndex; index += 1) {
+        const character = body[index];
+        if (quote === undefined) {
+          if (character === '"' || character === "'") {
+            quote = character;
+            openedAtBoundary = opensAtOperandBoundary(body[index - 1]);
+          }
+        } else if (character === quote) {
+          quote = undefined;
+        }
+      }
+      return quote !== undefined && openedAtBoundary;
+    };
+    visitNodeTemplateSlots(
+      node,
+      slot => {
+        if (slot.surface !== 'shell') return;
+        // Built per slot: a `g`-flagged instance carries mutable lastIndex.
+        const refFinder = new RegExp(`${LOOP_PREV_OUTPUT_REF_SOURCE}|${OUTPUT_REF_SOURCE}`, 'g');
+        const quoted = Array.from(slot.value.matchAll(refFinder)).some(match =>
+          isQuotedAt(slot.value, match.index)
+        );
+        if (!quoted) return;
         issues.push({
           level: 'warning',
           nodeId: node.id,
-          field,
+          field: slot.path,
           message:
-            '`"$nodeId.output"` / `"$LOOP_PREV.nodeId.output"` — double-quoting a substitution that is already shell-quoted by Archon produces the wrong value',
-          hint: 'Use `var=$node.output.field` or `var=$LOOP_PREV.node.output.field` (unquoted) — the substitution is injected already quoted. (Numeric/boolean fields are injected raw, so double-quoting is harmless for those, but the rule is uniform.)',
+            '`"$nodeId.output"` / `\'$nodeId.output\'` / `"$LOOP_PREV.nodeId.output"` / `\'$LOOP_PREV.nodeId.output\'` — wrapping a substitution that is already shell-quoted by Archon produces the wrong value',
+          hint: 'Use `var=$node.output.field` or `var=$LOOP_PREV.node.output.field` (unquoted) — the substitution is injected already quoted. (Numeric/boolean fields are injected raw, so wrapping is harmless for those, but the rule is uniform.)',
         });
-      }
-    };
-    if (isExecNode(node) && node.runtime === 'sh') warnDoubleQuoted(node.script, 'bash');
-    if (isLoopNode(node) && node.loop.until_bash) {
-      warnDoubleQuoted(node.loop.until_bash, 'loop.until_bash');
-    }
-    if (isLoopGroupNode(node) && node.loop_group.until_bash) {
-      warnDoubleQuoted(node.loop_group.until_bash, 'loop_group.until_bash');
-    }
+      },
+      // Body nodes of a loop_group are already in `allNodes`; recursing would double-report.
+      { recursive: false }
+    );
   }
 
   return issues;

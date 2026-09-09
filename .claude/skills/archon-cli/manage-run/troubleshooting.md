@@ -175,8 +175,11 @@ archon workflow runs --json | jq '.runs[]'
 # Recent runs of any status (find a failed run's ID)
 archon workflow runs --status failed --limit 10
 
-# All active runs as JSON (running / paused only — finished runs never appear here)
+# Active runs for this project (running / paused only — finished runs never appear here)
 archon workflow status --json | jq '.runs[]'
+
+# Active runs across all projects
+archon workflow status --all --json | jq '.runs[]'
 
 # Human-readable status of any active runs
 archon workflow status

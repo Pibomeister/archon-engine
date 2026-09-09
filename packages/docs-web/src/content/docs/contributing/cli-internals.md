@@ -92,12 +92,12 @@ packages/cli/
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│ archon workflow list [--json]                                    │
+│ archon workflow list [name] [--full] [--json]                    │
 └──────────────────────────────┬───────────────────────────────────┘
                                │
                                ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│ workflow.ts  workflowListCommand(cwd, json?)                     │
+│ workflow.ts  workflowListCommand(cwd, { name, full, json })      │
 └──────────────────────────────┬───────────────────────────────────┘
                                │
                                ▼
@@ -109,12 +109,20 @@ packages/cli/
 │ - Merges (repo overrides defaults by name)                       │
 └──────────────────────────────┬───────────────────────────────────┘
                                │
+                               ▼
+┌──────────────────────────────────────────────────────────────────┐
+│ Optional name resolution; project errors remain in the result    │
+│ full=false: bounded description + structured truncation state    │
+│ full=true: exact authored description                            │
+└──────────────────────────────┬───────────────────────────────────┘
+                               │
                ┌───────────────┴───────────────┐
                │ json=true                     │ json=false
                ▼                               ▼
 ┌──────────────────────────┐   ┌───────────────────────────────────┐
 │ JSON output to stdout    │   │ Human-readable list to stdout     │
-│ { workflows, errors }    │   │ name, description, type, options  │
+│ descriptionTruncated     │   │ shortened descriptions carry     │
+│ { workflows, errors }    │   │ the ` [truncated]` marker         │
 └──────────────────────────┘   └───────────────────────────────────┘
 ```
 

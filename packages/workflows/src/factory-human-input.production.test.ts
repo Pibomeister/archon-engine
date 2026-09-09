@@ -14,6 +14,7 @@ import {
   type AdmissionRequest,
 } from '../../providers/src/factory-admission';
 import { registerBuiltinProviders, getProviderCapabilities } from '@archon/providers';
+import { resolveWorkflow } from './graph-plan';
 
 // Mechanical integration tier: real DAG, real SQLite workflow store and real
 // admission wrapper; only the external model/broker and trusted startup binding
@@ -340,20 +341,24 @@ async function runDag(
     getAgentProvider: () => provider.agent,
     loadConfig: () => Promise.resolve(config),
   };
-  await executeDagWorkflow(
+  await executeDagWorkflow({
     deps,
     platform,
-    fixture.run.conversation_id,
-    fixture.root,
-    { ...workflow, nodes: workflow.nodes as DagNode[] },
-    fixture.run,
-    'codex',
-    'qualified-mechanical-model',
-    join(fixture.root, 'artifacts'),
-    join(fixture.root, 'state'),
-    join(fixture.root, 'logs'),
-    'main',
-    'docs/',
-    config
-  );
+    conversationId: fixture.run.conversation_id,
+    cwd: fixture.root,
+    workflow: resolveWorkflow({
+      ...workflow,
+      description: workflow.description ?? workflow.name,
+      nodes: [...(workflow.nodes as DagNode[])],
+    }),
+    workflowRun: fixture.run,
+    workflowProvider: 'codex',
+    workflowModel: 'qualified-mechanical-model',
+    artifactsDir: join(fixture.root, 'artifacts'),
+    stateDir: join(fixture.root, 'state'),
+    logDir: join(fixture.root, 'logs'),
+    baseBranch: 'main',
+    docsDir: 'docs/',
+    config,
+  });
 }

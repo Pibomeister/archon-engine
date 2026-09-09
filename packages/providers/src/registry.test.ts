@@ -16,6 +16,7 @@ import { registerCopilotProvider } from './community/copilot/registration';
 import { registerOpencodeProvider } from './community/opencode/registration';
 import { UnknownProviderError } from './errors';
 import type { ProviderRegistration, IAgentProvider } from './types';
+import { EFFORT_LADDER } from '@archon/paths/effort';
 
 /** Minimal mock provider for testing registration. */
 function makeMockProvider(id: string): IAgentProvider {
@@ -33,7 +34,6 @@ function makeMockProvider(id: string): IAgentProvider {
       envInjection: false,
       costControl: false,
       effortControl: false,
-      thinkingControl: false,
       fallbackModel: false,
       sandbox: false,
       nativeTools: false,
@@ -245,6 +245,7 @@ describe('registry', () => {
         expect(info).not.toHaveProperty('factory');
         expect(info).not.toHaveProperty('isModelCompatible');
       }
+      expect(infos.find(info => info.id === 'codex')?.effortLevels).toBe(EFFORT_LADDER);
     });
   });
 
@@ -313,11 +314,10 @@ describe('registry', () => {
       expect(piEntries).toHaveLength(1);
     });
 
-    test('declares v2 capabilities (thinking, effort, tools, skills, sessionResume, envInjection, structuredOutput supported)', () => {
+    test('declares v2 capabilities (effort, tools, skills, sessionResume, envInjection, structuredOutput supported)', () => {
       registerPiProvider();
       const caps = getProviderCapabilities('pi');
       // Flipped true in v2
-      expect(caps.thinkingControl).toBe(true);
       expect(caps.effortControl).toBe(true);
       expect(caps.toolRestrictions).toBe(true);
       expect(caps.skills).toBe(true);
@@ -380,7 +380,6 @@ describe('registry', () => {
       expect(caps.agents).toBe(true);
       expect(caps.toolRestrictions).toBe(true);
       expect(caps.effortControl).toBe(false);
-      expect(caps.thinkingControl).toBe(false);
       expect(caps.costControl).toBe(false);
       expect(caps.fallbackModel).toBe(false);
       expect(caps.sandbox).toBe(false);
@@ -425,7 +424,6 @@ describe('registry', () => {
       expect(caps.sessionResume).toBe(true);
       expect(caps.envInjection).toBe(true);
       expect(caps.effortControl).toBe(true);
-      expect(caps.thinkingControl).toBe(true);
       expect(caps.mcp).toBe(true);
       expect(caps.hooks).toBe(false);
       expect(caps.skills).toBe(true);

@@ -51,6 +51,7 @@ import {
   writeFile,
 } from 'fs/promises';
 import { createHash } from 'crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { dirname, join, relative, sep } from 'path';
 import { z } from '@hono/zod-openapi';
 import { createLogger } from '@archon/paths';
@@ -63,7 +64,11 @@ import {
   BUNDLED_WORKFLOW_OWNERS,
   isBinaryBuild,
 } from './defaults/bundled-defaults';
-import { readWorkflowSourceMetadata, readWorkflowSourceState } from './schemas/workflow-run';
+import {
+  readWorkflowSourceState,
+  workflowSourceConfigSchema,
+  type WorkflowSourceConfig,
+} from './schemas/workflow-run';
 import { parsePackagedResourceReference } from './packaged-workflow';
 import type { WorkflowConfig } from './deps';
 
@@ -112,46 +117,42 @@ const CAPTURE_WARN_BYTES = 64 * 1024 * 1024;
  * a project root, the captured form from a capture directory, and nothing downstream has
  * to know which it was handed.
  */
-export interface WorkflowSourceRoots {
+interface WorkflowSourceRootPaths {
   /** Project root (the directory containing `.archon/`), or null with no project context. */
-  project: string | null;
-  globalWorkflows: string;
-  globalCommands: string;
-  globalScripts: string;
-  /**
-   * Whether these roots are a live checkout or a run's frozen capture.
-   *
-   * Load-bearing for one thing: a compiled binary normally reads its bundled workflows
-   * and commands from embedded constants rather than disk, short-circuiting before any
-   * root is consulted. A capture materializes those constants to files, so a captured
-   * run must take the filesystem path instead — this is how each of those branches knows.
-   */
-  kind: 'live' | 'captured';
+  readonly project: string | null;
+  readonly globalWorkflows: string;
+  readonly globalCommands: string;
+  readonly globalScripts: string;
   /** Directory holding packaged bundled workflows (the parent of the defaults folder). */
-  bundledWorkflows: string;
+  readonly bundledWorkflows: string;
   /** Directory holding bundled default commands. */
-  bundledCommands: string;
-  /**
-   * The SOURCE's own settings for what those roots mean.
-   *
-   * Carried here rather than passed beside it, because the two are meaningless apart: a
-   * root without its `command_folder` resolves a different set of files than the source
-   * intended, and the source's `loadDefaultCommands` is what decides whether the bundled
-   * root counts at all. Two values that must always travel together are two values that
-   * eventually do not — and every leaf that received only one would silently resolve
-   * against the target's settings instead.
-   */
-  config: WorkflowSourceConfig;
+  readonly bundledCommands: string;
 }
 
-/** Source-side settings that affect which executable bytes a workflow resolves. */
-export const workflowSourceConfigSchema = z.object({
-  load_default_workflows: z.boolean(),
-  load_default_commands: z.boolean(),
-  command_folder: z.string().optional(),
-});
+export { workflowSourceConfigSchema, type WorkflowSourceConfig } from './schemas/workflow-run';
 
-export type WorkflowSourceConfig = z.infer<typeof workflowSourceConfigSchema>;
+/** Out-of-band identity that every late read from a captured source must recheck. */
+export interface WorkflowSourceAnchor {
+  readonly root: string;
+  readonly digest: string;
+  readonly config: WorkflowSourceConfig;
+}
+
+export interface LiveWorkflowSourceRoots extends WorkflowSourceRootPaths {
+  readonly kind: 'live';
+  readonly config: WorkflowSourceConfig;
+}
+
+export interface CapturedWorkflowSourceRoots extends WorkflowSourceRootPaths {
+  readonly kind: 'captured';
+  readonly anchor: WorkflowSourceAnchor;
+}
+
+export type WorkflowSourceRoots = LiveWorkflowSourceRoots | CapturedWorkflowSourceRoots;
+
+export function workflowSourceConfigForRoots(roots: WorkflowSourceRoots): WorkflowSourceConfig {
+  return roots.kind === 'captured' ? roots.anchor.config : roots.config;
+}
 
 export const DEFAULT_WORKFLOW_SOURCE_CONFIG: WorkflowSourceConfig = {
   load_default_workflows: true,
@@ -178,7 +179,7 @@ export function workflowSourceConfigFrom(config: WorkflowConfig): WorkflowSource
 export function liveSourceRoots(
   project: string | null,
   config: WorkflowSourceConfig = DEFAULT_WORKFLOW_SOURCE_CONFIG
-): WorkflowSourceRoots {
+): LiveWorkflowSourceRoots {
   return {
     project,
     globalWorkflows: archonPaths.getHomeWorkflowsPath(),
@@ -194,23 +195,11 @@ export function liveSourceRoots(
 /**
  * Roots for reading a run's frozen capture.
  *
- * `bundledWorkflows` still points at the live path in a binary build: the bundled set is
- * compiled in rather than stored on disk, so there was nothing to copy and nothing that
- * can change under the run.
+ * Bundled defaults use the same captured paths in every build. A compiled binary
+ * materializes its embedded constants into this tree when the capture is created.
  */
-export function capturedSourceRoots(
-  captureRoot: string,
-  /**
-   * From the capture's MANIFEST, so a resume cannot reinterpret frozen bytes with the
-   * target's settings.
-   *
-   * Required, with no default. A default here is what let the continuation path silently
-   * substitute `DEFAULT_WORKFLOW_SOURCE_CONFIG` after the capture-side fix had landed —
-   * confidently wrong rather than degraded, because a defined-but-default config also
-   * suppresses discovery's live-config fallback. Omitting it is now a compile error.
-   */
-  config: WorkflowSourceConfig
-): WorkflowSourceRoots {
+export function capturedSourceRoots(anchor: WorkflowSourceAnchor): CapturedWorkflowSourceRoots {
+  const captureRoot = anchor.root;
   return {
     project: join(captureRoot, PROJECT_SCOPE_DIR),
     globalWorkflows: join(captureRoot, GLOBAL_SCOPE_DIR, 'workflows'),
@@ -222,7 +211,7 @@ export function capturedSourceRoots(
     bundledWorkflows: join(captureRoot, BUNDLED_SCOPE_DIR, 'workflows'),
     bundledCommands: join(captureRoot, BUNDLED_SCOPE_DIR, 'commands', 'defaults'),
     kind: 'captured',
-    config,
+    anchor,
   };
 }
 
@@ -275,11 +264,11 @@ export class WorkflowSourceIntegrityError extends Error {
 
 /** Where a run's executable source came from, and what was frozen. */
 export interface WorkflowSourceCapture {
-  /** Absolute path to the capture; pass to {@link capturedSourceRoots} to resolve under it. */
-  captureRoot: string;
   /** The authoring directory this was captured from. */
   origin: string;
   manifest: WorkflowSourceManifest;
+  /** Pinned identity retained for every later filesystem-backed read. */
+  anchor: WorkflowSourceAnchor;
 }
 
 /** Project-relative directories that hold executable source. */
@@ -606,7 +595,11 @@ export async function captureWorkflowSource(opts: {
       { sourceRoot, captureRoot, fileCount, byteCount, scopes: manifest.scopes },
       'workflow.source_captured'
     );
-    return { captureRoot, origin: sourceRoot, manifest };
+    return {
+      origin: sourceRoot,
+      manifest,
+      anchor: { root: captureRoot, digest: manifest.digest, config: manifest.source_config },
+    };
   } catch (error) {
     await rm(staging, { recursive: true, force: true }).catch(() => {
       /* best-effort: the partial directory is inert, and the original error matters more */
@@ -674,7 +667,9 @@ export async function loadWorkflowSource(
    * internally consistent capture passes every check. The run row holds the digest
    * out-of-band, and comparing against it is what closes that.
    */
-  expectedDigest?: string
+  expectedDigest?: string,
+  /** The source resolution config the RUN recorded, when new enough to have one. */
+  expectedConfig?: WorkflowSourceConfig
 ): Promise<WorkflowSourceCapture> {
   const manifest = await readManifest(captureRoot);
   if (expectedDigest !== undefined && manifest.digest !== expectedDigest) {
@@ -682,6 +677,18 @@ export async function loadWorkflowSource(
       `Workflow source capture at ${captureRoot} is not the one this run recorded ` +
         `(run expects ${expectedDigest.slice(0, 12)}…, capture claims ` +
         `${manifest.digest.slice(0, 12)}…). The capture has been replaced.`
+    );
+  }
+  if (
+    expectedConfig !== undefined &&
+    !isDeepStrictEqual(
+      definedSourceConfig(manifest.source_config),
+      definedSourceConfig(expectedConfig)
+    )
+  ) {
+    throw new WorkflowSourceIntegrityError(
+      `Workflow source capture at ${captureRoot} has different resolution settings than this ` +
+        'run recorded. The capture manifest has changed.'
     );
   }
   const { digest } = await digestTree(captureRoot);
@@ -693,20 +700,32 @@ export async function loadWorkflowSource(
     );
   }
   if (manifest.engine_version !== BUNDLED_VERSION) {
-    // Recorded, never enforced: a paused run must stay resumable across an upgrade. It is
-    // worth saying out loud, because the bundled scope a binary embeds is the one part of
-    // the source this capture cannot freeze.
+    // Recorded, never enforced: the verified captured bytes remain authoritative across
+    // an upgrade; the version is provenance for diagnostics, not source identity.
     getLog().warn(
       { captureRoot, capturedBy: manifest.engine_version, runningOn: BUNDLED_VERSION },
       'workflow.source_engine_version_changed'
     );
   }
-  return { captureRoot, origin: manifest.origin, manifest };
+  return {
+    origin: manifest.origin,
+    manifest,
+    anchor: {
+      root: captureRoot,
+      digest: expectedDigest ?? manifest.digest,
+      config: expectedConfig ?? manifest.source_config,
+    },
+  };
 }
 
-/** Canonical location of a run's captured source, under that run's artifacts. */
-export function getRunSourceCapturePath(artifactsDir: string): string {
-  return join(artifactsDir, 'workflow-source');
+function definedSourceConfig(config: WorkflowSourceConfig): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(config).filter(([, value]) => value !== undefined));
+}
+
+/** Verify a captured root against its retained anchor immediately before a filesystem read. */
+export async function assertWorkflowSourceIntegrity(roots: WorkflowSourceRoots): Promise<void> {
+  if (roots.kind === 'live') return;
+  await loadWorkflowSource(roots.anchor.root, roots.anchor.digest, roots.anchor.config);
 }
 
 /**
@@ -733,11 +752,27 @@ export async function resolveRunSourceCapture(
     );
   }
   if (state.kind === 'absent') return undefined;
-  return loadWorkflowSource(state.record.root, state.record.digest);
+  const capture = await loadWorkflowSource(
+    state.record.root,
+    state.record.digest,
+    state.record.source_config
+  );
+  if (state.record.source_config === undefined) {
+    getLog().warn(
+      {
+        captureRoot: state.record.root,
+        warning:
+          'This pre-change run did not record source resolution settings outside its capture. ' +
+          'The manifest settings are used for this read; a resume pins them on the run row.',
+      },
+      'workflow.source_config_legacy_manifest_anchor'
+    );
+  }
+  return capture;
 }
 
 /**
- * The AUTHORING directory a run was captured from, if it still exists.
+ * The AUTHORING directory a run was captured from.
  *
  * Deliberately different from {@link resolveRunSourceCapture}, and the difference is the
  * whole contract for sub-runs: a run freezes its own source, but a `workflow:` child that
@@ -750,11 +785,26 @@ export async function resolveRunSourceCapture(
  * parent's frozen copy would re-drive the OLD gated definition forever, so the fix could
  * never take. The child's own run captures at its own start, which is where its
  * determinism begins.
+ *
+ * Returns `undefined` only for a historical parent with no source record. Once a parent
+ * records an authoring directory, an unreadable record or unavailable directory fails
+ * closed so a child cannot silently capture a same-named workflow from the target cwd.
  */
 export async function resolveChildDiscoveryRoot(
   metadata: Record<string, unknown> | undefined
 ): Promise<string | undefined> {
-  const recorded = readWorkflowSourceMetadata(metadata);
-  if (!recorded) return undefined;
-  return (await isDirectory(recorded.origin)) ? recorded.origin : undefined;
+  const state = readWorkflowSourceState(metadata);
+  if (state.kind === 'absent') return undefined;
+  if (state.kind === 'unreadable') {
+    throw new WorkflowSourceIntegrityError(
+      `This run's workflow source record cannot be read by this build: ${state.detail}`
+    );
+  }
+  if (!(await isDirectory(state.record.origin))) {
+    throw new WorkflowSourceIntegrityError(
+      `This run's recorded authoring source is unavailable at ${state.record.origin}. ` +
+        'A child workflow cannot start from a different checkout.'
+    );
+  }
+  return state.record.origin;
 }

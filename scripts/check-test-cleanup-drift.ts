@@ -336,8 +336,6 @@ export function buildLedger(entries: readonly (readonly [string, number])[]): Ma
  * hole it was recording.
  */
 export const LEGACY_RECURSIVE_CLEANUP: ReadonlyMap<string, number> = buildLedger([
-  ['.archon/scripts/__tests__/marketplace-fetch-source.test.ts', 2],
-  ['.archon/scripts/maintainer-standup-persist.test.ts', 1],
   ['packages/cli/src/commands/doctor.test.ts', 2],
   ['packages/cli/src/commands/serve.test.ts', 1],
   ['packages/cli/src/commands/setup.test.ts', 4],
@@ -351,7 +349,6 @@ export const LEGACY_RECURSIVE_CLEANUP: ReadonlyMap<string, number> = buildLedger
   ['packages/core/src/credentials/config.test.ts', 1],
   ['packages/core/src/db/workflow-events.test.ts', 1],
   ['packages/core/src/github-auth/auth.test.ts', 3],
-  ['packages/core/src/github-auth/credential-helper-install.test.ts', 1],
   ['packages/core/src/utils/token-crypto.test.ts', 2],
   ['packages/git/src/git.test.ts', 2],
   ['packages/paths/src/archon-paths.test.ts', 7],
@@ -374,7 +371,7 @@ export const LEGACY_RECURSIVE_CLEANUP: ReadonlyMap<string, number> = buildLedger
   ['packages/server/src/routes/api.workflow-runs.test.ts', 2],
   ['packages/server/src/routes/api.workflows.test.ts', 29],
   ['packages/workflows/src/artifacts-index.test.ts', 1],
-  ['packages/workflows/src/dag-executor.test.ts', 57],
+  ['packages/workflows/src/dag-executor.test.ts', 54],
   ['packages/workflows/src/defaults/generate-bundled-defaults.test.ts', 6],
   ['packages/workflows/src/dry-run.test.ts', 1],
   ['packages/workflows/src/executor-preamble.test.ts', 1],

@@ -6,7 +6,7 @@ request it opened.
 
 Bound inputs (`with:` bindings, canonical text in env):
 - INPUTS_ACTION / INPUTS_SUMMARY: the assessment's verdict.
-- INPUTS_DELIVERED: deliver's returned pull request record as JSON text, or
+- INPUTS_DELIVERED: the flip's verified pull request URL deliver returned, or
   "null" when the deliver branch was skipped (no_action).
 - INPUTS_GATE_PASSED: the spend gate's output, "null" when skipped. A passed
   gate with null delivered means delivery STARTED and died mid-flight — never
@@ -18,42 +18,37 @@ import os
 import sys
 
 
-def delivered_pr_url(delivered: str) -> tuple[str, str]:
-    """The delivered pull request URL, or why the record cannot supply one.
+def delivered_url(delivered: str) -> tuple[str, str]:
+    """The delivered pull request URL, or why the value cannot supply one.
 
-    `archon-deliver` returns its `pr` node, so this text is that node's structured
-    read-back: the run's own record of the pull request it opened. Reading it is
-    the whole job. Asking the forge again would restate what other nodes already
-    established — a record only exists here because deliver completed, which means
-    the ready flip ran, and that flip verifies the draft state by reading it back
-    before it will finish. Worse, a second lookup has to name the pull request
-    somehow, and the only name available this late is whatever branch happens to
-    be checked out: the ambient resolution this record exists to replace.
+    `archon-deliver` returns its `flip-ready` node, so this text is the URL that
+    node printed after flipping the pull request ready and reading its state
+    back. That choice is load-bearing twice. The value is proof of the flip,
+    not of creation: a record written when the pull request was opened exists
+    even when delivery dies afterwards, and reporting it as delivered announces
+    a delivery that never finished. And a composed dependency on `deliver`
+    resolves to its returns node, so a failed flip blocks this node instead of
+    handing it a stale value, while an earlier death leaves the flip skipped
+    and the bound value null - the caller's died-mid-flight branch.
 
-    Do not add an `is_draft` check. The record is written when the pull request is
-    created and delivery creates it as a draft, so the field is true on every
-    successful run; the flip that clears it happens afterwards and never rewrites
-    this record.
+    Asking the forge again would restate what the flip already verified, and a
+    second lookup has to name the pull request somehow; the only name available
+    this late is whatever branch happens to be checked out, the ambient
+    resolution this value exists to replace.
 
-    The record is validated rather than trusted, and every defect is named. This
-    is the last node of a delivery, so a report built from a record nobody could
-    read would announce a delivery while dropping the one thing its reader came
-    for.
+    Validated rather than trusted, with the defect named: this is the last node
+    of a delivery, and a report built from a value nobody could read would
+    announce a delivery while dropping the one thing its reader came for.
 
-    Kept byte-identical across the three tails that compose archon-deliver. A
+    Kept byte-identical across the two tails that compose archon-deliver. A
     packaged script is materialized standalone, so there is no import channel to
     share it through.
     """
-    try:
-        record = json.loads(delivered)
-    except ValueError as err:
-        return "", f"is not valid JSON ({err})"
-    if not isinstance(record, dict):
-        return "", f"is a JSON {type(record).__name__}, not the pull request object"
-    url = record.get("url")
-    stripped = url.strip() if isinstance(url, str) else ""
+    stripped = delivered.strip()
     if not stripped:
-        return "", "carries no 'url' string"
+        return "", "is empty"
+    if "\n" in stripped or not stripped.startswith("http"):
+        return "", "is not a single pull request URL"
     return stripped, ""
 
 
@@ -87,7 +82,7 @@ def format_discoveries(artifacts: str, failed: bool = False) -> str:
     EMPTY consolidated file is review's adjudication rather than a gap, so it stays
     silent, and a completed run's report keeps the same shape on every branch.
 
-    Kept byte-identical across the four SDLC tails. A packaged script is
+    Kept byte-identical across the three SDLC tails. A packaged script is
     materialized standalone, so there is no import channel to share it through.
     """
     disc_file = os.path.join(artifacts, "discoveries.json")
@@ -124,7 +119,7 @@ def format_raw_discoveries(artifacts: str) -> str:
     The contract is one section that exists only when discoveries do, and a failed
     run is not a reason to print an empty one.
 
-    Kept byte-identical across the four SDLC tails.
+    Kept byte-identical across the three SDLC tails.
     """
     disc_dir = os.path.join(artifacts, "discoveries")
     try:
@@ -175,7 +170,7 @@ def format_red_causes(artifacts: str) -> str:
     Presentation, like the discoveries sections: an unreadable record degrades to a
     pointer rather than failing a tail that has already done its irreversible work.
 
-    Kept byte-identical across the four SDLC tails.
+    Kept byte-identical across the three SDLC tails.
     """
     path = os.path.join(artifacts, "red-causes.json")
     if not os.path.isfile(path):
@@ -210,7 +205,7 @@ def format_caveats(artifacts: str, failed: bool = False) -> str:
     Composed in one place so a new branch in main() cannot print a report that
     quietly drops one.
 
-    Kept byte-identical across the four SDLC tails.
+    Kept byte-identical across the three SDLC tails.
     """
     return format_red_causes(artifacts) + format_discoveries(artifacts, failed)
 
@@ -248,10 +243,10 @@ def main() -> int:
         return 1
 
     # Deliver ran, so the record it returned is the report.
-    url, defect = delivered_pr_url(delivered)
+    url, defect = delivered_url(delivered)
     if defect:
         print(
-            f"outcome: delivery completed but its pull request record {defect}. "
+            f"outcome: delivery completed but its delivered value {defect}. "
             "The deliver node's own output is the evidence."
             + format_caveats(artifacts, failed=True),
             file=sys.stderr,

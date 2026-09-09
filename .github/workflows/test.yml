@@ -7,6 +7,9 @@ on:
   pull_request:
     branches: [main, dev]
 
+env:
+  BUN_VERSION: '1.4.0'
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -24,7 +27,7 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.3.11
+          bun-version: ${{ env.BUN_VERSION }}
 
       - name: Decide whether tests are needed
         id: decision
@@ -38,6 +41,26 @@ jobs:
         run: |
           run_tests=$(bun scripts/should-run-test-suite.ts "$EVENT_NAME" "$BASE_SHA" "$HEAD_SHA")
           echo "run-tests=$run_tests" >> "$GITHUB_OUTPUT"
+
+  workflow-fixtures:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Run workflow fixtures
+        run: bun run cli workflow test --json
 
   test:
     needs: changes
@@ -57,7 +80,7 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.3.11
+          bun-version: ${{ env.BUN_VERSION }}
 
       - name: Cache Bun dependencies
         if: runner.os == 'Windows'
@@ -158,7 +181,7 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.3.11
+          bun-version: ${{ env.BUN_VERSION }}
 
       # No `bun install`: the checker shells out to psql and uses only builtins.
       - name: Ensure psql is available
@@ -201,7 +224,7 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.3.11
+          bun-version: ${{ env.BUN_VERSION }}
 
       - name: Install dependencies
         run: bun install --frozen-lockfile

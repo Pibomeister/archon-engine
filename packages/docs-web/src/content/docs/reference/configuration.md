@@ -117,7 +117,7 @@ tiers:
 
 # Model aliases — optional custom refs for project workflows.
 aliases:
-  '@reasoning': { provider: claude, model: opus, thinking: { type: enabled, budgetTokens: 8000 } }
+  '@reasoning': { provider: claude, model: opus, effort: max }
 
 ```
 
@@ -271,6 +271,12 @@ Set in `~/.archon/config.yaml` (global) or `.archon/config.yaml` (repo-specific)
 ### Worktree file copying (`worktree.copyFiles`)
 
 `git worktree add` only copies **tracked** files into a new worktree. Anything gitignored — secrets, local planning docs, agent reports, IDE settings, data fixtures — is absent by default. Archon's `worktree.copyFiles` closes that gap: after the worktree is created, each listed path is copied from the canonical repo into the worktree via raw filesystem copy (not git), so gitignored content comes along for the ride.
+
+**Why this matters for agent runs.** A run does its work inside the worktree, so anything the agent needs at runtime has to be there. `.env` is the common case: without it an agent cannot start the project's server, run an integration test, or reproduce a bug that reads local credentials — and nothing errors, it simply finds no configuration. If you want agents to verify their own work by running the thing they changed, list `.env` here.
+
+Copy the **real** gitignored file, never a tracked template. Listing `.env.example` is wrong twice over: the worktree already has it, because it is tracked; and materialising it as `.env` produces placeholder credentials, so a server starts misconfigured instead of failing loudly.
+
+`worktree.copyFiles` is read from the repo's own `.archon/config.yaml`. It is not a global setting — placing it in `~/.archon/config.yaml` parses without error and has no effect.
 
 **Nothing is copied unless you list it.** Archon used to copy `.archon/` into every worktree automatically, because that was the only way a workflow's own commands and scripts could be found from inside the worktree it was running against. Runs now carry their own source (see below), so the implicit copy is gone.
 

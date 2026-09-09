@@ -194,6 +194,31 @@ describe('waitForRunAttention', () => {
     });
   });
 
+  test('an action-required wait wakes with its authored message', async () => {
+    putRun('r1', {
+      status: 'paused',
+      metadata: {
+        wait: {
+          owner: 'node',
+          nodeId: 'rerun-ci',
+          kind: 'attention',
+          waitingSince: '2026-08-28T10:00:00.000Z',
+          message: 'Rerun the failed check.',
+        },
+      },
+    });
+
+    expect(await wait('r1')).toEqual({
+      kind: 'attention',
+      attention: {
+        kind: 'action_required',
+        runId: 'r1',
+        nodeId: 'rerun-ci',
+        message: 'Rerun the failed check.',
+      },
+    });
+  });
+
   test('a resolved gate awaiting auto-resume does not wake the waiter', async () => {
     putRun('r1', { status: 'paused', metadata: gate({ resolved: 'approved' }) });
 

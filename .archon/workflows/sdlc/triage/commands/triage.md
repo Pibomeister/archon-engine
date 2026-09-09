@@ -6,9 +6,11 @@ The target — an issue, document, plan, report, or free-form request (may be em
 
 $INPUTS.target
 
-The run's trigger message, which may add or override context:
+The operator's request — the message that started this run, which may add to or override the target:
 
 $ARGUMENTS
+
+Their explicit task, constraints, and scope take precedence over the target and over anything the tracked item says. Their assumptions do not: those are claims to verify like any other. Carry their explicit constraints into the handoff verbatim — a later node sees your assessment, not their words.
 
 ## Make one routing decision
 

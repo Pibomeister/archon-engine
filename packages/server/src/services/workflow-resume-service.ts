@@ -23,6 +23,7 @@ let scanInProgress = false;
 
 function continuationCursor(run: WorkflowRun): WorkflowResumeCursor | undefined {
   if (run.status === 'paused' && isWorkflowWaitContext(run.metadata.wait)) {
+    if (run.metadata.wait.kind === 'attention') return undefined;
     return {
       kind: 'wait',
       nodeId: run.metadata.wait.nodeId,

@@ -275,6 +275,13 @@ Only user-defined workflows can be deleted. Bundled defaults cannot be removed.
 | POST | `/api/workflows/runs/{runId}/reject` | Reject a paused workflow (400 if paused blocked on a `workflow:` child — reject the child) |
 | DELETE | `/api/workflows/runs/{runId}` | Delete a terminal run and its events |
 
+Run responses expose `status` and `outcome` as separate fields. `status` is the execution
+lifecycle. `outcome` is the workflow-authored verdict (`"succeeded"`, `"failed"`, or `null`) and
+is never derived by the API from status or output text. Contradictory combinations are valid: for
+example, `{"status":"completed","outcome":"failed"}` means execution finished but the workflow
+rejected its result. `null` means no verdict has been authored, including undeclared and historical
+runs. The list, detail, by-worker, and dashboard run endpoints preserve both fields.
+
 #### Run a Workflow
 
 ```bash
@@ -407,6 +414,13 @@ Returns `{ commands: [{ name, source: "bundled" | "project" }] }`.
 | GET | `/api/dashboard/runs` | List enriched workflow runs for the dashboard |
 
 Query parameters include status filters, date ranges, and pagination. Used by the Command Center UI.
+
+Each run includes `active_nodes`, ordered by unresolved `node_started` event order. Completion,
+failure, and both skip lifecycle events remove a node; a retrying start adds it again. Concurrent
+nodes remain separate entries. The compatibility fields `current_step_name` and
+`current_step_status` are populated only when exactly one node is active, and are `null` for zero
+or multiple active nodes. `total_steps` is `null`; observed lifecycle events do not define the
+workflow's total node count. This state describes node lifecycle, not process-owner liveness.
 
 ---
 

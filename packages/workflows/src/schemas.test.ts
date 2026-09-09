@@ -13,11 +13,15 @@ import {
   LOOP_NODE_AI_FIELDS,
   LOOP_GROUP_NODE_AI_FIELDS,
   INCLUDE_NODE_IGNORED_FIELDS,
+  GATE_AND_HALT_IGNORED_FIELDS,
+  KNOWN_DAG_NODE_KEYS,
   WAIT_NODE_IGNORED_FIELDS,
   WORKFLOW_NODE_IGNORED_FIELDS,
   BASH_NODE_AI_FIELDS,
   approvalOnRejectSchema,
+  dagNodeFlatSchema,
   dagNodeSchema,
+  execNodeSchema,
   MAX_DURABLE_WAIT_MS,
   waitConfigSchema,
   inputEnvKey,
@@ -87,6 +91,31 @@ describe('persisted workflow continuation schemas', () => {
       resumeAt: '2026-08-25T10:00:00.000Z',
     });
     expect(workflowWaitStepName(loopEvent)).toBe('release.checks');
+
+    const attention = workflowWaitContextSchema.parse({
+      owner: 'node',
+      nodeId: 'recover-ci',
+      kind: 'attention',
+      waitingSince: '2026-08-24T10:00:00.000Z',
+      message: 'Rerun CI, then resume.',
+    });
+    expect(workflowWaitStepName(attention)).toBe('recover-ci');
+    expect(
+      workflowWaitContextSchema.safeParse({ ...attention, resumeAt: timeWait.resumeAt }).success
+    ).toBe(false);
+
+    const loopAttention = workflowWaitContextSchema.parse({
+      owner: 'loop_group',
+      nodeId: 'recover',
+      bodyWaitId: 'operator',
+      iteration: 2,
+      sessionId: null,
+      sessionProvider: null,
+      kind: 'attention',
+      waitingSince: '2026-08-24T10:00:00.000Z',
+      message: 'Fix the external failure, then resume.',
+    });
+    expect(workflowWaitStepName(loopAttention)).toBe('recover.operator');
   });
 
   test('rejects quota continuations beyond their attempt or time budget', () => {
@@ -111,7 +140,7 @@ describe('persisted workflow continuation schemas', () => {
 });
 
 describe('dagNodeSchema — durable wait', () => {
-  test('normalizes duration, until, and bounded event waits', () => {
+  test('normalizes duration, until, bounded event, and attention waits', () => {
     const duration = dagNodeSchema.parse({ id: 'later', wait: { duration_ms: 5000 } });
     const until = dagNodeSchema.parse({
       id: 'clock',
@@ -121,10 +150,18 @@ describe('dagNodeSchema — durable wait', () => {
       id: 'ci',
       wait: { event: 'checks.complete', deadline_ms: 60_000 },
     });
+    const attention = dagNodeSchema.parse({
+      id: 'recover',
+      wait: { attention: '  Rerun CI, then resume.  ' },
+    });
     expect(isWaitNode(duration as DagNode)).toBe(true);
     expect((until as DagNode).kind).toBe('wait');
     expect((event as DagNode).kind).toBe('wait');
     expect((event as DagNode).output_format?.required).toEqual(['status', 'waited_ms']);
+    expect((attention as DagNode).kind).toBe('wait');
+    expect((attention as DagNode & { wait: { attention: string } }).wait.attention).toBe(
+      'Rerun CI, then resume.'
+    );
   });
 
   test('rejects ambiguous and unbounded waits', () => {
@@ -140,6 +177,15 @@ describe('dagNodeSchema — durable wait', () => {
     ).toBe(false);
     expect(
       dagNodeSchema.safeParse({ id: 'blank-event', wait: { event: '   ', deadline_ms: 1 } }).success
+    ).toBe(false);
+    expect(
+      dagNodeSchema.safeParse({ id: 'blank-attention', wait: { attention: '   ' } }).success
+    ).toBe(false);
+    expect(
+      dagNodeSchema.safeParse({
+        id: 'mixed-attention',
+        wait: { attention: 'Resume me', duration_ms: 1 },
+      }).success
     ).toBe(false);
     expect(
       dagNodeSchema.safeParse({ id: 'duration', wait: { duration_ms: 1, deadline_ms: 2 } }).success
@@ -590,35 +636,13 @@ describe('dagNodeSchema — new Claude SDK options', () => {
     expect(result.success).toBe(false);
   });
 
-  test('parses thinking string shorthand: adaptive', () => {
+  test('rejects retired thinking config and names effort', () => {
     const result = dagNodeSchema.safeParse({ id: 'n', prompt: 'do it', thinking: 'adaptive' });
-    expect(result.success).toBe(true);
-    if (result.success) expect((result.data as AgentNode).thinking).toEqual({ type: 'adaptive' });
-  });
-
-  test('parses thinking string shorthand: disabled', () => {
-    const result = dagNodeSchema.safeParse({ id: 'n', prompt: 'do it', thinking: 'disabled' });
-    expect(result.success).toBe(true);
-    if (result.success) expect((result.data as AgentNode).thinking).toEqual({ type: 'disabled' });
-  });
-
-  test('parses thinking object form with budgetTokens', () => {
-    const result = dagNodeSchema.safeParse({
-      id: 'n',
-      prompt: 'do it',
-      thinking: { type: 'enabled', budgetTokens: 8000 },
-    });
-    expect(result.success).toBe(true);
-    if (result.success)
-      expect((result.data as AgentNode).thinking).toEqual({
-        type: 'enabled',
-        budgetTokens: 8000,
-      });
-  });
-
-  test('rejects invalid thinking value', () => {
-    const result = dagNodeSchema.safeParse({ id: 'n', prompt: 'do it', thinking: 'quantum' });
     expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0]?.path).toEqual(['thinking']);
+      expect(result.error.issues[0]?.message).toContain('effort:');
+    }
   });
 
   test('parses maxBudgetUsd as positive number', () => {
@@ -734,13 +758,11 @@ describe('dagNodeSchema — new Claude SDK options', () => {
       id: 'b',
       bash: 'echo hi',
       effort: 'high',
-      thinking: 'adaptive',
     });
     expect(result.success).toBe(true);
     if (result.success) {
       // bash nodes don't get AI-only fields in the transform
       expect('effort' in result.data).toBe(false);
-      expect('thinking' in result.data).toBe(false);
     }
   });
 });
@@ -818,6 +840,32 @@ describe('dagNodeSchema — per-node Pi posture (pi:)', () => {
 // ---------------------------------------------------------------------------
 
 describe('dagNodeSchema — ExecNode', () => {
+  test('derives authored exec fields from the resolved ExecNode owner', () => {
+    expect(dagNodeFlatSchema.shape.deps.unwrap()).toBe(execNodeSchema.shape.deps);
+    expect(KNOWN_DAG_NODE_KEYS).toEqual(new Set(Object.keys(dagNodeFlatSchema.shape)));
+
+    const authoredRuntime = dagNodeFlatSchema.shape.runtime.unwrap();
+    expect(authoredRuntime.options).toEqual(
+      execNodeSchema.shape.runtime.options.filter(runtime => runtime !== 'sh')
+    );
+
+    const raw = { id: 's', script: '   ', runtime: 'bun' };
+    const flat = dagNodeFlatSchema.safeParse(raw);
+    const authored = dagNodeSchema.safeParse(raw);
+    const resolved = execNodeSchema.safeParse({
+      id: 's',
+      kind: 'exec',
+      script: '   ',
+      runtime: 'bun',
+    });
+    expect(flat.success).toBe(true);
+    expect(authored.success).toBe(false);
+    expect(resolved.success).toBe(false);
+    if (!authored.success && !resolved.success) {
+      expect(authored.error.issues[0]?.message).toBe(resolved.error.issues[0]?.message);
+    }
+  });
+
   test('parses a bun script node with inline script', () => {
     const result = dagNodeSchema.safeParse({
       id: 'fetch',
@@ -906,6 +954,191 @@ describe('dagNodeSchema — ExecNode', () => {
     expect(result.success).toBe(false);
   });
 
+  test("keeps the internal 'sh' runtime behind the authored bash projection", () => {
+    const authoredScript = dagNodeSchema.safeParse({
+      id: 's',
+      script: 'echo hi',
+      runtime: 'sh',
+    });
+    expect(authoredScript.success).toBe(false);
+
+    const authoredBash = dagNodeSchema.safeParse({ id: 's', bash: 'echo hi' });
+    expect(authoredBash.success).toBe(true);
+    if (authoredBash.success) {
+      expect(authoredBash.data).toMatchObject({
+        kind: 'exec',
+        script: 'echo hi',
+        runtime: 'sh',
+      });
+    }
+  });
+
+  test('ignores deferred exec fields on every mode that does not select them', () => {
+    const cases: readonly {
+      name: string;
+      node: Record<string, unknown>;
+      ignored: Record<string, unknown>;
+    }[] = [
+      {
+        name: 'command',
+        node: { id: 'command', command: 'review' },
+        ignored: { bash: '   ', script: '   ', timeout: 0 },
+      },
+      {
+        name: 'prompt',
+        node: { id: 'prompt', prompt: 'Review this.' },
+        ignored: { bash: '   ', script: '   ', timeout: 0 },
+      },
+      {
+        name: 'loop',
+        node: {
+          id: 'loop',
+          loop: { prompt: 'Review this.', until: 'DONE', max_iterations: 1 },
+        },
+        ignored: { bash: '   ', script: '   ', timeout: 0 },
+      },
+      {
+        name: 'loop_group',
+        node: {
+          id: 'loop-group',
+          loop_group: {
+            until: 'DONE',
+            max_iterations: 1,
+            nodes: [{ id: 'review', prompt: 'Review this.' }],
+          },
+        },
+        ignored: { bash: '   ', script: '   ', timeout: 0 },
+      },
+      {
+        name: 'approval',
+        node: { id: 'approval', approval: { message: 'Continue?' } },
+        ignored: { bash: '   ', script: '   ', timeout: 0 },
+      },
+      {
+        name: 'wait',
+        node: { id: 'wait', wait: { duration_ms: 1 } },
+        ignored: { bash: '   ', script: '   ', timeout: 0 },
+      },
+      {
+        name: 'cancel',
+        node: { id: 'cancel', cancel: 'Stop.' },
+        ignored: { bash: '   ', script: '   ', timeout: 0 },
+      },
+      {
+        name: 'include',
+        node: { id: 'include', include: 'child' },
+        ignored: { bash: '   ', script: '   ', timeout: 0 },
+      },
+      {
+        name: 'workflow',
+        node: { id: 'workflow', workflow: 'child' },
+        ignored: { bash: '   ', script: '   ', timeout: 0 },
+      },
+      {
+        name: 'bash',
+        node: { id: 'bash', bash: 'echo hi' },
+        ignored: { script: '   ' },
+      },
+      {
+        name: 'script',
+        node: { id: 'script', script: 'console.log("hi")', runtime: 'bun' },
+        ignored: { bash: '   ' },
+      },
+    ];
+
+    for (const { name, node, ignored } of cases) {
+      const baseline = dagNodeSchema.safeParse(node);
+      const withIgnoredFields = dagNodeSchema.safeParse({ ...node, ...ignored });
+      expect(baseline.success, `${name} baseline`).toBe(true);
+      expect(withIgnoredFields.success, name).toBe(true);
+      if (baseline.success && withIgnoredFields.success) {
+        expect(withIgnoredFields.data, name).toEqual(baseline.data);
+      }
+    }
+  });
+
+  test('ignores unsupported with values on every mode that drops with', () => {
+    const cases: readonly { name: string; node: Record<string, unknown> }[] = [
+      { name: 'bash', node: { id: 'bash', bash: 'echo hi' } },
+      { name: 'prompt', node: { id: 'prompt', prompt: 'Review this.' } },
+      {
+        name: 'loop',
+        node: {
+          id: 'loop',
+          loop: { prompt: 'Review this.', until: 'DONE', max_iterations: 1 },
+        },
+      },
+      {
+        name: 'loop_group',
+        node: {
+          id: 'loop-group',
+          loop_group: {
+            until: 'DONE',
+            max_iterations: 1,
+            nodes: [{ id: 'review', prompt: 'Review this.' }],
+          },
+        },
+      },
+      { name: 'approval', node: { id: 'approval', approval: { message: 'Continue?' } } },
+      { name: 'wait', node: { id: 'wait', wait: { duration_ms: 1 } } },
+      { name: 'cancel', node: { id: 'cancel', cancel: 'Stop.' } },
+    ];
+
+    for (const { name, node } of cases) {
+      const baseline = dagNodeSchema.safeParse(node);
+      const withIgnoredValue = dagNodeSchema.safeParse({ ...node, with: ['ignored'] });
+      expect(baseline.success, `${name} baseline`).toBe(true);
+      expect(withIgnoredValue.success, name).toBe(true);
+      if (baseline.success && withIgnoredValue.success) {
+        expect(withIgnoredValue.data, name).toEqual(baseline.data);
+      }
+    }
+  });
+
+  test('validates with against the exec owner after script mode is selected', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'script',
+      script: 'console.log("hi")',
+      runtime: 'bun',
+      with: ['not-a-map'],
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0]?.message).toBe(
+        "'with' on script nodes must be an object mapping input names to values"
+      );
+    }
+  });
+
+  // The command and script paths must reject the same authored input names. They
+  // reached one validator before the owner-derived split; a script path that skips
+  // validateWithShape silently widens the accepted key grammar for scripts only.
+  test('rejects an invalid input name on script with, exactly as command does', () => {
+    const script = dagNodeSchema.safeParse({
+      id: 'script',
+      script: 'console.log("hi")',
+      runtime: 'bun',
+      with: { '1bad': 'value' },
+    });
+    const command = dagNodeSchema.safeParse({
+      id: 'command',
+      command: 'thing',
+      with: { '1bad': 'value' },
+    });
+    expect(script.success).toBe(false);
+    expect(command.success).toBe(false);
+    if (!script.success && !command.success) {
+      const nameIssue = (issues: readonly { message: string }[]) =>
+        issues.find(i => /invalid (script|command) input name/.test(i.message))?.message;
+      expect(nameIssue(script.error.issues)).toBe(
+        "invalid script input name '1bad'; use letters, numbers, underscores, or hyphens and start with a letter or underscore"
+      );
+      expect(nameIssue(command.error.issues)).toBe(
+        "invalid command input name '1bad'; use letters, numbers, underscores, or hyphens and start with a letter or underscore"
+      );
+    }
+  });
+
   test('rejects empty script string', () => {
     const result = dagNodeSchema.safeParse({ id: 's', script: '', runtime: 'bun' });
     expect(result.success).toBe(false);
@@ -980,12 +1213,10 @@ describe('dagNodeSchema — ExecNode', () => {
       script: 'console.log("hi")',
       runtime: 'bun',
       effort: 'high',
-      thinking: 'adaptive',
     });
     expect(result.success).toBe(true);
     if (result.success) {
       expect('effort' in result.data).toBe(false);
-      expect('thinking' in result.data).toBe(false);
     }
   });
 });
@@ -1005,14 +1236,12 @@ describe('SCRIPT_NODE_AI_FIELDS', () => {
       'provider',
       'model',
       'context',
-      'output_format',
       'allowed_tools',
       'denied_tools',
       'hooks',
       'mcp',
       'skills',
       'effort',
-      'thinking',
       'maxBudgetUsd',
       'systemPrompt',
       'fallbackModel',
@@ -1021,6 +1250,47 @@ describe('SCRIPT_NODE_AI_FIELDS', () => {
     ];
     for (const field of expectedFields) {
       expect(SCRIPT_NODE_AI_FIELDS).toContain(field);
+    }
+  });
+
+  // #2453: the one AI field an exec node now OWNS. It is enforced against the node's
+  // stdout, so warning that it is ignored would be a lie — and it must stay listed on
+  // every node kind derived from this list that still has no execution site for it.
+  test('excludes output_format, which exec nodes now enforce (#2453)', () => {
+    expect(BASH_NODE_AI_FIELDS).not.toContain('output_format');
+    expect(SCRIPT_NODE_AI_FIELDS).not.toContain('output_format');
+    for (const list of [
+      GATE_AND_HALT_IGNORED_FIELDS,
+      INCLUDE_NODE_IGNORED_FIELDS,
+      WAIT_NODE_IGNORED_FIELDS,
+    ]) {
+      for (const field of BASH_NODE_AI_FIELDS) expect(list).toContain(field);
+    }
+    // Re-added where the field stays meaningless…
+    expect(GATE_AND_HALT_IGNORED_FIELDS).toContain('output_format');
+    expect(LOOP_GROUP_NODE_AI_FIELDS).toContain('output_format');
+    expect(INCLUDE_NODE_IGNORED_FIELDS).toContain('output_format');
+    // …but NOT on a wait, whose schema rejects the field outright rather than warning.
+    expect(WAIT_NODE_IGNORED_FIELDS).not.toContain('output_format');
+    expect(
+      dagNodeSchema.safeParse({
+        id: 'w',
+        wait: { duration_ms: 5000 },
+        output_format: { type: 'object' },
+      }).success
+    ).toBe(false);
+  });
+
+  test('an exec node KEEPS output_format through the transform (#2453)', () => {
+    const outputFormat = { type: 'object', properties: { ready: { type: 'boolean' } } };
+    for (const body of [
+      { bash: 'echo hi' },
+      { script: 'console.log("hi")', runtime: 'bun' },
+    ] as const) {
+      const result = dagNodeSchema.safeParse({ id: 'n', ...body, output_format: outputFormat });
+      expect(result.success).toBe(true);
+      if (!result.success) throw new Error('unreachable: asserted above');
+      expect((result.data as { output_format?: unknown }).output_format).toEqual(outputFormat);
     }
   });
 });
@@ -1046,7 +1316,6 @@ describe('LOOP_NODE_AI_FIELDS', () => {
       'mcp',
       'skills',
       'effort',
-      'thinking',
       'maxBudgetUsd',
       'systemPrompt',
       'fallbackModel',
@@ -1889,6 +2158,32 @@ describe('runAttention', () => {
       expect(runAttention(run)).toBeNull();
     });
 
+    test('reports an attention wait as an explicit resume action', () => {
+      const run = {
+        id: 'run-1',
+        status: 'paused' as const,
+        metadata: {
+          wait: {
+            owner: 'loop_group' as const,
+            nodeId: 'recover-ci',
+            bodyWaitId: 'operator-action',
+            iteration: 1,
+            sessionId: null,
+            sessionProvider: null,
+            kind: 'attention' as const,
+            waitingSince: '2026-08-28T10:00:00.000Z',
+            message: 'Rerun the failing check, then resume.',
+          },
+        },
+      };
+      expect(runAttention(run)).toEqual({
+        kind: 'action_required',
+        runId: 'run-1',
+        nodeId: 'recover-ci.operator-action',
+        message: 'Rerun the failing check, then resume.',
+      });
+    });
+
     test('a resolved child_workflow gate is still nobody’s decision', () => {
       // Order matters: resolution is checked before the child redirect, so a gate
       // already resolved never re-addresses a human at the child.
@@ -2027,6 +2322,24 @@ describe('runAttention', () => {
       },
     });
     expect(attention?.kind).toBe('awaiting_response');
+  });
+
+  test('an attention wait wins over stale approval metadata', () => {
+    const attention = runAttention({
+      id: 'run-1',
+      status: 'paused',
+      metadata: {
+        approval: gate(),
+        wait: {
+          owner: 'node',
+          nodeId: 'recover',
+          kind: 'attention',
+          waitingSince: '2026-08-28T10:00:00.000Z',
+          message: 'Recover the external dependency.',
+        },
+      },
+    });
+    expect(attention?.kind).toBe('action_required');
   });
 
   test('an absent metadata bag on a paused run is unreadable, not silence', () => {

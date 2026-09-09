@@ -54,26 +54,26 @@ function StepProgress({
   liveState: WorkflowState | undefined;
 }): React.ReactElement | null {
   const dagNodes = liveState?.dagNodes ?? [];
-  const runningNode = dagNodes
-    .slice()
-    .reverse()
-    .find(n => n.status === 'running');
+  const activeNodeNames = liveState?.activeNodeIds ?? run.active_nodes;
   const completedCount = dagNodes.filter(n => n.status === 'completed').length;
-  const totalNodes = dagNodes.length || run.total_steps || 0;
-  const stepName = runningNode?.name ?? run.current_step_name;
+  const totalNodes = run.total_steps ?? 0;
   const currentTool = liveState?.currentTool ?? null;
 
-  const hasProgress = runningNode != null || totalNodes > 0;
+  const hasProgress = activeNodeNames.length > 0 || totalNodes > 0;
   if (!hasProgress && !currentTool) return null;
 
   return (
     <div className="rounded-md bg-surface-elevated px-3 py-2 space-y-1">
       {hasProgress && (
         <div className="flex items-center gap-2 text-sm text-text-primary">
-          <span className="font-medium">
-            {`${String(completedCount)}${totalNodes ? `/${String(totalNodes)}` : ''} nodes`}
-          </span>
-          {stepName && <span className="text-text-secondary">{stepName}</span>}
+          {totalNodes > 0 && (
+            <span className="font-medium">{`${String(completedCount)}/${String(totalNodes)} nodes`}</span>
+          )}
+          {activeNodeNames.length > 0 && (
+            <span className="text-text-secondary">
+              Active node{activeNodeNames.length === 1 ? '' : 's'}: {activeNodeNames.join(', ')}
+            </span>
+          )}
         </div>
       )}
       {currentTool && (
@@ -115,29 +115,10 @@ function isValidNodeCounts(value: unknown): value is NodeCounts {
   );
 }
 
-interface WaitMetadata {
-  kind: 'time' | 'event';
-  resumeAt: string;
-  event?: string;
-}
-
 interface ScheduledResumeMetadata {
   resumeAt: string;
   attempt: number;
   maxAttempts: number;
-}
-
-function readWaitMetadata(value: unknown): WaitMetadata | null {
-  if (typeof value !== 'object' || value === null) return null;
-  const wait = value as Record<string, unknown>;
-  if ((wait.kind !== 'time' && wait.kind !== 'event') || typeof wait.resumeAt !== 'string') {
-    return null;
-  }
-  return {
-    kind: wait.kind,
-    resumeAt: wait.resumeAt,
-    ...(typeof wait.event === 'string' ? { event: wait.event } : {}),
-  };
 }
 
 function readScheduledResumeMetadata(value: unknown): ScheduledResumeMetadata | null {
@@ -221,9 +202,9 @@ export function WorkflowRunCard({
       ? run.user_message
       : run.user_message.slice(0, 80) + '…'
     : null;
-  const wait = readWaitMetadata(run.metadata?.wait);
+  const wait = run.metadata.wait ?? undefined;
   const scheduledResume = readScheduledResumeMetadata(run.metadata?.scheduled_resume);
-  const hasApproval = wait === null && hasApprovalMetadata(run.metadata?.approval);
+  const hasApproval = wait === undefined && hasApprovalMetadata(run.metadata?.approval);
 
   return (
     <div className="rounded-lg border border-border bg-surface p-4 space-y-3">
@@ -322,13 +303,15 @@ export function WorkflowRunCard({
         </div>
       )}
 
-      {run.status === 'paused' && wait !== null && (
+      {run.status === 'paused' && wait !== undefined && (
         <div className="rounded-md bg-warning/5 border border-warning/20 px-3 py-2 flex items-start gap-2">
           <Pause className="h-4 w-4 text-warning shrink-0 mt-0.5" />
           <p className="text-xs text-text-secondary">
-            {wait.kind === 'event'
-              ? `Waiting for event '${wait.event ?? '?'}' until ${wait.resumeAt}`
-              : `Waiting until ${wait.resumeAt}`}
+            {wait.kind === 'attention'
+              ? wait.message
+              : wait.kind === 'event'
+                ? `Waiting for event '${wait.event ?? '?'}' until ${wait.resumeAt}`
+                : `Waiting until ${wait.resumeAt}`}
           </p>
         </div>
       )}
@@ -421,38 +404,40 @@ export function WorkflowRunCard({
               }}
             />
           )}
-          {run.status === 'failed' && onResume && (
-            <button
-              onClick={(): void => {
-                onResume(run.id);
-              }}
-              className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-primary/80 hover:bg-primary/10 hover:text-primary transition-colors"
-            >
-              <PlayCircle className="h-3.5 w-3.5" />
-              Resume
-            </button>
-          )}
-          {run.status === 'running' && onAbandon && (
-            <ConfirmRunActionDialog
-              trigger={
-                <button className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-warning/80 hover:bg-warning/10 hover:text-warning transition-colors">
-                  <Ban className="h-3.5 w-3.5" />
-                  Abandon
-                </button>
-              }
-              title="Abandon workflow?"
-              description={
-                <>
-                  Mark <strong>{run.workflow_name}</strong> as cancelled. Already-completed nodes
-                  remain in the database; the run will not continue.
-                </>
-              }
-              confirmLabel="Abandon"
-              onConfirm={(): void => {
-                onAbandon(run.id);
-              }}
-            />
-          )}
+          {(run.status === 'failed' || (run.status === 'paused' && wait?.kind === 'attention')) &&
+            onResume && (
+              <button
+                onClick={(): void => {
+                  onResume(run.id);
+                }}
+                className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-primary/80 hover:bg-primary/10 hover:text-primary transition-colors"
+              >
+                <PlayCircle className="h-3.5 w-3.5" />
+                Resume
+              </button>
+            )}
+          {(run.status === 'running' || (run.status === 'paused' && wait?.kind === 'attention')) &&
+            onAbandon && (
+              <ConfirmRunActionDialog
+                trigger={
+                  <button className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-warning/80 hover:bg-warning/10 hover:text-warning transition-colors">
+                    <Ban className="h-3.5 w-3.5" />
+                    Abandon
+                  </button>
+                }
+                title="Abandon workflow?"
+                description={
+                  <>
+                    Mark <strong>{run.workflow_name}</strong> as cancelled. Already-completed nodes
+                    remain in the database; the run will not continue.
+                  </>
+                }
+                confirmLabel="Abandon"
+                onConfirm={(): void => {
+                  onAbandon(run.id);
+                }}
+              />
+            )}
           {(run.status === 'running' || run.status === 'pending') && (
             <ConfirmRunActionDialog
               trigger={

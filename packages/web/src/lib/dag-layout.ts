@@ -76,7 +76,9 @@ export function resolveNodeDisplay(dn: DagNode): {
         ? dn.wait.event
         : 'until' in dn.wait
           ? dn.wait.until
-          : `${String(dn.wait.duration_ms)} ms`;
+          : 'attention' in dn.wait
+            ? dn.wait.attention
+            : `${String(dn.wait.duration_ms)} ms`;
     return { label: 'Wait', nodeType: 'wait', promptText: condition };
   }
   return {

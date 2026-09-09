@@ -31,6 +31,7 @@ import {
   logWorkflowComplete,
   logNodeComplete,
   logNodeError,
+  logWatchdogReset,
   type WorkflowEvent,
 } from './logger';
 
@@ -114,6 +115,26 @@ describe('Workflow Logger', () => {
 
       const events = await readLogFile('new-dir-test');
       expect(events).toHaveLength(1);
+    });
+  });
+
+  describe('logWatchdogReset', () => {
+    it('persists the reset timestamp and chunk type without chunk content', async () => {
+      const resetAt = Date.parse('2026-08-31T20:31:53.123Z');
+
+      await logWatchdogReset(testDir, 'watchdog-test', 'review', 'thinking', resetAt);
+
+      const events = await readLogFile('watchdog-test');
+      expect(events).toEqual([
+        expect.objectContaining({
+          type: 'watchdog_reset',
+          workflow_id: 'watchdog-test',
+          step: 'review',
+          chunk_type: 'thinking',
+          ts: '2026-08-31T20:31:53.123Z',
+        }),
+      ]);
+      expect(events[0].content).toBeUndefined();
     });
   });
 
@@ -265,6 +286,25 @@ Line 3`;
       expect(events).toHaveLength(1);
       expect(events[0].type).toBe('workflow_error');
       expect(events[0].error).toBe('Step prompt not found: missing-step.md');
+    });
+
+    it('records aggregate run usage when supplied', async () => {
+      await logWorkflowError(testDir, 'error-usage', 'Node failed', {
+        cost_usd: 0.08,
+        tokens: { input: 1200, output: 80, cacheRead: 900, cacheWrite: 0 },
+      });
+
+      const [event] = await readLogFile('error-usage');
+      expect(event.cost_usd).toBe(0.08);
+      expect(event.tokens).toEqual({ input: 1200, output: 80, cacheRead: 900, cacheWrite: 0 });
+    });
+
+    it('omits aggregate usage axes when they were not reported', async () => {
+      await logWorkflowError(testDir, 'error-no-usage', 'Node failed');
+
+      const [event] = await readLogFile('error-no-usage');
+      expect('cost_usd' in event).toBe(false);
+      expect('tokens' in event).toBe(false);
     });
   });
 

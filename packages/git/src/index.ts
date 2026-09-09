@@ -59,7 +59,10 @@ export {
   getRemoteUrl,
   listChildRepos,
   syncWorkspace,
+  fetchWithRefLockRetry,
   cloneRepository,
+  validateCloneUrl,
   syncRepository,
   addSafeDirectory,
 } from './repo';
+export type { CloneCredentials, CloneRepositoryOptions } from './repo';

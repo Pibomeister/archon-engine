@@ -577,7 +577,7 @@ export function getRunArtifactsPath(owner: string, repo: string, workflowRunId: 
  * Returns: ~/.archon/workspaces/owner/repo/logs/{id}.jsonl
  */
 export function getRunLogPath(owner: string, repo: string, workflowRunId: string): string {
-  return join(getProjectLogsPath(owner, repo), `${workflowRunId}.jsonl`);
+  return getRunLogPathForRoot(getProjectRoot(owner, repo), workflowRunId);
 }
 
 /**
@@ -637,8 +637,8 @@ export type ProjectStorageKey =
   | { kind: 'cwd'; cwd: string };
 
 /**
- * The four output roots every project kind has. Composed from one project root
- * so the tree is identical no matter which key resolved it.
+ * The output roots every project kind has. Composed from one project root so
+ * the tree is identical no matter which key resolved it.
  */
 export interface ProjectStoragePaths {
   /** `~/.archon/workspaces/<...>/` — the project root all output hangs off. */
@@ -649,6 +649,15 @@ export interface ProjectStoragePaths {
   logsDir: string;
   /** `$STATE_DIR` — per-PROJECT cross-run state, shared by every workflow. */
   stateRoot: string;
+  /**
+   * Parent of the `runs/<run-id>/` layout holding each run's frozen workflow source.
+   *
+   * A sibling of `artifactsRoot`, deliberately not inside it: `$ARTIFACTS_DIR` is the
+   * run's output channel, handed to every node and listed for humans, and the frozen
+   * pack is neither an output nor something a node should be able to reach by that
+   * path.
+   */
+  workflowSourceRoot: string;
 }
 
 /**
@@ -741,6 +750,22 @@ export function isInsideArchonHome(candidate: string): boolean {
 }
 
 /**
+ * Resolve the durable project root for a persisted run.
+ *
+ * A trusted persisted root preserves the run's original project identity. An
+ * out-of-tree root is stale or corrupt, so readers re-derive the project under
+ * the current ARCHON_HOME when the run still has a codebase row.
+ */
+export function resolveRunStorageRoot(
+  run: { output_root?: string | null },
+  codebase: { kind?: string | null; name: string; default_cwd: string } | null | undefined
+): string | null {
+  if (run.output_root && isInsideArchonHome(run.output_root)) return run.output_root;
+  if (!codebase?.name) return null;
+  return getProjectStoragePaths(resolveProjectStorageKey(codebase, codebase.default_cwd)).root;
+}
+
+/**
  * Compose the output roots from an already-resolved project root — the branch
  * taken when a run recorded its `output_root` at start and must NOT re-derive
  * identity (a renamed codebase would otherwise orphan its artifacts, #1192).
@@ -757,6 +782,7 @@ export function getStoragePathsForRoot(root: string): ProjectStoragePaths {
     artifactsRoot: join(root, 'artifacts'),
     logsDir: join(root, 'logs'),
     stateRoot: join(root, 'state'),
+    workflowSourceRoot: join(root, 'workflow-source'),
   };
 }
 
@@ -781,6 +807,20 @@ export function getRunArtifactsDirForKey(key: ProjectStorageKey, workflowRunId: 
  */
 export function getRunArtifactsDirForRoot(root: string, workflowRunId: string): string {
   return join(getStoragePathsForRoot(root).artifactsRoot, 'runs', workflowRunId);
+}
+
+/** Get a run's JSONL transcript from an already-resolved project root. */
+export function getRunLogPathForRoot(root: string, workflowRunId: string): string {
+  return join(getStoragePathsForRoot(root).logsDir, `${workflowRunId}.jsonl`);
+}
+
+/**
+ * Get a run's frozen workflow source directory from an already-resolved project root:
+ * `<workflowSourceRoot>/runs/<id>`. The same `runs/<id>` shape as artifacts, keyed by
+ * the same run id, so one run's source and output are siblings under one project.
+ */
+export function getRunWorkflowSourceDirForRoot(root: string, workflowRunId: string): string {
+  return join(getStoragePathsForRoot(root).workflowSourceRoot, 'runs', workflowRunId);
 }
 
 // =============================================================================

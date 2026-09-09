@@ -15,7 +15,6 @@ import {
   isLoopGroupNode,
   isGateNode,
   isWaitNode,
-  isHaltNode,
   isWorkflowNode,
   isIncludeDirective,
   isComposeFanOutNode,
@@ -25,23 +24,18 @@ import {
 import { COMPOSE_FAN_OUT_STEP_MARKER } from './fan-out-identity';
 import { createLogger } from '@archon/paths';
 import {
+  compileOutputSchema,
   isRegisteredProvider,
   getRegisteredProviders,
   getProviderCapabilities,
 } from '@archon/providers';
 import {
   dagNodeSchema,
-  BASH_NODE_AI_FIELDS,
-  LOOP_NODE_AI_FIELDS,
-  LOOP_GROUP_NODE_AI_FIELDS,
-  GATE_AND_HALT_IGNORED_FIELDS,
-  WAIT_NODE_IGNORED_FIELDS,
-  INCLUDE_NODE_IGNORED_FIELDS,
-  WORKFLOW_NODE_IGNORED_FIELDS,
+  ignoredFieldsForNode,
+  isOutputFormatEnforced,
   KNOWN_DAG_NODE_KEYS,
   KNOWN_NODE_NESTED_KEYS,
   effortLevelSchema,
-  thinkingConfigSchema,
   sandboxSettingsSchema,
   betasSchema,
 } from './schemas/dag-node';
@@ -70,6 +64,7 @@ import { declaredFieldsFromSchema, OUTPUT_REF_SOURCE, parseWholeOutputRef } from
 import { isBindingDirective } from './schemas/dag-node';
 import { readComposedBindings } from './compiled-command';
 import { visitNodeTemplateSlots } from './template-walker';
+import { validateInlineExecInputs } from './exec-input-validation';
 import { z } from '@hono/zod-openapi';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -108,9 +103,8 @@ export function resetClassPlacementWarningForTests(): void {
  * valid enum options).
  *
  * The return type is inferred from the schema (`z.output<S>`), so
- * preprocess-based schemas (e.g. `thinkingConfigSchema`, whose input is
- * `unknown`) still resolve to their parsed output type rather than their
- * input type. zod v4 removed `ZodTypeDef` as the middle type parameter, so the
+ * preprocess-based schemas still resolve to their parsed output type rather
+ * than their input type. zod v4 removed `ZodTypeDef` as the middle type parameter, so the
  * old `z.ZodType<T, z.ZodTypeDef, unknown>` form no longer compiles.
  */
 function parseOptionalField<S extends z.ZodType>(
@@ -175,7 +169,9 @@ function nodeIdForMessages(raw: unknown, index: number): string {
  * on the final flat workflow, where every selected node is executable.
  */
 export function validateWorkflowOutcomeDeclaration(
-  workflow: Pick<WorkflowDefinition, 'returns' | 'outcome_field' | 'nodes'>
+  workflow: Pick<WorkflowDefinition, 'returns' | 'outcome_field'> & {
+    readonly nodes: readonly (DagNode | IncludeDirective)[];
+  }
 ): string | null {
   const field = workflow.outcome_field;
   if (field === undefined) return null;
@@ -483,15 +479,17 @@ function collectGateAndLoopDeprecationWarnings(
     const message =
       `Node '${id}': the prose 'loop.until' completion signal is deprecated. Declare ` +
       "'loop.until_bash' (deterministic check) or 'loop.until_field' (a declared boolean " +
-      'in output_format) instead (#2707 step 3). Continue using it for now.';
+      'in output_format) instead (#2707 step 3). While supported, emit legacy signals as ' +
+      "'<promise>SIGNAL</promise>' or a final standalone signal line.";
     warnings.push(message);
     getLog().warn({ id, warning: message }, 'node_loop_until_deprecated');
   } else if (isLoopGroupNode(node) && node.loop_group.until !== undefined) {
     const message =
       `Node '${id}': the prose 'loop_group.until' completion signal is deprecated. ` +
       "Declare 'loop_group.until_bash' instead — it can read a body node's structured " +
-      'output (e.g. \'test $body-node.output.field = "true"\') (#2707 step 3). Continue ' +
-      'using it for now.';
+      'output (e.g. \'test $body-node.output.field = "true"\') (#2707 step 3). While ' +
+      "supported, emit legacy signals as '<promise>SIGNAL</promise>' or a final standalone " +
+      'signal line.';
     warnings.push(message);
     getLog().warn({ id, warning: message }, 'node_loop_group_until_deprecated');
   }
@@ -653,7 +651,6 @@ function parseDagNode(
     );
     return null;
   }
-
   collectUnknownNodeKeys(raw, id, `Node '${id}'`, warnings);
   collectGateAndLoopDeprecationWarnings(node, raw, id, warnings);
 
@@ -676,28 +673,7 @@ function parseDagNode(
   }
 
   // Warn about AI-specific fields on non-AI nodes (runtime behavior, not schema errors)
-  let nonAiNode: { type: string; fields: readonly string[] } | undefined;
-  if (isIncludeDirective(node)) {
-    nonAiNode = { type: 'include', fields: INCLUDE_NODE_IGNORED_FIELDS };
-  } else if (isComposeFanOutNode(node)) {
-    // Same execution-less posture as a static include: the composed body's own nodes
-    // carry their config, so AI-level fields declared here are ignored (#2512).
-    nonAiNode = { type: 'include', fields: INCLUDE_NODE_IGNORED_FIELDS };
-  } else if (isHaltNode(node)) {
-    nonAiNode = { type: 'cancel', fields: GATE_AND_HALT_IGNORED_FIELDS };
-  } else if (isWorkflowNode(node)) {
-    nonAiNode = { type: 'workflow', fields: WORKFLOW_NODE_IGNORED_FIELDS };
-  } else if (isGateNode(node)) {
-    nonAiNode = { type: 'approval', fields: GATE_AND_HALT_IGNORED_FIELDS };
-  } else if (isWaitNode(node)) {
-    nonAiNode = { type: 'wait', fields: WAIT_NODE_IGNORED_FIELDS };
-  } else if (isLoopNode(node)) {
-    nonAiNode = { type: 'loop', fields: LOOP_NODE_AI_FIELDS };
-  } else if (isLoopGroupNode(node)) {
-    nonAiNode = { type: 'loop_group', fields: LOOP_GROUP_NODE_AI_FIELDS };
-  } else if (isExecNode(node)) {
-    nonAiNode = { type: node.runtime === 'sh' ? 'bash' : 'script', fields: BASH_NODE_AI_FIELDS };
-  }
+  const nonAiNode = ignoredFieldsForNode(node);
   if (nonAiNode) {
     const presentAiFields = nonAiNode.fields.filter(
       f => (raw as Record<string, unknown>)[f] !== undefined
@@ -779,7 +755,7 @@ const GATE_ON_A_SHELL_NODE =
  * the free-form-AI check needs that producer's type and `output_format`.
  */
 export function validateDagStructure(
-  nodes: (DagNode | IncludeDirective)[],
+  nodes: readonly (DagNode | IncludeDirective)[],
   enclosingNodes?: ReadonlyMap<string, DagNode | IncludeDirective>
 ): string | null {
   // Check ID uniqueness
@@ -963,6 +939,8 @@ export function validateDagStructure(
       const waitSources: (readonly [string, string])[] = [];
       if (node.wait.until !== undefined) waitSources.push(['wait.until', node.wait.until]);
       if (node.wait.event !== undefined) waitSources.push(['wait.event', node.wait.event]);
+      if (node.wait.attention !== undefined)
+        waitSources.push(['wait.attention', node.wait.attention]);
       for (const [field, text] of waitSources) {
         outputRefPattern.lastIndex = 0;
         let m: RegExpExecArray | null;
@@ -1261,6 +1239,65 @@ export function validateWorkflowClassPlacement(
   return null;
 }
 
+/**
+ * A `workflow:` node may not declare `output_format` (#2453). The result contract
+ * belongs to the node that produces the value — the child's `returns:` node — and
+ * its declared field names travel back with the result, so the caller has nothing
+ * to assert. Checked before the compile gate in both the file-fed loader and the
+ * in-memory validator, through this one function, so both name the same owner and
+ * a caller schema never reaches the compile branch. Returns the load error, or
+ * `null` for every other node.
+ */
+export function workflowNodeOutputFormatError(node: DagNode): string | null {
+  if (!isWorkflowNode(node) || node.output_format === undefined) return null;
+  return `Node '${node.id}' declares output_format on a workflow: node; the result contract belongs to the child's returns: node — declare it there`;
+}
+
+/**
+ * Compile every declared `output_format` so a contract that cannot be enforced
+ * is rejected at LOAD time, before a provider is paid (#2453).
+ *
+ * `output_format` is free-form JSON Schema to Zod (`z.record`), so nothing before
+ * this point can tell a real schema from one ajv will refuse. The runtime gates
+ * used to warn and continue on that refusal, which silently turned a declared
+ * contract into no contract at all after the spend. They now fail the node, and
+ * this check is what keeps that failure from being the author's first signal.
+ *
+ * ajv stays `strict: false`, so a schema carrying tolerated annotations (unknown
+ * keywords, unknown formats) still compiles and still loads — only a schema ajv
+ * genuinely rejects, such as a dangling `$ref`, is an error here.
+ *
+ * Loop_group bodies are walked too: a body node runs its own provider turn with
+ * its own schema, while the group's own `output_format` stays inert and is skipped.
+ * Returns the first failure message, or `null`.
+ */
+export function validateNodeOutputFormats(
+  nodes: readonly (DagNode | IncludeDirective)[]
+): string | null {
+  for (const node of nodes) {
+    if (isIncludeDirective(node)) continue;
+    // Ownership first (#2453): a `workflow:` node's schema is rejected outright, so the
+    // compile gate below never sees one.
+    const ownershipError = workflowNodeOutputFormatError(node);
+    if (ownershipError !== null) return ownershipError;
+    // Only a schema the engine will enforce is worth rejecting. Where the field is
+    // inert (warned and ignored) a dangling `$ref` governs nothing and must not fail
+    // the file; the predicate derives from the ignored-field lists, so it stays true
+    // as those lists change.
+    if (isOutputFormatEnforced(node) && node.output_format !== undefined) {
+      const compileError = compileOutputSchema(node.output_format);
+      if (compileError !== null) {
+        return `Node '${node.id}' declares an output_format that cannot be compiled: ${compileError}`;
+      }
+    }
+    if (isLoopGroupNode(node)) {
+      const bodyError = validateNodeOutputFormats(node.loop_group.nodes);
+      if (bodyError) return bodyError;
+    }
+  }
+  return null;
+}
+
 export type ParseResult =
   | { workflow: WorkflowDefinition; error: null; warnings: string[] }
   | { workflow: null; error: WorkflowLoadError; warnings?: never };
@@ -1278,6 +1315,17 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
         error: {
           filename,
           error: 'YAML file is empty or does not contain an object',
+          errorType: 'validation_error',
+        },
+      };
+    }
+
+    if (Object.hasOwn(raw, 'thinking')) {
+      return {
+        workflow: null,
+        error: {
+          filename,
+          error: "'thinking:' has been removed; use 'effort:' instead",
           errorType: 'validation_error',
         },
       };
@@ -1362,6 +1410,15 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
       return {
         workflow: null,
         error: { filename, error: structureError, errorType: 'validation_error' },
+      };
+    }
+
+    const outputFormatError = validateNodeOutputFormats(dagNodes);
+    if (outputFormatError) {
+      getLog().warn({ filename, outputFormatError }, 'output_format_rejected');
+      return {
+        workflow: null,
+        error: { filename, error: outputFormatError, errorType: 'validation_error' },
       };
     }
 
@@ -1620,7 +1677,7 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
           error: {
             filename,
             error:
-              "Invalid evidence_policy: expected { required: boolean }. When required is true, the run is refused terminal 'completed' unless $ARTIFACTS_DIR/evidence.json exists.",
+              "Invalid evidence_policy: expected { required: boolean }. When required is true, the run is refused terminal 'completed' unless the conventional marker file $ARTIFACTS_DIR/evidence.json exists; its contents are not checked.",
             errorType: 'validation_error',
           },
         };
@@ -1870,12 +1927,6 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
       // persists verbatim as a `workflow_parse_warnings` event (#2213).
       getLog().warn({ filename, warning: message }, 'workflow_model_reasoning_effort_deprecated');
     }
-    const thinking = parseOptionalField(
-      raw.thinking,
-      thinkingConfigSchema,
-      filename,
-      'invalid_workflow_thinking_value_ignored'
-    );
     const sandbox = parseOptionalField(
       raw.sandbox,
       sandboxSettingsSchema,
@@ -1960,7 +2011,6 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
       interactive,
       ...(mutatesCheckout !== undefined ? { mutates_checkout: mutatesCheckout } : {}),
       ...(effort !== undefined ? { effort } : {}),
-      ...(thinking !== undefined ? { thinking } : {}),
       ...(fallbackModel !== undefined ? { fallbackModel } : {}),
       ...(betas !== undefined ? { betas } : {}),
       ...(sandbox !== undefined ? { sandbox } : {}),
@@ -1976,6 +2026,18 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
       ...(outcomeField !== undefined ? { outcome_field: outcomeField } : {}),
       ...(deprecated !== undefined ? { deprecated } : {}),
     };
+    const execInputValidation = validateInlineExecInputs(workflow);
+    parseWarnings.push(...execInputValidation.warnings);
+    if (execInputValidation.errors.length > 0) {
+      return {
+        workflow: null,
+        error: {
+          filename,
+          error: execInputValidation.errors.join(' '),
+          errorType: 'validation_error',
+        },
+      };
+    }
     const outcomeDeclarationError = validateWorkflowOutcomeDeclaration(workflow);
     if (outcomeDeclarationError !== null) {
       return {

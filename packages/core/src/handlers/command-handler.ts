@@ -25,9 +25,9 @@ import { createWorkflowDeps } from '../workflows/store-adapter';
 import type {
   WorkflowWithSource,
   WorkflowLoadError,
-  WorkflowDefinition,
+  ResolvedWorkflow,
 } from '@archon/workflows/schemas/workflow';
-import { isContainerRun } from '@archon/workflows/schemas/workflow-run';
+import { isContainerRun, runAttention } from '@archon/workflows/schemas/workflow-run';
 import * as workflowDb from '../db/workflows';
 import {
   approveWorkflow,
@@ -883,17 +883,27 @@ async function handleWorkflowCommand(
         let msg = `**Active Workflows (${String(activeRuns.length)})**\n\n`;
         for (const run of activeRuns) {
           msg += `**\`${run.workflow_name}\`** (${run.status})\n`;
+          if (run.outcome !== null) msg += `  Authored outcome: ${run.outcome}\n`;
           msg += `  ID: ${run.id}\n`;
           msg += `  Path: ${run.working_path ?? '(unknown)'}\n`;
-          msg += `  Started: ${new Date(run.started_at).toISOString()}\n\n`;
+          if (run.active_nodes.length > 0) {
+            msg += `  Active node${run.active_nodes.length === 1 ? '' : 's'}: ${run.active_nodes.join(', ')}\n`;
+          }
+          msg += `  Started: ${new Date(run.started_at).toISOString()}\n`;
+          const attention = runAttention(run);
+          if (attention?.kind === 'action_required') {
+            msg += `  Action required: ${attention.message}\n`;
+            msg += `  Resume: \`/workflow resume ${run.id}\`\n`;
+            msg += `  Abandon: \`/workflow abandon ${run.id}\`\n`;
+          } else if (attention?.kind === 'awaiting_response') {
+            msg += `  Approve: \`/workflow approve ${attention.respondTo.runId}\`\n`;
+            msg += `  Reject: \`/workflow reject ${attention.respondTo.runId} <reason>\`\n`;
+          }
+          msg += '\n';
         }
 
         const hasRunning = activeRuns.some(r => r.status === 'running');
-        const hasPaused = activeRuns.some(r => r.status === 'paused');
         if (hasRunning) msg += 'Use `/workflow cancel` to stop a running workflow.';
-        if (hasPaused)
-          msg +=
-            '\nUse `/workflow approve <id>` or `/workflow reject <id> <reason>` for paused runs.';
         return { success: true, message: msg.trim() };
       } catch (error) {
         const err = error as Error;
@@ -911,7 +921,7 @@ async function handleWorkflowCommand(
         return {
           success: false,
           message:
-            'Usage: /workflow resume <id>\n\nResumes a failed workflow from completed nodes.',
+            'Usage: /workflow resume <id>\n\nResumes a failed or paused workflow from completed nodes.',
         };
       }
       try {
@@ -1158,7 +1168,7 @@ async function handleWorkflowCommand(
         'cmd.workflows_discovered'
       );
 
-      let workflow: WorkflowDefinition | undefined;
+      let workflow: ResolvedWorkflow | undefined;
       try {
         workflow = resolveWorkflowName(workflowName, workflows);
       } catch (err) {
@@ -1218,7 +1228,7 @@ async function handleWorkflowCommand(
       return {
         success: false,
         message:
-          'Usage:\n  /workflow list - Show available workflows\n  /workflow reload - Reload workflow definitions\n  /workflow status - Show all active workflows\n  /workflow cancel - Cancel running workflow\n  /workflow resume <id> - Resume a failed run\n  /workflow abandon <id> - Discard a failed run\n  /workflow approve <id> [comment] - Approve a paused run\n  /workflow reject <id> [reason] - Reject a paused run\n  /workflow reset-sessions <name> [<node-id>] - Clear persisted AI session memory for this conversation\n  /workflow run <name> [args] - Run a workflow directly',
+          'Usage:\n  /workflow list - Show available workflows\n  /workflow reload - Reload workflow definitions\n  /workflow status - Show all active workflows\n  /workflow cancel - Cancel running workflow\n  /workflow resume <id> - Resume a failed or paused run\n  /workflow abandon <id> - Abandon a running, failed, or paused run\n  /workflow approve <id> [comment] - Approve a paused gate\n  /workflow reject <id> [reason] - Reject a paused gate\n  /workflow reset-sessions <name> [<node-id>] - Clear persisted AI session memory for this conversation\n  /workflow run <name> [args] - Run a workflow directly',
       };
   }
 }
@@ -1249,10 +1259,10 @@ Talk naturally — the orchestrator routes your requests to the right workflow a
 - \`/workflow run <name> [message]\` — Run a workflow explicitly
 - \`/workflow status\` — Show all active workflows
 - \`/workflow cancel\` — Cancel the active workflow
-- \`/workflow resume <id>\` — Resume a failed run
-- \`/workflow abandon <id>\` — Discard a failed run
-- \`/workflow approve <id>\` — Approve a paused run
-- \`/workflow reject <id>\` — Reject a paused run
+- \`/workflow resume <id>\` — Resume a failed or paused run
+- \`/workflow abandon <id>\` — Abandon a running, failed, or paused run
+- \`/workflow approve <id>\` — Approve a paused gate
+- \`/workflow reject <id>\` — Reject a paused gate
 - \`/workflow reset-sessions <name> [<node-id>]\` — Clear persisted AI session memory for this conversation
 
 **Projects**

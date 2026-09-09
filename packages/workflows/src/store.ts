@@ -10,6 +10,7 @@ import type {
   WorkflowRunOutcome,
   WorkflowRunStatus,
   ApprovalContext,
+  WorkflowAttentionWaitContext,
   WorkflowWaitContext,
   WorkflowWaitResult,
   FactoryHumanInputContext,
@@ -27,12 +28,17 @@ export type { WorkflowNodeSession, WorkflowRunNodeSession } from './schemas';
  * `structuredOutput` is the logical value the node's `node_completed` event carried
  * under `structured_output`; absent for text-only nodes and rows persisted before
  * the key existed — those degrade to text re-parsing, the pre-#2637 behavior.
+ * `declaredFields` is the field-access contract the node completed under, from the
+ * event's `declared_fields` (#2453). Only a `workflow:` node writes it, because only
+ * it can hold a contract the parent's own definition does not state — every other
+ * producer's projection is re-derived from the loaded `output_format` on resume.
  */
 export interface PersistedNodeOutput {
   output: string;
   structuredOutput?: unknown;
   /** Loop-group body iteration when the terminal row carried one. */
   iteration?: number;
+  declaredFields?: readonly string[];
 }
 
 export interface DagResumeSnapshot {
@@ -67,6 +73,16 @@ export interface WorkflowNodeSessionKey {
   provider: string;
 }
 
+export const NODE_LIFECYCLE_EVENT_TYPES = [
+  'node_started',
+  'node_completed',
+  'node_failed',
+  'node_skipped',
+  'node_skipped_prior_success',
+] as const;
+
+export type NodeLifecycleEventType = (typeof NODE_LIFECYCLE_EVENT_TYPES)[number];
+
 export const WORKFLOW_EVENT_TYPES = [
   'workflow_started',
   'workflow_completed',
@@ -80,11 +96,7 @@ export const WORKFLOW_EVENT_TYPES = [
   // Between-run continuation (#2747) — written on the ADOPTING run's log when it
   // starts with `--adopt`/`--supersedes`, so the chain renders from events alone.
   'workflow.run_adopted',
-  'node_started',
-  'node_completed',
-  'node_failed',
-  'node_skipped',
-  'node_skipped_prior_success',
+  ...NODE_LIFECYCLE_EVENT_TYPES,
   // #2402 — written when a cached prior-success node is invalidated because a
   // dependency re-executed during the current resume (e.g. an `always_run: true`
   // upstream, or any dep that re-ran with fresh output). `data.prior_output` is the
@@ -135,9 +147,9 @@ export const WORKFLOW_EVENT_TYPES = [
   'writeback_requested',
   'writeback_applied',
   'writeback_discarded',
-  // Evidence gate (#2230): `evidence_policy.required` was set but
-  // `$ARTIFACTS_DIR/evidence.json` was absent at completion time — the run was
-  // refused terminal `completed` and marked failed. Data carries the expected path.
+  // File-presence gate (#2230): `evidence_policy.required` was set but its
+  // conventional `$ARTIFACTS_DIR/evidence.json` marker was absent at completion.
+  // Data carries the expected path; the legacy event name is a persisted contract.
   'evidence_validation_failed',
   // #2213 — keys the engine dropped from this run's workflow YAML. Written by the
   // executor at run start for EVERY run that has them, whatever surface started
@@ -207,7 +219,7 @@ export interface IWorkflowStore extends IRunTreeStore, IWorkflowRunNodeSessionSt
   createWorkflowRun(data: {
     /**
      * Caller-reserved row id, from `prepareWorkflowSource`. Supplied when the run's
-     * frozen workflow source had to be written at this run's own artifacts path before
+     * frozen workflow source had to be written at this run's own source path before
      * the row existed. Omitted, the store generates one.
      */
     id?: string;
@@ -328,6 +340,12 @@ export interface IWorkflowStore extends IRunTreeStore, IWorkflowRunNodeSessionSt
     id: string,
     context: FactoryHumanInputContext
   ): Promise<{ consumed: boolean }>;
+  /** Fail the exact paused action-required cursor after its required notification is lost. */
+  failPausedAttentionWait(
+    id: string,
+    waitContext: WorkflowAttentionWaitContext,
+    error: string
+  ): Promise<{ failed: boolean }>;
   /** Consume the exact wait cursor and persist its completion snapshot atomically. */
   clearWorkflowWaitContext(
     id: string,

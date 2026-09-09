@@ -189,14 +189,16 @@ of moving a `prompt:` node to a `command:` node.
 
 ### `until`
 
-The completion signal string. The executor checks each iteration's output for:
+Deprecated prose completion signal. Prefer `until_bash` for deterministic checks or
+`until_field` for model judgment. While `until` remains supported, the executor checks
+each iteration's output for:
 
 1. **Tag format (recommended):** `<promise>COMPLETE</promise>` — case-insensitive
    match (both tags and signal value), whitespace-tolerant. Prevents false
    positives from the AI mentioning the signal word in discussion.
-2. **Plain signal (fallback):** The signal at the very end of output (trailing
-   whitespace and punctuation tolerated) or on its own line. More prone to
-   false positives — prefer the tag format.
+2. **Plain signal (fallback):** A final line containing only `COMPLETE`, with
+   surrounding line whitespace allowed. Inline mentions, including a final sentence
+   ending in `COMPLETE`, do not complete the loop.
 
 The `<promise>` tags are automatically stripped from output sent to the user
 and to downstream nodes.

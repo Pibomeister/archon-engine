@@ -33,6 +33,8 @@ validate__validate:
   summary: "stub: full gate green"
 gate-validated: '{"gate":"green"}'
 ci-probe: '{"state":"concluded","detail":"no checks configured"}'
+ci-verdict: '{"state":"concluded","detail":"no checks configured"}'
+ci-attention-route: '{"attention":false,"red_cause":""}'
 flip-ready: "https://github.com/example/repo/pull/5"
 outcome: "https://github.com/example/repo/pull/5"
 fixture:

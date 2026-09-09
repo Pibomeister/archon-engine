@@ -1,7 +1,9 @@
 import { describe, expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
-import { shouldRunTestSuite } from './should-run-test-suite';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { trackTempRoots } from '@archon/paths/test-utils';
+import { changedFilesBetween, shouldRunTestSuite } from './should-run-test-suite';
 
 const EMPTY_GIT_SHA = '0000000000000000000000000000000000000000';
 
@@ -139,5 +141,118 @@ describe('test-suite change decision', () => {
       'run_tests=$(bun scripts/should-run-test-suite.ts "$EVENT_NAME" "$BASE_SHA" "$HEAD_SHA")\n'
     );
     expect(changesJob).toContain('echo "run-tests=$run_tests" >> "$GITHUB_OUTPUT"');
+  });
+
+  test('the workflow fixture bar runs for every pull request', () => {
+    const workflow = readFileSync(
+      resolve(import.meta.dir, '../.github/workflows/test.yml'),
+      'utf8'
+    ).replaceAll('\r\n', '\n');
+    const pullRequestTrigger = workflow.slice(
+      workflow.indexOf('  pull_request:'),
+      workflow.indexOf('\n\nconcurrency:')
+    );
+    const fixtureJob = workflow.slice(
+      workflow.indexOf('  workflow-fixtures:'),
+      workflow.indexOf('  test:')
+    );
+
+    expect(pullRequestTrigger).toBe(
+      "  pull_request:\n    branches: [main, dev]\n\nenv:\n  BUN_VERSION: '1.4.0'"
+    );
+    expect(fixtureJob).toContain("if: github.event_name == 'pull_request'");
+    expect(fixtureJob).toContain('runs-on: ubuntu-latest');
+    expect(fixtureJob).not.toContain('needs:');
+    expect(fixtureJob).not.toContain('changes');
+    expect(fixtureJob).toContain('uses: actions/checkout@v4');
+    expect(fixtureJob).toContain('uses: oven-sh/setup-bun@v2');
+    expect(fixtureJob).toContain('bun-version: ${{ env.BUN_VERSION }}');
+    expect(fixtureJob).toContain('uses: astral-sh/setup-uv@v4');
+    expect(fixtureJob).toContain('run: bun install --frozen-lockfile');
+    expect(fixtureJob).toContain('run: bun run cli workflow test --json');
+  });
+});
+
+describe('diff mode', () => {
+  const trackTempRoot = trackTempRoots();
+
+  const git = (cwd: string, ...args: string[]): void => {
+    const r = Bun.spawnSync(['git', ...args], { cwd, stdout: 'pipe', stderr: 'pipe' });
+    if (r.exitCode !== 0) throw new Error(`git ${args.join(' ')}: ${r.stderr.toString()}`);
+  };
+
+  const commit = (repo: string, file: string, message: string): string => {
+    writeFileSync(join(repo, file), `${message}\n`);
+    git(repo, 'add', file);
+    git(repo, 'commit', '-m', message);
+    return Bun.spawnSync(['git', 'rev-parse', 'HEAD'], { cwd: repo, stdout: 'pipe' })
+      .stdout.toString()
+      .trim();
+  };
+
+  /**
+   * The shape that disabled this filter in production: a docs-only branch whose base moved on.
+   * A two-dot `git diff base head` also reports the base's own new commit and forces the suite;
+   * the merge-base diff reports only what the branch changed.
+   */
+  function docsBranchWithMovedBase(): { repo: string; base: string; head: string } {
+    const repo = trackTempRoot(mkdtempSync(join(tmpdir(), 'run-suite-diff-')));
+    git(repo, 'init', '-q', '-b', 'main');
+    git(repo, 'config', 'user.email', 'test@example.com');
+    git(repo, 'config', 'user.name', 'Test');
+    commit(repo, 'seed.ts', 'seed');
+
+    git(repo, 'checkout', '-q', '-b', 'docs-branch');
+    const head = commit(repo, 'GUIDE.md', 'docs only');
+
+    git(repo, 'checkout', '-q', 'main');
+    const base = commit(repo, 'unrelated.ts', 'landed on the base after the branch point');
+
+    return { repo, base, head };
+  }
+
+  test('a docs-only branch skips even when the base branch moved on', () => {
+    const { repo, base, head } = docsBranchWithMovedBase();
+    // Seen red against the previous two-dot call: it also reported `unrelated.ts`.
+    expect(changedFilesBetween(base, head, repo)).toEqual(['GUIDE.md']);
+    expect(shouldRunTestSuite(changedFilesBetween(base, head, repo))).toBe(false);
+  });
+
+  test('a code change on the branch still runs the suite', () => {
+    const repo = trackTempRoot(mkdtempSync(join(tmpdir(), 'run-suite-diff-')));
+    git(repo, 'init', '-q', '-b', 'main');
+    git(repo, 'config', 'user.email', 'test@example.com');
+    git(repo, 'config', 'user.name', 'Test');
+    const base = commit(repo, 'seed.ts', 'seed');
+    git(repo, 'checkout', '-q', '-b', 'code-branch');
+    const head = commit(repo, 'feature.ts', 'real code');
+
+    expect(shouldRunTestSuite(changedFilesBetween(base, head, repo))).toBe(true);
+  });
+});
+
+describe('inert paths', () => {
+  test.each([
+    '.gitignore',
+    '.gitattributes',
+    'LICENSE',
+    '.env.example',
+    'Caddyfile.example',
+    '.archon/config.example.yaml',
+    'assets/logo.png',
+  ])('skips %s, which no check reads', file => {
+    expect(shouldRunTestSuite([file])).toBe(false);
+  });
+
+  test.each([
+    ['Dockerfile', 'the docker-build job'],
+    ['.dockerignore', 'the docker-build job'],
+    ['.prettierrc', 'format:check'],
+    ['homebrew/archon.rb', 'build:checksums'],
+    ['scripts/install.ps1', 'test:install'],
+    ['.github/workflows/test.yml', 'the gate itself'],
+    ['packages/web/public/favicon.png', 'the web build'],
+  ])('runs for %s, which is read by %s', file => {
+    expect(shouldRunTestSuite([file])).toBe(true);
   });
 });

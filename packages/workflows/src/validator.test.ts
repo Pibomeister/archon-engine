@@ -957,10 +957,10 @@ describe('validateWorkflowResources — tool-name validation', () => {
 });
 
 // =============================================================================
-// validateWorkflowResources — bash double-quote lint
+// validateWorkflowResources — bash quoted-output lint
 // =============================================================================
 
-describe('validateWorkflowResources — bash double-quote lint', () => {
+describe('validateWorkflowResources — bash quoted-output lint', () => {
   test('no warning when bash uses correct unquoted idiom', async () => {
     const workflow = makeWorkflow('test', [
       {
@@ -988,7 +988,7 @@ describe('validateWorkflowResources — bash double-quote lint', () => {
     const warnings = issues.filter(i => i.level === 'warning' && i.field === 'bash');
     expect(warnings).toHaveLength(1);
     expect(warnings[0].nodeId).toBe('check');
-    expect(warnings[0].message).toContain('double-quoting');
+    expect(warnings[0].message).toContain('wrapping');
     expect(warnings[0].hint).toContain('var=$node.output.field');
   });
 
@@ -1006,7 +1006,11 @@ describe('validateWorkflowResources — bash double-quote lint', () => {
     expect(warnings).toHaveLength(1);
   });
 
-  test('script nodes are exempt from the double-quote lint', async () => {
+  test('script nodes are exempt from the quoted-output lint', async () => {
+    // A `bun` script is not shell source, so quoting a ref there is correct TypeScript.
+    // Asserted across every field, not just `bash`: the lint selects fields by the
+    // template walker's `shell` surface, and dropping that filter would report the
+    // `script` slot (and prompts, and conditions) under their own field names.
     const workflow = makeWorkflow('test', [
       {
         id: 'check',
@@ -1016,17 +1020,96 @@ describe('validateWorkflowResources — bash double-quote lint', () => {
       } as unknown as DagNode,
     ]);
     const issues = await validateWorkflowResources(workflow, tmpDir);
-    const warnings = issues.filter(i => i.level === 'warning' && i.field === 'bash');
-    expect(warnings).toHaveLength(0);
+    expect(issues.filter(i => i.message.includes('wrapping'))).toHaveLength(0);
   });
 
-  test('no warning when $nodeId.output is inside single quotes', async () => {
+  test('warning when bash body has single-quoted $nodeId.output.field', async () => {
     const workflow = makeWorkflow('test', [
       {
         id: 'check',
         kind: 'exec',
         runtime: 'sh',
         script: "status='$emit.output.status'",
+      } as DagNode,
+    ]);
+    const issues = await validateWorkflowResources(workflow, tmpDir);
+    const warnings = issues.filter(i => i.level === 'warning' && i.field === 'bash');
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0].message).toContain('wrapping');
+  });
+
+  test('warns on single-quoted output refs in loop and loop_group until_bash', async () => {
+    // until_bash substitutes through the same pre-quoting path, so the single-quoted
+    // form is as wrong there as in a bash body. The loop_group case uses the
+    // $LOOP_PREV grammar, which the lint has to look for separately — a plain
+    // $id.output pattern does not match it.
+    const workflow = makeWorkflow('test', [
+      {
+        id: 'loop-single',
+        prompt: 'produce output',
+        kind: 'loop',
+        loop: {
+          until: 'DONE',
+          until_bash: "status='$emit.output.status'",
+        },
+      } as unknown as DagNode,
+      {
+        id: 'group-single',
+        kind: 'loop_group',
+        loop_group: {
+          until_bash: "status='$LOOP_PREV.probe.output.status'",
+          max_iterations: 2,
+          nodes: [{ id: 'probe', kind: 'exec', runtime: 'sh', script: 'echo pending' }],
+        },
+      } as unknown as DagNode,
+    ]);
+    const issues = await validateWorkflowResources(workflow, tmpDir);
+    const warnings = issues.filter(i => i.level === 'warning');
+    expect(warnings.map(warning => [warning.nodeId, warning.field])).toEqual([
+      ['loop-single', 'loop.until_bash'],
+      ['group-single', 'loop_group.until_bash'],
+    ]);
+  });
+
+  test('no false positive: prose apostrophes and heredoc bodies elsewhere in the script', async () => {
+    // Both bodies are reduced from shipped workflows that a whole-body quote scanner
+    // reported (archon-deliver's flip-ready, t1-fix-issue's open-pr). In `commented`
+    // the apostrophe of "gh's" opens nothing because it is mid-word; in `heredoc` the
+    // `--body "$(cat <<...` double quote stays open to the end of its own line, and
+    // only line-locality stops it from reaching the refs on the lines below. Every
+    // ref in both bodies is correctly unquoted.
+    const workflow = makeWorkflow('test', [
+      {
+        id: 'commented',
+        kind: 'exec',
+        runtime: 'sh',
+        script:
+          '# --repo pins to origin: gh\'s default resolution targets the parent.\nPR_NUMBER=$pr.output.number\necho "$PR_NUMBER"',
+      } as DagNode,
+      {
+        id: 'heredoc',
+        kind: 'exec',
+        runtime: 'sh',
+        script:
+          'gh pr create --title "fix" --body "$(cat <<\'ARCHON_EOF\'\n## Assessment\n$assess.output.reason\nARCHON_EOF\n)"',
+      } as DagNode,
+    ]);
+    const issues = await validateWorkflowResources(workflow, tmpDir);
+    const warnings = issues.filter(i => i.level === 'warning' && i.field === 'bash');
+    expect(warnings).toHaveLength(0);
+  });
+
+  test("no false positive: an unbalanced apostrophe earlier on the ref's own line", async () => {
+    // Line-locality alone does not cover this: the apostrophe is on the SAME line as
+    // the ref and never closes, so only the operand-boundary rule (a quote must open
+    // at line start, after `=`, or after whitespace) keeps `$build.output.score` —
+    // which is correctly unquoted — from being reported.
+    const workflow = makeWorkflow('test', [
+      {
+        id: 'check',
+        kind: 'exec',
+        runtime: 'sh',
+        script: "echo don't; result=$build.output.score",
       } as DagNode,
     ]);
     const issues = await validateWorkflowResources(workflow, tmpDir);
@@ -1043,6 +1126,20 @@ describe('validateWorkflowResources — bash double-quote lint', () => {
         kind: 'exec',
         runtime: 'sh',
         script: 'echo "Build complete."; result=$build.output.score',
+      } as DagNode,
+    ]);
+    const issues = await validateWorkflowResources(workflow, tmpDir);
+    const warnings = issues.filter(i => i.level === 'warning' && i.field === 'bash');
+    expect(warnings).toHaveLength(0);
+  });
+
+  test('no false positive: a prior single-quoted string before an unquoted ref on the same line', async () => {
+    const workflow = makeWorkflow('test', [
+      {
+        id: 'check',
+        kind: 'exec',
+        runtime: 'sh',
+        script: "echo 'Build complete.'; result=$build.output.score",
       } as DagNode,
     ]);
     const issues = await validateWorkflowResources(workflow, tmpDir);
@@ -1067,7 +1164,7 @@ describe('validateWorkflowResources — bash double-quote lint', () => {
     const issues = await validateWorkflowResources(workflow, tmpDir);
     const warnings = issues.filter(i => i.level === 'warning' && i.field === 'loop.until_bash');
     expect(warnings).toHaveLength(1);
-    expect(warnings[0].message).toContain('double-quoting');
+    expect(warnings[0].message).toContain('wrapping');
   });
 
   test('warns on double-quoted output refs in top-level and nested loop_groups', async () => {
@@ -1093,12 +1190,15 @@ describe('validateWorkflowResources — bash double-quote lint', () => {
       } as unknown as DagNode,
     ]);
     const issues = await validateWorkflowResources(workflow, tmpDir);
-    const warnings = issues.filter(
-      i => i.level === 'warning' && i.field === 'loop_group.until_bash'
-    );
-    expect(warnings).toHaveLength(2);
-    expect(warnings.map(warning => warning.nodeId)).toEqual(['outer', 'inner']);
-    expect(warnings.every(warning => warning.message.includes('double-quoting'))).toBe(true);
+    const warnings = issues.filter(i => i.level === 'warning');
+    // Every warning is listed, not just the ones on the expected field: a body node is
+    // reached once through the validator's own flattening, so the lint must not also
+    // walk into loop_group bodies and report `inner` a second time under a nested path.
+    expect(warnings.map(warning => [warning.nodeId, warning.field])).toEqual([
+      ['outer', 'loop_group.until_bash'],
+      ['inner', 'loop_group.until_bash'],
+    ]);
+    expect(warnings.every(warning => warning.message.includes('wrapping'))).toBe(true);
   });
 
   test('does not warn on an unquoted output ref in loop_group until_bash', async () => {
@@ -1385,5 +1485,88 @@ describe('validateWorkflowResources — skills search roots', () => {
     const issues = await validateWorkflowResources(workflow, tmpDir);
 
     expect(missingSkillIssues(issues)).toHaveLength(1);
+  });
+});
+
+// =============================================================================
+// validateWorkflowResources — declared contract compiles (#2453)
+// =============================================================================
+
+describe('validateWorkflowResources — output_format compiles', () => {
+  test('no issue for the inert output_format on a loop_group itself', async () => {
+    // The loader and this pass must agree: a group's own schema governs nothing, so a
+    // dangling $ref there is not a contract failure here either.
+    const workflow = makeWorkflow('test', [
+      {
+        id: 'group',
+        kind: 'loop_group',
+        output_format: { type: 'object', properties: { done: { $ref: '#/$defs/missing' } } },
+        loop_group: {
+          until_bash: 'exit 0',
+          max_iterations: 1,
+          nodes: [{ id: 'work', kind: 'exec', runtime: 'sh', script: 'echo done' }],
+        },
+      } as unknown as DagNode,
+    ]);
+
+    const issues = await validateWorkflowResources(workflow, tmpDir);
+
+    expect(issues.filter(i => i.field === 'output_format')).toHaveLength(0);
+  });
+
+  test('error when a workflow: node declares output_format, naming the child returns: node', async () => {
+    const workflow = makeWorkflow('test', [
+      {
+        id: 'sub',
+        kind: 'workflow',
+        workflow: 'child-workflow',
+        output_format: { type: 'object', properties: { green: { type: 'boolean' } } },
+      } as DagNode,
+    ]);
+
+    const issues = await validateWorkflowResources(workflow, tmpDir);
+    const errors = issues.filter(i => i.field === 'output_format');
+    expect(errors).toHaveLength(1);
+    expect(errors[0].level).toBe('error');
+    expect(errors[0].nodeId).toBe('sub');
+    expect(errors[0].message).toBe(
+      "Node 'sub' declares output_format on a workflow: node; the result contract belongs to the child's returns: node — declare it there"
+    );
+  });
+
+  test('error when a declared output_format cannot be compiled', async () => {
+    const workflow = makeWorkflow('test', [
+      {
+        id: 'plan',
+        kind: 'agent',
+        source: { kind: 'inline', prompt: 'emit the plan result' },
+        output_format: { type: 'object', properties: { ready: { $ref: '#/$defs/missing' } } },
+      } as DagNode,
+    ]);
+
+    const issues = await validateWorkflowResources(workflow, tmpDir);
+    const errors = issues.filter(i => i.field === 'output_format');
+    expect(errors).toHaveLength(1);
+    expect(errors[0].level).toBe('error');
+    expect(errors[0].nodeId).toBe('plan');
+    expect(errors[0].message).toContain('cannot be compiled');
+  });
+
+  test('no issue for a compilable schema', async () => {
+    const workflow = makeWorkflow('test', [
+      {
+        id: 'plan',
+        kind: 'agent',
+        source: { kind: 'inline', prompt: 'emit the plan result' },
+        output_format: {
+          type: 'object',
+          properties: { ready: { type: 'boolean' } },
+          required: ['ready'],
+        },
+      } as DagNode,
+    ]);
+
+    const issues = await validateWorkflowResources(workflow, tmpDir);
+    expect(issues.filter(i => i.field === 'output_format')).toHaveLength(0);
   });
 });

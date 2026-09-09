@@ -67,7 +67,7 @@ describe('a binary freezes its embedded bundled source', () => {
     });
 
     const onDisk = await readFile(
-      join(capture.captureRoot, 'bundled', 'commands', 'defaults', 'archon-assist.md'),
+      join(capture.anchor.root, 'bundled', 'commands', 'defaults', 'archon-assist.md'),
       'utf-8'
     );
     expect(onDisk.length).toBeGreaterThan(0);
@@ -79,7 +79,7 @@ describe('a binary freezes its embedded bundled source', () => {
       target,
       'archon-assist',
       undefined,
-      capturedSourceRoots(capture.captureRoot, capture.manifest.source_config)
+      capturedSourceRoots(capture.anchor)
     );
     expect(result.success).toBe(true);
   });
@@ -90,7 +90,7 @@ describe('a binary freezes its embedded bundled source', () => {
       captureRoot: join(root, 'capture'),
     });
 
-    const roots = capturedSourceRoots(capture.captureRoot, capture.manifest.source_config);
+    const roots = capturedSourceRoots(capture.anchor);
     const yaml = await readFile(
       join(roots.bundledWorkflows, 'defaults', 'archon-assist.yaml'),
       'utf-8'
@@ -106,7 +106,7 @@ describe('a binary freezes its embedded bundled source', () => {
 
     // No bundled scripts ship today, so the assertion is about WHERE it looked: a captured
     // run must not fall back to the embedded-constant path.
-    const roots = capturedSourceRoots(capture.captureRoot, capture.manifest.source_config);
+    const roots = capturedSourceRoots(capture.anchor);
     expect(roots.kind).toBe('captured');
     await expect(discoverScriptsForCwd(target, roots)).resolves.toBeInstanceOf(Map);
   });
@@ -118,17 +118,17 @@ describe('a binary freezes its embedded bundled source', () => {
     });
 
     // Verifies end to end — this is what replaced refusing the resume outright.
-    const loaded = await loadWorkflowSource(capture.captureRoot, capture.manifest.digest);
+    const loaded = await loadWorkflowSource(capture.anchor.root, capture.manifest.digest);
     expect(loaded.manifest.digest).toBe(capture.manifest.digest);
 
     // And a bundled byte changing IS caught, rather than being invisible.
     const { writeFile } = await import('fs/promises');
     await writeFile(
-      join(capture.captureRoot, 'bundled', 'commands', 'defaults', 'archon-assist.md'),
+      join(capture.anchor.root, 'bundled', 'commands', 'defaults', 'archon-assist.md'),
       'swapped by a different Archon build'
     );
     await expect(
-      loadWorkflowSource(capture.captureRoot, capture.manifest.digest)
+      loadWorkflowSource(capture.anchor.root, capture.manifest.digest)
     ).rejects.toThrow();
   });
 });
