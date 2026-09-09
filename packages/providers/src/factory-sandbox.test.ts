@@ -9,7 +9,13 @@ import {
   factoryCodexConfigOverrides,
 } from './factory-sandbox';
 
-describe('trusted factory provider writable scope', () => {
+// `validateFactoryProviderScope` qualifies darwin and linux only — anywhere else it
+// throws `factory_provider_platform_unqualified` before a scope is ever built. These
+// tests drive that code, so gate them to the platforms it actually supports rather
+// than asserting behaviour the implementation refuses to have.
+const factorySandboxQualified = process.platform === 'darwin' || process.platform === 'linux';
+
+describe.skipIf(!factorySandboxQualified)('trusted factory provider writable scope', () => {
   test.skipIf(process.platform !== 'darwin')(
     'rejects native always-writable temporary protected roots before execution',
     async () => {
