@@ -1,5 +1,8 @@
 # Manage-Run Command Reference
 
+Approval and rejection commands below are **human-only operator reference**, not
+agent capabilities. Agents must not invoke them or write approval state.
+
 Every command runs through the `archon` CLI and is scoped to the current project by
 the working directory. Add `--json` for a single clean JSON object on stdout (logs
 are suppressed in `--json` mode); omit it for human-readable text. Diagnostics go to
@@ -80,7 +83,7 @@ return — they do NOT execute the workflow inline** (execution streams output t
 corrupt the JSON). The error path always returns `{ "ok": false, "runId": …, "error": … }`
 instead of throwing, so a parser always gets one JSON line.
 
-### `archon workflow approve <run-id> [comment] [--json]`
+### Human-only: `archon workflow approve <run-id> [comment] [--json]`
 Approve a paused gate (approval node or interactive loop).
 ```json
 { "ok": true, "runId": "…", "action": "approve",
@@ -95,8 +98,10 @@ the completion — the node finalizes from its computed output on resume (no re-
 A comment runs another iteration with it as `$LOOP_USER_INPUT`. On a non-signaled gate,
 both forms iterate.
 
-### `archon workflow reject <run-id> [reason] [--json]`
-Reject a paused gate. `cancelled: false` means an `on_reject` rework pass is queued
+### Human-only: `archon workflow reject <run-id> [reason] [--json]`
+Reject a paused gate. Guarded/container runs cancel on ordinary plan rejection and require
+a fresh guarded run with renewed review and approval; frozen checks are never reworked
+in the same run. For legacy non-guarded runs, `cancelled: false` means an `on_reject` rework pass is queued
 (run is resumable); `cancelled: true` ends the run.
 ```json
 { "ok": true, "runId": "…", "action": "reject", "cancelled": false,
@@ -122,7 +127,7 @@ Re-run a failed/paused run, skipping completed nodes.
 
 ---
 
-## Continuation model (paused → done)
+## Human operator continuation (paused → done)
 
 ```bash
 archon workflow approve <run-id> "ship it" --json   # 1. record decision (fast, parseable)

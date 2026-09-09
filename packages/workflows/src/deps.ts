@@ -19,6 +19,8 @@ import type {
   ProviderCapabilities,
 } from '@archon/providers/types';
 import type { RawAliasesConfig, RawTiersConfig } from './model-validation';
+import type { ControllerActionGrant, ControllerActionHandlers } from './controller-actions';
+import type { WorkflowBudgetGrant } from './budget';
 
 // Re-export provider types so existing workflow engine consumers don't break
 export type {
@@ -184,4 +186,23 @@ export interface WorkflowDeps {
     aliases?: RawAliasesConfig;
     defaultProvider?: string;
   }>;
+  /**
+   * Controller-private handler bindings for fixed privileged workflow steps.
+   * YAML can select only a fixed enum action; it cannot provide executable code,
+   * credentials, RPC addresses, or callback targets. Missing handlers fail closed.
+   */
+  controllerActions?: ControllerActionHandlers;
+  /**
+   * Controller-private authorization grants for privileged action nodes. The
+   * executor compares run id, workflow identity/digest, node id, fixed action,
+   * and phase before invoking the corresponding handler. Untrusted YAML cannot
+   * create these grants.
+   */
+  controllerActionGrants?: readonly ControllerActionGrant[];
+  /**
+   * Controller-private frozen budget/deadline grants for hardened runs. A hardened
+   * workflow run must match one grant by run id + workflow digest before any AI
+   * work starts, and resumes must match the persisted budget state.
+   */
+  workflowBudgetGrants?: readonly WorkflowBudgetGrant[];
 }

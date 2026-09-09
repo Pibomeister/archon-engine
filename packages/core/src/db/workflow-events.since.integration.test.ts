@@ -27,6 +27,7 @@ const { SqliteAdapter, sqliteDialect } = await import('./adapters/sqlite');
 const db = new SqliteAdapter(':memory:');
 
 mock.module('./connection', () => ({
+  getDatabase: () => db,
   pool: db,
   getDialect: () => sqliteDialect,
   getDatabaseType: () => 'sqlite',

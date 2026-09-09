@@ -34,6 +34,31 @@ import {
 } from './executor-shared';
 
 describe('substituteWorkflowVariables', () => {
+  it('maps container artifacts and state without exposing controller directories', () => {
+    const { prompt } = substituteWorkflowVariables(
+      '$ARTIFACTS_DIR/proof.json $STATE_DIR/status.json',
+      'run-1',
+      '',
+      '/private/controller/run',
+      'main',
+      'docs/',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {
+        stateDir: '/private/controller/state',
+        execContext: {
+          kind: 'container',
+          profile: 'hardened',
+          containerId: 'owned',
+          agentArtifactsDir: '/archon-artifacts',
+        },
+      }
+    );
+    expect(prompt).toBe('/archon-artifacts/run/proof.json /archon-artifacts/state/status.json');
+  });
+
   it('replaces $WORKFLOW_ID with the run ID', () => {
     const { prompt } = substituteWorkflowVariables(
       'Run ID: $WORKFLOW_ID',

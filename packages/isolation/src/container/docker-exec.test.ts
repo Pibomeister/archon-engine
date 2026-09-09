@@ -7,11 +7,12 @@ describe('dockerPreflight', () => {
     const calls: string[][] = [];
     const runner: DockerRunner = async args => {
       calls.push(args);
+      if (args[0] === 'image') return { stdout: 'sha256:runnerid\n', stderr: '' };
       return { stdout: '28.2.2', stderr: '' };
     };
     await dockerPreflight('archon-runner:test', runner);
     expect(calls[0]).toEqual(['version', '--format', '{{.Server.Version}}']);
-    expect(calls[1]).toEqual(['image', 'inspect', 'archon-runner:test']);
+    expect(calls[1]).toEqual(['image', 'inspect', '--format', '{{.Id}}', 'archon-runner:test']);
   });
 
   test('throws a daemon-down error when version fails', async () => {

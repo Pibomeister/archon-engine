@@ -114,6 +114,27 @@ export const workflowEvidencePolicySchema = z.object({
 
 export type WorkflowEvidencePolicy = z.infer<typeof workflowEvidencePolicySchema>;
 
+export const workflowHardenedPolicySchema = z
+  .object({
+    /** Refuse execution unless the caller supplies a container execution context. */
+    required: z.boolean(),
+  })
+  .strict();
+
+export type WorkflowHardenedPolicy = z.infer<typeof workflowHardenedPolicySchema>;
+
+export const workflowBudgetPolicySchema = z
+  .object({
+    /**
+     * Authoring marker only: the concrete deadline/token ceiling is supplied as a
+     * controller-private WorkflowBudgetGrant at dispatch time, never from YAML.
+     */
+    required: z.boolean(),
+  })
+  .strict();
+
+export type WorkflowBudgetPolicy = z.infer<typeof workflowBudgetPolicySchema>;
+
 // ---------------------------------------------------------------------------
 // WorkflowBase — common fields shared by all workflow types
 // ---------------------------------------------------------------------------
@@ -134,6 +155,8 @@ export const workflowBaseSchema = z.object({
   worktree: workflowWorktreePolicySchema.optional(),
   container: workflowContainerPolicySchema.optional(),
   evidence_policy: workflowEvidencePolicySchema.optional(),
+  hardened: workflowHardenedPolicySchema.optional(),
+  budget: workflowBudgetPolicySchema.optional(),
   /**
    * When `false`, the engine skips the path-exclusive lock for this workflow,
    * allowing N concurrent runs on the same live checkout. The author asserts
@@ -224,6 +247,8 @@ export const KNOWN_WORKFLOW_NESTED_KEYS: ReadonlyMap<string, NestedKeySpec> = ne
     'evidence_policy',
     { kind: 'object', keys: new Set(Object.keys(workflowEvidencePolicySchema.shape)) },
   ],
+  ['hardened', { kind: 'object', keys: new Set(Object.keys(workflowHardenedPolicySchema.shape)) }],
+  ['budget', { kind: 'object', keys: new Set(Object.keys(workflowBudgetPolicySchema.shape)) }],
 ]);
 
 // ---------------------------------------------------------------------------

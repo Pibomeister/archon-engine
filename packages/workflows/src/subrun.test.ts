@@ -2526,12 +2526,19 @@ nodes:
     // Concurrency-tracking provider: the in-flight window during the awaited "AI turn"
     // reflects how many children run at once.
     const tracker = { inFlight: 0, max: 0 };
+    let releaseFirstPair: () => void = () => {
+      throw new Error('first-pair barrier not initialized');
+    };
+    const firstPair = new Promise<void>(resolve => {
+      releaseFirstPair = resolve;
+    });
     const slowProvider = {
       ...makeProvider(),
       sendQuery: async function* () {
         tracker.inFlight++;
         tracker.max = Math.max(tracker.max, tracker.inFlight);
-        await new Promise(r => setTimeout(r, 15));
+        if (tracker.inFlight === 2) releaseFirstPair();
+        await firstPair;
         tracker.inFlight--;
         yield { type: 'assistant', content: 'ai-output' };
         yield { type: 'result', sessionId: 'sess', cost: 0.01 };

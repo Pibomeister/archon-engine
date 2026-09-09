@@ -153,7 +153,9 @@ import {
   resolveProjectPaths,
   resolveScopeArtifactsDir,
 } from './executor';
+import { computeControllerWorkflowDigest } from './controller-actions';
 import { keepAwake } from './utils/keep-awake';
+import { WORKFLOW_PIN_METADATA_KEY, buildWorkflowPinState } from './workflow-pinning';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
 import type { IWorkflowStore } from './store';
 import type { WorkflowDefinition, WorkflowRun } from './schemas';
@@ -252,16 +254,21 @@ describe('executeWorkflow', () => {
     it('fails a container run resumed without a container context, pointing at the CLI', async () => {
       const failSpy = mock(async () => {});
       const store = makeStore({ failWorkflowRun: failSpy });
+      const workflow = makeWorkflow();
       const preCreatedRun = makeRun({
         id: 'crun',
-        metadata: { isolation: 'container', isolation_env_id: 'env-x' },
+        metadata: {
+          isolation: 'container',
+          isolation_env_id: 'env-x',
+          [WORKFLOW_PIN_METADATA_KEY]: buildWorkflowPinState(workflow, undefined),
+        },
       });
       const result = await executeWorkflow(
         makeDeps(store),
         makePlatform(),
         'conv-1',
         '/tmp/ops',
-        makeWorkflow(),
+        workflow,
         'msg',
         'db-conv-1',
         { preCreatedRun, priorCompletedNodes: new Map([['node1', 'out']]) }
@@ -274,9 +281,14 @@ describe('executeWorkflow', () => {
     });
 
     it('proceeds when the container context IS provided (guard passes)', async () => {
+      const workflow = makeWorkflow();
       const preCreatedRun = makeRun({
         id: 'crun2',
-        metadata: { isolation: 'container', isolation_env_id: 'env-x' },
+        metadata: {
+          isolation: 'container',
+          isolation_env_id: 'env-x',
+          [WORKFLOW_PIN_METADATA_KEY]: buildWorkflowPinState(workflow, undefined),
+        },
       });
       const backend = {
         suspend: mock(async () => {}),
@@ -289,14 +301,14 @@ describe('executeWorkflow', () => {
         makePlatform(),
         'conv-1',
         '/tmp/ops',
-        makeWorkflow(),
+        workflow,
         'msg',
         'db-conv-1',
         {
           preCreatedRun,
           priorCompletedNodes: new Map([['node1', 'out']]),
           priorTokenUsage: { input: 40, output: 4 },
-          execContext: { kind: 'container', containerId: 'cid' },
+          execContext: { kind: 'container', profile: 'hardened', containerId: 'cid' },
           container: { envId: 'env-x', writeBack: 'approve', backend },
         }
       );
@@ -304,6 +316,234 @@ describe('executeWorkflow', () => {
       expect(mockExecuteDagWorkflow).toHaveBeenCalledTimes(1);
       expect(mockExecuteDagWorkflow.mock.calls[0]?.[24]).toEqual({ input: 40, output: 4 });
       expect(result.success).toBe(true);
+    });
+  });
+
+  describe('hardened workflow pinning', () => {
+    it('records the canonical workflow pin in run metadata before DAG execution', async () => {
+      const store = makeStore();
+      const workflow = makeWorkflow({
+        hardened: { required: true },
+        nodes: [{ id: 'node1', prompt: 'Do something', depends_on: undefined }],
+      });
+
+      await executeWorkflow(
+        makeDeps(store),
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        workflow,
+        'test message',
+        'db-conv-1',
+        {
+          source: 'project',
+          execContext: { kind: 'container', profile: 'hardened', containerId: 'container-1' },
+        }
+      );
+
+      const createArg = (store.createWorkflowRun as ReturnType<typeof mock>).mock.calls[0]?.[0] as
+        | { metadata?: Record<string, unknown> }
+        | undefined;
+      expect(createArg?.metadata?.[WORKFLOW_PIN_METADATA_KEY]).toEqual({
+        workflowName: 'test-workflow',
+        workflowDigest: computeControllerWorkflowDigest(workflow),
+        hardenedRequired: true,
+        containerRequired: false,
+        sourceIdentity: { source: 'project' },
+      });
+      expect(mockExecuteDagWorkflow).toHaveBeenCalledTimes(1);
+    });
+
+    it('allows a resumed hardened run when the persisted pin still matches', async () => {
+      const workflow = makeWorkflow({ hardened: { required: true } });
+      const resumed = makeRun({
+        id: 'pinned-run',
+        metadata: { [WORKFLOW_PIN_METADATA_KEY]: buildWorkflowPinState(workflow, 'bundled') },
+      });
+      const store = makeStore();
+
+      const result = await executeWorkflow(
+        makeDeps(store),
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        workflow,
+        'test message',
+        'db-conv-1',
+        {
+          preCreatedRun: resumed,
+          priorCompletedNodes: new Map([['node0', 'already done']]),
+          source: 'bundled',
+          execContext: { kind: 'container', profile: 'hardened', containerId: 'container-1' },
+        }
+      );
+
+      expect(result.success).toBe(true);
+      expect(store.createWorkflowRun).not.toHaveBeenCalled();
+      expect(mockExecuteDagWorkflow).toHaveBeenCalledTimes(1);
+    });
+
+    it('rejects a resumed hardened run when the workflow definition changed', async () => {
+      const original = makeWorkflow({ hardened: { required: true } });
+      const changed = makeWorkflow({
+        hardened: { required: true },
+        nodes: [{ id: 'node1', prompt: 'Changed prompt' }],
+      });
+      const failSpy = mock(async () => {});
+      const store = makeStore({ failWorkflowRun: failSpy });
+      const preCreatedRun = makeRun({
+        id: 'changed-run',
+        metadata: { [WORKFLOW_PIN_METADATA_KEY]: buildWorkflowPinState(original, 'project') },
+      });
+      const deps = makeDeps(store);
+
+      const result = await executeWorkflow(
+        deps,
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        changed,
+        'test message',
+        'db-conv-1',
+        {
+          preCreatedRun,
+          priorCompletedNodes: new Map(),
+          source: 'project',
+          execContext: { kind: 'container', profile: 'hardened', containerId: 'container-1' },
+        }
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('pin does not match the loaded workflow definition');
+      expect(failSpy).toHaveBeenCalledWith(
+        'changed-run',
+        expect.stringContaining('pin does not match the loaded workflow definition')
+      );
+      expect(deps.loadConfig).not.toHaveBeenCalled();
+      expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
+    });
+
+    it('rejects a resumed hardened run when the workflow source changes', async () => {
+      const workflow = makeWorkflow({ hardened: { required: true } });
+      const store = makeStore();
+      const deps = makeDeps(store);
+      const result = await executeWorkflow(
+        deps,
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        workflow,
+        'test message',
+        'db-conv-1',
+        {
+          preCreatedRun: makeRun({
+            id: 'source-run',
+            metadata: { [WORKFLOW_PIN_METADATA_KEY]: buildWorkflowPinState(workflow, 'bundled') },
+          }),
+          priorCompletedNodes: new Map(),
+          source: 'project',
+          execContext: { kind: 'container', profile: 'hardened', containerId: 'container-1' },
+        }
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('pin does not match workflow source identity');
+      expect(deps.loadConfig).not.toHaveBeenCalled();
+      expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
+    });
+
+    it('rejects a resumed hardened run when the hardened flag was removed', async () => {
+      const original = makeWorkflow({ hardened: { required: true } });
+      const changed = makeWorkflow();
+      const store = makeStore();
+
+      const result = await executeWorkflow(
+        makeDeps(store),
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        changed,
+        'test message',
+        'db-conv-1',
+        {
+          preCreatedRun: makeRun({
+            id: 'downgrade-run',
+            metadata: { [WORKFLOW_PIN_METADATA_KEY]: buildWorkflowPinState(original, undefined) },
+          }),
+          priorCompletedNodes: new Map(),
+          execContext: { kind: 'container', profile: 'hardened', containerId: 'container-1' },
+        }
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('pin does not match the loaded workflow definition');
+      expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
+    });
+
+    it('refuses an old unpinned hardened run instead of reconstructing state', async () => {
+      const store = makeStore();
+      const deps = makeDeps(store);
+
+      const result = await executeWorkflow(
+        deps,
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow({ hardened: { required: true } }),
+        'test message',
+        'db-conv-1',
+        {
+          preCreatedRun: makeRun({ id: 'legacy-run', metadata: {} }),
+          priorCompletedNodes: new Map(),
+          execContext: { kind: 'container', profile: 'hardened', containerId: 'container-1' },
+        }
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('pin state is missing or malformed');
+      expect(deps.loadConfig).not.toHaveBeenCalled();
+      expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
+    });
+
+    it('refuses malformed pinned state without repairing it from current artifacts', async () => {
+      const store = makeStore();
+      const deps = makeDeps(store);
+
+      const result = await executeWorkflow(
+        deps,
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow({ hardened: { required: true } }),
+        'test message',
+        'db-conv-1',
+        {
+          preCreatedRun: makeRun({
+            id: 'malformed-run',
+            metadata: { [WORKFLOW_PIN_METADATA_KEY]: { workflowName: 'test-workflow' } },
+          }),
+          priorCompletedNodes: new Map(),
+          execContext: { kind: 'container', profile: 'hardened', containerId: 'container-1' },
+        }
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('pin state is malformed');
+      expect(deps.loadConfig).not.toHaveBeenCalled();
+      expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
+    });
+
+    it('does not change workflow digests after undefined optional fields are JSON-persisted', () => {
+      const workflowWithUndefined = makeWorkflow({
+        hardened: { required: true },
+        provider: undefined,
+        nodes: [{ id: 'node1', prompt: 'Do something', depends_on: undefined }],
+      });
+      const jsonPersisted = JSON.parse(JSON.stringify(workflowWithUndefined));
+
+      expect(computeControllerWorkflowDigest(workflowWithUndefined)).toBe(
+        computeControllerWorkflowDigest(jsonPersisted)
+      );
     });
   });
 
@@ -789,7 +1029,7 @@ describe('executeWorkflow', () => {
         'container input',
         'db-conv-1',
         {
-          execContext: { kind: 'container', containerId: 'container-1' },
+          execContext: { kind: 'container', profile: 'hardened', containerId: 'container-1' },
           isolationContext: { branchName: 'feature/snapshot' },
         }
       );
@@ -1376,6 +1616,48 @@ describe('executeWorkflow', () => {
       // The config passed to executeDagWorkflow (arg index 12) should have merged envVars
       const configArg = mockExecuteDagWorkflow.mock.calls[0]?.[13] as WorkflowConfig | undefined;
       expect(configArg?.envVars).toEqual({ FILE_KEY: 'file_val', DB_KEY: 'db_val' });
+    });
+
+    it('never delivers host, project, database, or GitHub secrets into hardened containers', async () => {
+      const store = makeStore({
+        getCodebaseEnvVars: mock(async () => ({ DATABASE_URL: 'controller-db-secret' })),
+      });
+      const deps: WorkflowDeps = {
+        ...makeDeps(store),
+        isPerUserGitHubEnabled: () => true,
+        getUserGithubToken: mock(async () => 'controller-github-secret'),
+        isPerUserProviderKeysEnabled: () => true,
+        getUserProviderEnv: mock(async () => ({
+          env: { OTHER_PROVIDER_KEY: 'cross-provider-secret' },
+          files: [],
+        })),
+      };
+      (deps.loadConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+        assistant: 'claude',
+        assistants: { claude: {}, codex: {} },
+        baseBranch: '',
+        commands: { folder: '' },
+        envVars: { CONTROLLER_KEY: 'private-key' },
+      });
+      await executeWorkflow(
+        deps,
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow({ hardened: { required: true } }),
+        'message',
+        'db-conv-1',
+        {
+          codebaseId: 'codebase-1',
+          userId: 'user-1',
+          execContext: { kind: 'container', profile: 'hardened', containerId: 'owned-container' },
+        }
+      );
+      const configArg = mockExecuteDagWorkflow.mock.calls[0]?.[13] as WorkflowConfig | undefined;
+      expect(configArg?.envVars).toEqual({});
+      expect(store.getCodebaseEnvVars).not.toHaveBeenCalled();
+      expect(deps.getUserGithubToken).not.toHaveBeenCalled();
+      expect(deps.getUserProviderEnv).not.toHaveBeenCalled();
     });
 
     it('does not call getCodebaseEnvVars when no codebaseId', async () => {

@@ -398,6 +398,7 @@ describe('approveWorkflow', () => {
   test('refuses a child_workflow-blocked parent — redirects to the child run, writes nothing', async () => {
     const run = makePausedRun({
       metadata: {
+        isolation: 'container',
         approval: {
           nodeId: 'implement-qa',
           message: 'Blocked on sub-run',
@@ -475,6 +476,87 @@ describe('rejectWorkflow', () => {
 
     expect(mockCaptureApprovalResolved).toHaveBeenCalledTimes(1);
     expect(mockCaptureApprovalResolved).toHaveBeenCalledWith({ resolution: 'rejected' });
+  });
+
+  for (const securityMetadata of [
+    { isolation: 'container' },
+    { hardened_controller_policy: {} },
+    { hardened_controller_policy: null },
+    { hardened_workflow_pin: {} },
+    { hardened_workflow_pin: null },
+  ]) {
+    test(`guarded rejection cancels instead of reusing frozen approval: ${JSON.stringify(securityMetadata)}`, async () => {
+      mockGetWorkflowRun.mockResolvedValueOnce(
+        makePausedRun({
+          metadata: {
+            ...securityMetadata,
+            approval: {
+              nodeId: 'review',
+              message: 'Review',
+              type: 'approval',
+              onRejectPrompt: 'Rewrite the frozen plan',
+              onRejectMaxAttempts: 3,
+            },
+            rejection_count: 0,
+          },
+        })
+      );
+
+      const result = await rejectWorkflow('run-1', 'change the acceptance checks');
+
+      expect(result.cancelled).toBe(true);
+      expect(result.maxAttemptsReached).toBe(false);
+      expect(mockResolveApprovalGate).not.toHaveBeenCalled();
+      expect(mockResolveAndCancelApprovalGate).toHaveBeenCalledWith('run-1', [
+        {
+          event_type: 'approval_received',
+          step_name: 'review',
+          data: {
+            decision: 'rejected',
+            reason: 'change the acceptance checks',
+            fresh_guarded_run_required: true,
+          },
+        },
+      ]);
+    });
+  }
+
+  test('guarded terminal rejection does not stage rework when cancellation CAS loses', async () => {
+    mockGetWorkflowRun.mockResolvedValueOnce(
+      makePausedRun({
+        metadata: {
+          isolation: 'container',
+          approval: {
+            nodeId: 'review',
+            message: 'Review',
+            onRejectPrompt: 'Rewrite',
+          },
+        },
+      })
+    );
+    mockResolveAndCancelApprovalGate.mockResolvedValueOnce({ resolved: false });
+    await expect(rejectWorkflow('run-1', 'no')).rejects.toThrow('already resolved');
+    expect(mockResolveApprovalGate).not.toHaveBeenCalled();
+    expect(mockCaptureApprovalResolved).not.toHaveBeenCalled();
+  });
+
+  test('guarded cancellation transaction failure propagates without staging rework or telemetry', async () => {
+    mockGetWorkflowRun.mockResolvedValueOnce(
+      makePausedRun({
+        metadata: {
+          isolation: 'container',
+          approval: {
+            nodeId: 'review',
+            message: 'Review',
+            onRejectPrompt: 'Rewrite',
+          },
+        },
+      })
+    );
+    mockResolveAndCancelApprovalGate.mockRejectedValueOnce(new Error('event transaction failed'));
+    await expect(rejectWorkflow('run-1', 'no')).rejects.toThrow('event transaction failed');
+    expect(mockResolveApprovalGate).not.toHaveBeenCalled();
+    expect(mockCaptureApprovalResolved).not.toHaveBeenCalled();
   });
 
   test('throws on already-resolved gate (double-reject guard)', async () => {
@@ -592,6 +674,7 @@ describe('rejectWorkflow', () => {
   test('rejects container write-back gate — stays resumable (never cancels), writeBack flag set', async () => {
     const run = makePausedRun({
       metadata: {
+        isolation: 'container',
         approval: { nodeId: '__writeback__', message: '3 files changed', type: 'writeback' },
       },
     });
@@ -635,6 +718,7 @@ describe('rejectWorkflow', () => {
   test('refuses a child_workflow-blocked parent — redirects to the child run, cancels nothing', async () => {
     const run = makePausedRun({
       metadata: {
+        isolation: 'container',
         approval: {
           nodeId: 'implement-qa',
           message: 'Blocked on sub-run',
@@ -687,6 +771,18 @@ describe('resumeWorkflow', () => {
 
     const run = await resumeWorkflow('run-1');
     expect(run.id).toBe('run-1');
+  });
+
+  test('cannot resume a rejected guarded run', async () => {
+    mockGetWorkflowRun.mockResolvedValueOnce(
+      makePausedRun({
+        status: 'cancelled',
+        metadata: { isolation: 'container' },
+      })
+    );
+    await expect(resumeWorkflow('run-1')).rejects.toThrow(
+      "Cannot resume run with status 'cancelled'"
+    );
   });
 
   test('throws on non-resumable status', async () => {

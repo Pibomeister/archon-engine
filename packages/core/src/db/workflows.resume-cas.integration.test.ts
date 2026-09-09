@@ -50,6 +50,7 @@ const {
   releaseWritebackClaim,
   WorkflowNotResumableError,
 } = await import('./workflows');
+const { createControllerCompletionEvent } = await import('./workflow-events');
 const { approveWorkflow, rejectWorkflow } = await import('../operations/workflow-operations');
 
 // workflow_runs.conversation_id is NOT NULL with an enforced FK — seed a parent.
@@ -214,6 +215,56 @@ describe('claimWriteback — real SQLite CAS', () => {
     await releaseWritebackClaim('wb-release');
     // Released → the retrying resume can re-claim.
     expect((await claimWriteback('wb-release')).claimed).toBe(true);
+  });
+});
+
+describe('createControllerCompletionEvent — real SQLite transaction', () => {
+  const event = {
+    workflow_run_id: 'controller-complete',
+    event_type: 'node_completed',
+    step_name: 'controller',
+    data: { type: 'controller_action', action: 'publish' },
+  };
+
+  test('inserts only while the run is running', async () => {
+    await seed('controller-complete', 'running', "datetime('now')");
+
+    await createControllerCompletionEvent(event, Date.now() + 10_000);
+
+    expect(await countEvents('controller-complete', 'node_completed')).toBe(1);
+  });
+
+  test('writes no completion event for a cancelled run', async () => {
+    await seed('controller-cancelled', 'cancelled', "datetime('now')");
+
+    await expect(
+      createControllerCompletionEvent(
+        { ...event, workflow_run_id: 'controller-cancelled' },
+        Date.now() + 10_000
+      )
+    ).rejects.toThrow('requires a running workflow run');
+
+    expect(await countEvents('controller-cancelled', 'node_completed')).toBe(0);
+  });
+
+  test('rolls back the event when the deadline expires after insertion', async () => {
+    await seed('controller-deadline', 'running', "datetime('now')");
+    const originalNow = Date.now;
+    let checks = 0;
+    Date.now = () => {
+      checks += 1;
+      return checks === 1 ? 1_000 : 3_000;
+    };
+
+    try {
+      await expect(
+        createControllerCompletionEvent({ ...event, workflow_run_id: 'controller-deadline' }, 2_000)
+      ).rejects.toThrow('deadline expired');
+    } finally {
+      Date.now = originalNow;
+    }
+
+    expect(await countEvents('controller-deadline', 'node_completed')).toBe(0);
   });
 });
 

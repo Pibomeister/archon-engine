@@ -9,6 +9,7 @@ import { existsSync, writeFileSync } from 'fs';
 import { readFile } from 'fs/promises';
 import { isAbsolute, join as joinPath, resolve as resolvePath } from 'path';
 import { execFileAsync, resolveBashPath } from '@archon/git';
+import { assertNoGuardedApprovalRework } from './workflow-pinning';
 import { discoverScriptsForCwd } from './script-discovery';
 import { discoverWorkflowsWithConfig } from './workflow-discovery';
 import { resolveWorkflowName } from './router';
@@ -28,8 +29,12 @@ import type {
   OverlayChangeSummary,
 } from '@archon/providers/types';
 import { CONTAINER_ENV_DENYLIST } from '@archon/providers/types';
-import type { ContainerRunContext } from './container-context';
-import { WRITEBACK_GATE_NODE_ID } from './container-context';
+import type { ContainerRunContext, VerifiedProxyBudgetStatus } from './container-context';
+import {
+  WRITEBACK_GATE_NODE_ID,
+  snapshotDrainedContainerArtifacts,
+  runGuardedContainerSubprocess,
+} from './container-context';
 import {
   getProviderCapabilities,
   getRegisteredProviders,
@@ -58,6 +63,8 @@ import type {
   LoopGateRunMetadata,
   ApprovalContext,
   WorkflowEvidencePolicy,
+  WorkflowHardenedPolicy,
+  ControllerActionNode,
 } from './schemas';
 import {
   isBashNode,
@@ -65,6 +72,7 @@ import {
   isLoopGroupNode,
   isApprovalNode,
   isCancelNode,
+  isControllerActionNode,
   isScriptNode,
   isIncludeNode,
   isWorkflowNode,
@@ -72,6 +80,13 @@ import {
   readSubrunMetadata,
   isApprovalContext,
 } from './schemas';
+import {
+  computeControllerWorkflowDigest,
+  isControllerActionManifestSealed,
+  normalizeControllerActionOutput,
+  sealControllerActionManifest,
+} from './controller-actions';
+import type { ControllerActionGrant } from './controller-actions';
 import { formatToolCall } from './utils/tool-formatter';
 import { createLogger, captureWorkflowCompleted } from '@archon/paths';
 import type { WorkflowErrorClass, WorkflowNodeType } from '@archon/paths';
@@ -103,6 +118,7 @@ import {
   detectCreditExhaustion,
   loadCommandPrompt,
   substituteWorkflowVariables,
+  resolveAgentOutputPaths,
   buildPromptWithContext,
   detectCompletionSignal,
   stripCompletionTags,
@@ -120,6 +136,15 @@ import {
   type ResolvedAiProfile,
   type TierName,
 } from './model-validation';
+import {
+  WORKFLOW_BUDGET_METADATA_KEY,
+  assertWorkflowBudgetCanContinue,
+  nextWorkflowBudgetState,
+  resolveWorkflowBudget,
+  unknownWorkflowBudgetState,
+  type ActiveWorkflowBudget,
+  type WorkflowBudgetState,
+} from './budget';
 
 /**
  * Closed-set node type for telemetry — mirrors the DagNode discriminators.
@@ -134,6 +159,7 @@ function dagNodeTelemetryType(node: DagNode): WorkflowNodeType {
   if (isLoopGroupNode(node)) return 'loop_group';
   if (isApprovalNode(node)) return 'approval';
   if (isCancelNode(node)) return 'cancel';
+  if (isControllerActionNode(node)) return 'controller_action';
   if ('command' in node) return 'command';
   return 'prompt';
 }
@@ -336,6 +362,17 @@ type NodeExecutionResult = NodeOutput & {
   /** Loop nodes only: number of iterations executed. */
   loopIterations?: number;
 };
+
+type BudgetPassCheckpoint = (
+  accumulatedPassOutput: NodeExecutionResult,
+  rawPassOutput: NodeExecutionResult
+) => Promise<void>;
+
+interface PriorAttemptUsage {
+  tokens?: TokenUsage;
+  tokensUnknown: boolean;
+  costUsd?: number;
+}
 
 // ---------------------------------------------------------------------------
 // workflow: (sub-run) node — cross-run composition (#2121 Phase 2)
@@ -615,6 +652,222 @@ function shouldRetryNodeFailure(
   return { shouldRetry, isTransient };
 }
 
+function nodeTotalTimeoutMs(node: DagNode): number | undefined {
+  const timeout = (node as { timeout?: unknown }).timeout;
+  return typeof timeout === 'number' && Number.isFinite(timeout) && timeout > 0
+    ? timeout
+    : undefined;
+}
+
+function remainingDeadlineMs(deadlineAt: number | undefined): number | undefined {
+  if (deadlineAt === undefined) return undefined;
+  return Math.max(0, deadlineAt - Date.now());
+}
+
+function earlierDeadline(a: number | undefined, b: number | undefined): number | undefined {
+  if (a === undefined) return b;
+  if (b === undefined) return a;
+  return Math.min(a, b);
+}
+
+const workflowBudgetPersistQueues = new Map<string, Promise<void>>();
+
+async function persistWorkflowBudgetState(
+  deps: WorkflowDeps,
+  workflowRunId: string,
+  budget: ActiveWorkflowBudget | undefined,
+  consumed: { input: number; output: number },
+  options: { unknownConsumption?: boolean } = {}
+): Promise<void> {
+  if (!budget) return;
+  const prior = workflowBudgetPersistQueues.get(workflowRunId) ?? Promise.resolve();
+  const write = prior
+    .catch(() => undefined)
+    .then(async () => {
+      const monotonicConsumed = {
+        input: Math.max(budget.state.consumed.input, consumed.input),
+        output: Math.max(budget.state.consumed.output, consumed.output),
+      };
+      const state =
+        options.unknownConsumption === true
+          ? unknownWorkflowBudgetState(budget, monotonicConsumed)
+          : nextWorkflowBudgetState(budget, monotonicConsumed);
+      await deps.store.updateWorkflowRun(workflowRunId, {
+        metadata: { [WORKFLOW_BUDGET_METADATA_KEY]: state },
+      });
+      budget.state = state;
+    });
+  workflowBudgetPersistQueues.set(workflowRunId, write);
+  try {
+    await write;
+  } finally {
+    if (workflowBudgetPersistQueues.get(workflowRunId) === write) {
+      workflowBudgetPersistQueues.delete(workflowRunId);
+    }
+  }
+}
+
+async function checkpointHardenedAiAttempt(
+  deps: WorkflowDeps,
+  workflowRunId: string,
+  budget: ActiveWorkflowBudget | undefined,
+  containerCtx: ContainerRunContext | undefined,
+  label: string,
+  _baseUsage: { input: number; output: number },
+  _completedUsage: { input: number; output: number },
+  _accumulatedAttempt: { tokens?: TokenUsage },
+  _rawAttempt: { tokens?: TokenUsage }
+): Promise<void> {
+  if (!budget) return;
+  const ledgerStatus = await readRequiredVerifiedHardenedBudgetStatus(containerCtx);
+  assertLedgerStatusMatchesBudget(ledgerStatus, budget);
+  await persistWorkflowBudgetState(deps, workflowRunId, budget, ledgerStatus.consumed);
+  assertWorkflowBudgetCanContinue(budget, label, ledgerStatus.consumed);
+}
+
+function hasUnknownPersistedBudgetState(workflowRun: WorkflowRun): boolean {
+  const value = workflowRun.metadata?.[WORKFLOW_BUDGET_METADATA_KEY];
+  return (
+    !!value &&
+    typeof value === 'object' &&
+    (value as WorkflowBudgetState).unknownConsumption === true
+  );
+}
+
+async function readVerifiedHardenedBudgetStatus(
+  containerCtx: ContainerRunContext | undefined
+): Promise<VerifiedProxyBudgetStatus | undefined> {
+  if (!containerCtx?.proxyBudgetSeedDigest) return undefined;
+  return readRequiredVerifiedHardenedBudgetStatus(containerCtx);
+}
+
+async function readRequiredVerifiedHardenedBudgetStatus(
+  containerCtx: ContainerRunContext | undefined
+): Promise<VerifiedProxyBudgetStatus> {
+  if (!containerCtx?.proxyBudgetSeedDigest) {
+    throw new Error('Hardened workflow budget proxy ledger binding is incomplete.');
+  }
+  const binding = readProxyBudgetBinding(containerCtx);
+  if (!containerCtx.backend.readProxyBudgetStatus) {
+    throw new Error('Hardened workflow budget requires controller proxy ledger status.');
+  }
+  const status = await containerCtx.backend.readProxyBudgetStatus(containerCtx.envId, binding);
+  assertVerifiedProxyBudgetStatus(status, containerCtx.envId, binding.proxyBudgetSeedDigest);
+  return status;
+}
+
+function readProxyBudgetBinding(containerCtx: ContainerRunContext): {
+  egressPolicyB64: string;
+  image: string;
+  ownerRunId: string;
+  proxyBudgetSeedDigest: string;
+} {
+  if (
+    !containerCtx.egressPolicyB64 ||
+    !containerCtx.image ||
+    !containerCtx.ownerRunId ||
+    !containerCtx.proxyBudgetSeedDigest
+  ) {
+    throw new Error('Hardened workflow budget proxy ledger binding is incomplete.');
+  }
+  return {
+    egressPolicyB64: containerCtx.egressPolicyB64,
+    image: containerCtx.image,
+    ownerRunId: containerCtx.ownerRunId,
+    proxyBudgetSeedDigest: containerCtx.proxyBudgetSeedDigest,
+  };
+}
+
+function assertVerifiedProxyBudgetStatus(
+  status: VerifiedProxyBudgetStatus,
+  envId: string,
+  proxyBudgetSeedDigest: string
+): void {
+  if (status.source !== 'controller-proxy-ledger' || status.envId !== envId) {
+    throw new Error('Hardened workflow budget ledger status binding is malformed.');
+  }
+  if (status.pendingReservations > 0 || status.unknownReservations > 0) {
+    throw new Error('Hardened workflow budget ledger has pending or unknown reservations.');
+  }
+  if (!status.acceptingReservations) {
+    throw new Error('Hardened workflow budget ledger is not accepting exact reservations.');
+  }
+  if (status.grant.runId.length === 0 || proxyBudgetSeedDigest.length !== 64) {
+    throw new Error('Hardened workflow budget ledger grant binding is malformed.');
+  }
+  if (!isNonnegativeSafeTokenUsage(status.consumed)) {
+    throw new Error('Hardened workflow budget ledger consumption is malformed.');
+  }
+}
+
+function assertLedgerStatusMatchesBudget(
+  status: VerifiedProxyBudgetStatus,
+  budget: ActiveWorkflowBudget
+): void {
+  if (
+    status.grant.workflowDigest !== budget.state.workflowDigest ||
+    new Date(status.grant.deadlineEpochMs).toISOString() !== budget.state.deadlineAt ||
+    status.grant.totalTokenLimit !== budget.state.tokens.total ||
+    status.grant.inputTokenLimit !== (budget.state.tokens.input ?? budget.state.tokens.total) ||
+    status.grant.outputTokenLimit !== (budget.state.tokens.output ?? budget.state.tokens.total)
+  ) {
+    throw new Error('Hardened workflow budget ledger grant does not match controller grant.');
+  }
+}
+
+function isHardenedBudgetError(error: Error): boolean {
+  return /hardened .*budget/i.test(error.message);
+}
+
+function isNonnegativeSafeTokenUsage(tokens: TokenUsage): boolean {
+  return (
+    Number.isSafeInteger(tokens.input) &&
+    tokens.input >= 0 &&
+    Number.isSafeInteger(tokens.output) &&
+    tokens.output >= 0
+  );
+}
+
+function mergeTokenUsage(left: TokenUsage | undefined, right: TokenUsage): TokenUsage | undefined {
+  const input = (left?.input ?? 0) + right.input;
+  const output = (left?.output ?? 0) + right.output;
+  if (!Number.isSafeInteger(input) || !Number.isSafeInteger(output)) return undefined;
+  return { input, output };
+}
+
+function resolveFailedNodeTokens(
+  accumulated: TokenUsage | undefined,
+  current: TokenUsage | undefined,
+  currentIsAccumulated: boolean,
+  usageUnknown: boolean
+): TokenUsage | undefined {
+  if (usageUnknown) return undefined;
+  if (current === undefined) return undefined;
+  if (currentIsAccumulated) return current;
+  return mergeTokenUsage(accumulated, current);
+}
+
+function withPriorAttemptUsage<T extends NodeExecutionResult>(
+  prior: PriorAttemptUsage | undefined,
+  output: T
+): T {
+  if (!prior) return output;
+  const rest = { ...output };
+  delete rest.tokens;
+  delete rest.costUsd;
+  const mergedTokens =
+    prior.tokensUnknown || output.tokens === undefined
+      ? undefined
+      : mergeTokenUsage(prior.tokens, output.tokens);
+  return {
+    ...rest,
+    ...(mergedTokens !== undefined ? { tokens: mergedTokens } : {}),
+    ...(prior.costUsd !== undefined || output.costUsd !== undefined
+      ? { costUsd: (prior.costUsd ?? 0) + (output.costUsd ?? 0) }
+      : {}),
+  } as T;
+}
+
 /**
  * Run a node executor with the shared retry loop: exponential backoff, FATAL
  * never retried, and a platform notification before each retry. Used by both the
@@ -629,12 +882,60 @@ async function runNodeRetryLoop<T extends NodeOutput>(
   conversationId: string,
   workflowRun: WorkflowRun,
   retryConfig: { maxRetries: number; delayMs: number; onError: 'transient' | 'all' },
-  run: () => Promise<T>,
-  initialOutput: T
+  run: (deadlineAt?: number, priorAttemptUsage?: PriorAttemptUsage) => Promise<T>,
+  initialOutput: T,
+  totalTimeoutMs?: number,
+  afterAttempt?: (output: T, attempt: number, rawOutput: T) => Promise<void>
 ): Promise<T> {
   let output = initialOutput;
+  let accumulatedTokens: TokenUsage | undefined;
+  let accumulatedTokensUnknown = false;
+  let accumulatedCostUsd: number | undefined;
+  const addAttemptUsage = (attemptOutput: T): void => {
+    const usage = attemptOutput as T & { tokens?: TokenUsage; costUsd?: number };
+    if (usage.tokens === undefined) {
+      accumulatedTokensUnknown = true;
+    } else if (!accumulatedTokensUnknown) {
+      const mergedTokens = mergeTokenUsage(accumulatedTokens, usage.tokens);
+      if (mergedTokens === undefined) {
+        accumulatedTokensUnknown = true;
+        accumulatedTokens = undefined;
+      } else {
+        accumulatedTokens = mergedTokens;
+      }
+    }
+    if (usage.costUsd !== undefined) {
+      accumulatedCostUsd = (accumulatedCostUsd ?? 0) + usage.costUsd;
+    }
+  };
+  const withAccumulatedUsage = (attemptOutput: T): T => ({
+    ...attemptOutput,
+    ...(!accumulatedTokensUnknown && accumulatedTokens !== undefined
+      ? { tokens: accumulatedTokens }
+      : {}),
+    ...(accumulatedCostUsd !== undefined ? { costUsd: accumulatedCostUsd } : {}),
+  });
+  const priorAttemptUsage = (): PriorAttemptUsage => ({
+    tokensUnknown: accumulatedTokensUnknown,
+    ...(accumulatedTokens !== undefined ? { tokens: accumulatedTokens } : {}),
+    ...(accumulatedCostUsd !== undefined ? { costUsd: accumulatedCostUsd } : {}),
+  });
+  const deadlineAt = totalTimeoutMs !== undefined ? Date.now() + totalTimeoutMs : undefined;
   for (let attempt = 0; attempt <= retryConfig.maxRetries; attempt++) {
-    output = await run();
+    if (remainingDeadlineMs(deadlineAt) === 0) {
+      const timeoutOutput = {
+        ...initialOutput,
+        state: 'failed',
+        output: '',
+        error: `Node '${node.id}' exceeded total timeout of ${String(totalTimeoutMs)}ms`,
+      };
+      await afterAttempt?.(withAccumulatedUsage(timeoutOutput), attempt, timeoutOutput);
+      return withAccumulatedUsage(timeoutOutput);
+    }
+    output = await run(deadlineAt, priorAttemptUsage());
+    addAttemptUsage(output);
+    const accumulatedOutput = withAccumulatedUsage(output);
+    await afterAttempt?.(accumulatedOutput, attempt, output);
     if (output.state !== 'failed') break;
 
     const { shouldRetry, isTransient } = shouldRetryNodeFailure(output, retryConfig.onError);
@@ -660,9 +961,13 @@ async function runNodeRetryLoop<T extends NodeOutput>(
       { workflowId: workflowRun.id, nodeName: node.id }
     );
 
-    await new Promise(resolve => setTimeout(resolve, delayMs));
+    const remaining = remainingDeadlineMs(deadlineAt);
+    if (remaining === 0) break;
+    await new Promise(resolve =>
+      setTimeout(resolve, remaining === undefined ? delayMs : Math.min(delayMs, remaining))
+    );
   }
-  return output;
+  return withAccumulatedUsage(output);
 }
 
 /**
@@ -1291,7 +1596,9 @@ async function executeNodeInternal(
   resolvedTier?: TierName,
   resolvedEffort?: string,
   stepNamePrefix = '',
-  iteration?: number
+  iteration?: number,
+  totalDeadlineAt?: number,
+  budgetPassCheckpoint?: BudgetPassCheckpoint
 ): Promise<NodeExecutionResult> {
   const nodeStartTime = Date.now();
   const nodeContext: SendMessageContext = { workflowId: workflowRun.id, nodeName: node.id };
@@ -1389,7 +1696,7 @@ async function executeNodeInternal(
       docsDir,
       issueContext,
       `dag node '${node.id}' prompt`,
-      { stateDir }
+      { stateDir, execContext: nodeOptions?.execContext }
     );
   } catch (error) {
     const err = error as Error;
@@ -1455,6 +1762,7 @@ async function executeNodeInternal(
     ...(shouldForkSession ? { forkSession: true } : {}),
   };
   let nodeIdleTimedOut = false;
+  let nodeTotalTimedOut = false;
   const effectiveIdleTimeout = node.idle_timeout ?? STEP_IDLE_TIMEOUT_MS;
   const runningTools = new Map<string, RunningTool>();
   let anonymousToolSequence = 0;
@@ -1473,6 +1781,9 @@ async function executeNodeInternal(
       ? STRUCTURED_OUTPUT_MAX_REASKS
       : 0;
   let accumulatedCostUsd: number | undefined;
+  let accumulatedNodeTokens: TokenUsage | undefined;
+  let passTokenUsageUnknown = false;
+  let nodeTokensAreAccumulated = false;
 
   // One sendQuery stream pass. Resets the per-attempt accumulators it mutates
   // (output text, structured output, the batched-message buffer, per-pass cost,
@@ -1486,359 +1797,406 @@ async function executeNodeInternal(
     nodeOutputText = '';
     structuredOutput = undefined;
     batchMessages.length = 0; // else a failed attempt's prose flushes during reask
+    nodeTokens = undefined;
+    nodeTokensAreAccumulated = false;
     nodeCostUsd = undefined;
     nodeIdleTimedOut = false;
+    nodeTotalTimedOut = false;
     backgroundTasksIncomplete = [];
     const backgroundTasks = createBackgroundTaskTracker();
-    for await (const msg of withIdleTimeout(
-      aiClient.sendQuery(attemptPrompt, cwd, attemptResumeId, nodeOptionsWithAbort),
-      effectiveIdleTimeout,
-      () => {
-        nodeIdleTimedOut = true;
-        getLog().warn(
-          { nodeId: node.id, timeoutMs: effectiveIdleTimeout },
-          'dag_node_idle_timeout_reached'
-        );
-        nodeAbortController.abort();
-      }
-    )) {
-      const tickNow = Date.now();
-      const nodeKey = `${workflowRun.id}:${node.id}`;
-
-      // Cancel/pause check — read-only, no write contention in WAL mode (every 10s).
-      //
-      // `paused` is tolerated here: an approval node can transition the run to
-      // paused while this concurrent node is mid-stream (same topological layer).
-      // The streaming node should be allowed to finish its own output — the
-      // paused gate owns workflow progression, not individual node lifecycles.
-      // Only truly terminal / unknown states (null, cancelled, failed, completed)
-      // abort the in-flight stream.
-      if (tickNow - (lastNodeCancelCheck.get(nodeKey) ?? 0) > CANCEL_CHECK_INTERVAL_MS) {
-        lastNodeCancelCheck.set(nodeKey, tickNow);
-        try {
-          const streamStatus = await deps.store.getWorkflowRunStatus(workflowRun.id);
-          if (!shouldContinueStreamingForStatus(streamStatus)) {
-            getLog().info(
-              { workflowRunId: workflowRun.id, nodeId: node.id, status: streamStatus ?? 'deleted' },
-              'dag.stop_detected_during_streaming'
+    const remaining = remainingDeadlineMs(totalDeadlineAt);
+    if (remaining === 0) {
+      nodeAbortController.abort();
+      throw new Error(`Node '${node.id}' exceeded total timeout`);
+    }
+    const passTimeout = effectiveIdleTimeout;
+    const totalDeadlineTimer =
+      remaining === undefined
+        ? undefined
+        : setTimeout(() => {
+            nodeTotalTimedOut = true;
+            getLog().warn(
+              { nodeId: node.id, timeoutMs: remaining },
+              'dag_node_total_timeout_reached'
             );
             nodeAbortController.abort();
-            break;
-          }
-        } catch (cancelCheckErr) {
+          }, remaining);
+    try {
+      for await (const msg of withIdleTimeout(
+        aiClient.sendQuery(attemptPrompt, cwd, attemptResumeId, nodeOptionsWithAbort),
+        passTimeout,
+        () => {
+          nodeIdleTimedOut = true;
           getLog().warn(
-            { err: cancelCheckErr as Error, workflowRunId: workflowRun.id, nodeId: node.id },
-            'dag.status_check_failed'
+            { nodeId: node.id, timeoutMs: passTimeout },
+            'dag_node_idle_timeout_reached'
           );
+          nodeAbortController.abort();
         }
-      }
+      )) {
+        const tickNow = Date.now();
+        const nodeKey = `${workflowRun.id}:${node.id}`;
 
-      // Activity heartbeat — write, throttled to every 60s (only for stale/zombie detection)
-      if (tickNow - (lastNodeActivityUpdate.get(nodeKey) ?? 0) > ACTIVITY_HEARTBEAT_INTERVAL_MS) {
-        lastNodeActivityUpdate.set(nodeKey, tickNow);
-        try {
-          await deps.store.updateWorkflowActivity(workflowRun.id);
-        } catch (e) {
-          getLog().warn(
-            { err: e as Error, workflowRunId: workflowRun.id },
-            'dag.activity_update_failed'
-          );
-        }
-      }
-
-      if (msg.type === 'assistant' && msg.content) {
-        nodeOutputText += msg.content; // ALWAYS capture for $node_id.output
-        if (streamingMode === 'stream' || msg.flush) {
-          // `flush` chunks (e.g. Pi notify() emitting a plannotator review URL)
-          // must reach the user before the node blocks. Drain any queued batch
-          // content first so order is preserved.
-          if (streamingMode === 'batch' && batchMessages.length > 0) {
-            await safeSendMessage(
-              platform,
-              conversationId,
-              batchMessages.join('\n\n'),
-              nodeContext
+        // Cancel/pause check — read-only, no write contention in WAL mode (every 10s).
+        //
+        // `paused` is tolerated here: an approval node can transition the run to
+        // paused while this concurrent node is mid-stream (same topological layer).
+        // The streaming node should be allowed to finish its own output — the
+        // paused gate owns workflow progression, not individual node lifecycles.
+        // Only truly terminal / unknown states (null, cancelled, failed, completed)
+        // abort the in-flight stream.
+        if (tickNow - (lastNodeCancelCheck.get(nodeKey) ?? 0) > CANCEL_CHECK_INTERVAL_MS) {
+          lastNodeCancelCheck.set(nodeKey, tickNow);
+          try {
+            const streamStatus = await deps.store.getWorkflowRunStatus(workflowRun.id);
+            if (!shouldContinueStreamingForStatus(streamStatus)) {
+              getLog().info(
+                {
+                  workflowRunId: workflowRun.id,
+                  nodeId: node.id,
+                  status: streamStatus ?? 'deleted',
+                },
+                'dag.stop_detected_during_streaming'
+              );
+              nodeAbortController.abort();
+              break;
+            }
+          } catch (cancelCheckErr) {
+            getLog().warn(
+              { err: cancelCheckErr as Error, workflowRunId: workflowRun.id, nodeId: node.id },
+              'dag.status_check_failed'
             );
-            batchMessages.length = 0;
           }
-          await safeSendMessage(platform, conversationId, msg.content, nodeContext);
-        } else {
-          batchMessages.push(msg.content);
         }
-        await logAssistant(logDir, workflowRun.id, msg.content);
-      } else if (msg.type === 'tool' && msg.toolName) {
-        const now = Date.now();
-        const toolCallId = msg.toolCallId ?? `anonymous-${String(++anonymousToolSequence)}`;
 
-        // Providers without stable IDs report sequential tool calls. Preserve their
-        // legacy boundary while allowing identified calls to overlap.
-        const previousTool = lastAnonymousToolCallId
-          ? runningTools.get(lastAnonymousToolCallId)
-          : undefined;
-        if (previousTool && lastAnonymousToolCallId !== undefined) {
+        // Activity heartbeat — write, throttled to every 60s (only for stale/zombie detection)
+        if (tickNow - (lastNodeActivityUpdate.get(nodeKey) ?? 0) > ACTIVITY_HEARTBEAT_INTERVAL_MS) {
+          lastNodeActivityUpdate.set(nodeKey, tickNow);
+          try {
+            await deps.store.updateWorkflowActivity(workflowRun.id);
+          } catch (e) {
+            getLog().warn(
+              { err: e as Error, workflowRunId: workflowRun.id },
+              'dag.activity_update_failed'
+            );
+          }
+        }
+
+        if (nodeTotalTimedOut) break;
+
+        if (msg.type === 'assistant' && msg.content) {
+          nodeOutputText += msg.content; // ALWAYS capture for $node_id.output
+          if (streamingMode === 'stream' || msg.flush) {
+            // `flush` chunks (e.g. Pi notify() emitting a plannotator review URL)
+            // must reach the user before the node blocks. Drain any queued batch
+            // content first so order is preserved.
+            if (streamingMode === 'batch' && batchMessages.length > 0) {
+              await safeSendMessage(
+                platform,
+                conversationId,
+                batchMessages.join('\n\n'),
+                nodeContext
+              );
+              batchMessages.length = 0;
+            }
+            await safeSendMessage(platform, conversationId, msg.content, nodeContext);
+          } else {
+            batchMessages.push(msg.content);
+          }
+          await logAssistant(logDir, workflowRun.id, msg.content);
+        } else if (msg.type === 'tool' && msg.toolName) {
+          const now = Date.now();
+          const toolCallId = msg.toolCallId ?? `anonymous-${String(++anonymousToolSequence)}`;
+
+          // Providers without stable IDs report sequential tool calls. Preserve their
+          // legacy boundary while allowing identified calls to overlap.
+          const previousTool = lastAnonymousToolCallId
+            ? runningTools.get(lastAnonymousToolCallId)
+            : undefined;
+          if (previousTool && lastAnonymousToolCallId !== undefined) {
+            getWorkflowEventEmitter().emit({
+              type: 'tool_completed',
+              runId: workflowRun.id,
+              toolName: previousTool.toolName,
+              stepName: node.id,
+              durationMs: now - previousTool.startedAt,
+              toolCallId: lastAnonymousToolCallId,
+              toolOutcome: 'unknown',
+            });
+            deps.store
+              .createWorkflowEvent({
+                workflow_run_id: workflowRun.id,
+                event_type: 'tool_completed',
+                step_name: stepName,
+                data: {
+                  tool_name: previousTool.toolName,
+                  duration_ms: now - previousTool.startedAt,
+                  tool_call_id: lastAnonymousToolCallId,
+                  tool_outcome: 'unknown',
+                },
+              })
+              .catch((err: Error) => {
+                getLog().error(
+                  { err, workflowRunId: workflowRun.id, eventType: 'tool_completed' },
+                  'workflow_event_persist_failed'
+                );
+              });
+            runningTools.delete(lastAnonymousToolCallId);
+          }
+          runningTools.set(toolCallId, { toolName: msg.toolName, startedAt: now });
+          if (!msg.toolCallId) lastAnonymousToolCallId = toolCallId;
+
+          // Emit tool_started for the current tool (fire-and-forget)
           getWorkflowEventEmitter().emit({
-            type: 'tool_completed',
+            type: 'tool_started',
             runId: workflowRun.id,
-            toolName: previousTool.toolName,
+            toolName: msg.toolName,
             stepName: node.id,
-            durationMs: now - previousTool.startedAt,
-            toolCallId: lastAnonymousToolCallId,
-            toolOutcome: 'unknown',
+            toolCallId,
           });
+
+          if (streamingMode === 'stream') {
+            const toolMsg = formatToolCall(msg.toolName, msg.toolInput);
+            await safeSendMessage(platform, conversationId, toolMsg, nodeContext, {
+              category: 'tool_call_formatted',
+            } as WorkflowMessageMetadata);
+
+            // Send structured event to adapters that support it (Web UI)
+            if (platform.sendStructuredEvent) {
+              await platform.sendStructuredEvent(conversationId, msg);
+            }
+          }
+          await logTool(logDir, workflowRun.id, msg.toolName, msg.toolInput ?? {});
+
+          // Persist tool_called event for ALL adapters (fire-and-forget)
           deps.store
             .createWorkflowEvent({
               workflow_run_id: workflowRun.id,
-              event_type: 'tool_completed',
+              event_type: 'tool_called',
               step_name: stepName,
               data: {
-                tool_name: previousTool.toolName,
-                duration_ms: now - previousTool.startedAt,
-                tool_call_id: lastAnonymousToolCallId,
-                tool_outcome: 'unknown',
+                tool_name: msg.toolName,
+                tool_input: msg.toolInput ?? {},
+                tool_call_id: toolCallId,
               },
             })
             .catch((err: Error) => {
               getLog().error(
-                { err, workflowRunId: workflowRun.id, eventType: 'tool_completed' },
+                { err, workflowRunId: workflowRun.id, eventType: 'tool_called' },
                 'workflow_event_persist_failed'
               );
             });
-          runningTools.delete(lastAnonymousToolCallId);
-        }
-        runningTools.set(toolCallId, { toolName: msg.toolName, startedAt: now });
-        if (!msg.toolCallId) lastAnonymousToolCallId = toolCallId;
-
-        // Emit tool_started for the current tool (fire-and-forget)
-        getWorkflowEventEmitter().emit({
-          type: 'tool_started',
-          runId: workflowRun.id,
-          toolName: msg.toolName,
-          stepName: node.id,
-          toolCallId,
-        });
-
-        if (streamingMode === 'stream') {
-          const toolMsg = formatToolCall(msg.toolName, msg.toolInput);
-          await safeSendMessage(platform, conversationId, toolMsg, nodeContext, {
-            category: 'tool_call_formatted',
-          } as WorkflowMessageMetadata);
-
-          // Send structured event to adapters that support it (Web UI)
-          if (platform.sendStructuredEvent) {
+        } else if (msg.type === 'tool_result' && msg.toolName) {
+          const now = Date.now();
+          const completedTool = findRunningTool(runningTools, msg.toolName, msg.toolCallId);
+          if (completedTool) {
+            const [completedToolCallId, tool] = completedTool;
+            getWorkflowEventEmitter().emit({
+              type: 'tool_completed',
+              runId: workflowRun.id,
+              toolName: tool.toolName,
+              stepName: node.id,
+              durationMs: now - tool.startedAt,
+              toolCallId: completedToolCallId,
+              ...(msg.toolOutcome !== undefined ? { toolOutcome: msg.toolOutcome } : {}),
+              ...(msg.exitCode !== undefined ? { exitCode: msg.exitCode } : {}),
+            });
+            deps.store
+              .createWorkflowEvent({
+                workflow_run_id: workflowRun.id,
+                event_type: 'tool_completed',
+                step_name: stepName,
+                data: {
+                  tool_name: tool.toolName,
+                  duration_ms: now - tool.startedAt,
+                  tool_call_id: completedToolCallId,
+                  ...(msg.toolOutcome !== undefined ? { tool_outcome: msg.toolOutcome } : {}),
+                  ...(msg.exitCode !== undefined ? { exit_code: msg.exitCode } : {}),
+                },
+              })
+              .catch((err: Error) => {
+                getLog().error(
+                  { err, workflowRunId: workflowRun.id, eventType: 'tool_completed' },
+                  'workflow_event_persist_failed'
+                );
+              });
+            runningTools.delete(completedToolCallId);
+            if (completedToolCallId === lastAnonymousToolCallId) {
+              lastAnonymousToolCallId = undefined;
+            }
+          }
+          if (streamingMode === 'stream' && platform.sendStructuredEvent) {
             await platform.sendStructuredEvent(conversationId, msg);
           }
-        }
-        await logTool(logDir, workflowRun.id, msg.toolName, msg.toolInput ?? {});
-
-        // Persist tool_called event for ALL adapters (fire-and-forget)
-        deps.store
-          .createWorkflowEvent({
-            workflow_run_id: workflowRun.id,
-            event_type: 'tool_called',
-            step_name: stepName,
-            data: {
-              tool_name: msg.toolName,
-              tool_input: msg.toolInput ?? {},
-              tool_call_id: toolCallId,
-            },
-          })
-          .catch((err: Error) => {
-            getLog().error(
-              { err, workflowRunId: workflowRun.id, eventType: 'tool_called' },
-              'workflow_event_persist_failed'
-            );
-          });
-      } else if (msg.type === 'tool_result' && msg.toolName) {
-        const now = Date.now();
-        const completedTool = findRunningTool(runningTools, msg.toolName, msg.toolCallId);
-        if (completedTool) {
-          const [completedToolCallId, tool] = completedTool;
-          getWorkflowEventEmitter().emit({
-            type: 'tool_completed',
-            runId: workflowRun.id,
-            toolName: tool.toolName,
-            stepName: node.id,
-            durationMs: now - tool.startedAt,
-            toolCallId: completedToolCallId,
-            ...(msg.toolOutcome !== undefined ? { toolOutcome: msg.toolOutcome } : {}),
-            ...(msg.exitCode !== undefined ? { exitCode: msg.exitCode } : {}),
-          });
-          deps.store
-            .createWorkflowEvent({
-              workflow_run_id: workflowRun.id,
-              event_type: 'tool_completed',
-              step_name: stepName,
-              data: {
-                tool_name: tool.toolName,
-                duration_ms: now - tool.startedAt,
-                tool_call_id: completedToolCallId,
-                ...(msg.toolOutcome !== undefined ? { tool_outcome: msg.toolOutcome } : {}),
-                ...(msg.exitCode !== undefined ? { exit_code: msg.exitCode } : {}),
-              },
-            })
-            .catch((err: Error) => {
-              getLog().error(
-                { err, workflowRunId: workflowRun.id, eventType: 'tool_completed' },
-                'workflow_event_persist_failed'
-              );
+        } else if (msg.type === 'result') {
+          // A terminal result closes every outstanding lifecycle.
+          for (const [toolCallId, prevTool] of runningTools) {
+            getWorkflowEventEmitter().emit({
+              type: 'tool_completed',
+              runId: workflowRun.id,
+              toolName: prevTool.toolName,
+              stepName: node.id,
+              durationMs: Date.now() - prevTool.startedAt,
+              toolCallId,
+              toolOutcome: 'unknown',
             });
-          runningTools.delete(completedToolCallId);
-          if (completedToolCallId === lastAnonymousToolCallId) {
-            lastAnonymousToolCallId = undefined;
+            deps.store
+              .createWorkflowEvent({
+                workflow_run_id: workflowRun.id,
+                event_type: 'tool_completed',
+                step_name: stepName,
+                data: {
+                  tool_name: prevTool.toolName,
+                  duration_ms: Date.now() - prevTool.startedAt,
+                  tool_call_id: toolCallId,
+                  tool_outcome: 'unknown',
+                },
+              })
+              .catch((err: Error) => {
+                getLog().error(
+                  { err, workflowRunId: workflowRun.id, eventType: 'tool_completed' },
+                  'workflow_event_persist_failed'
+                );
+              });
+            runningTools.delete(toolCallId);
           }
-        }
-        if (streamingMode === 'stream' && platform.sendStructuredEvent) {
-          await platform.sendStructuredEvent(conversationId, msg);
-        }
-      } else if (msg.type === 'result') {
-        // A terminal result closes every outstanding lifecycle.
-        for (const [toolCallId, prevTool] of runningTools) {
-          getWorkflowEventEmitter().emit({
-            type: 'tool_completed',
-            runId: workflowRun.id,
-            toolName: prevTool.toolName,
-            stepName: node.id,
-            durationMs: Date.now() - prevTool.startedAt,
-            toolCallId,
-            toolOutcome: 'unknown',
-          });
-          deps.store
-            .createWorkflowEvent({
-              workflow_run_id: workflowRun.id,
-              event_type: 'tool_completed',
-              step_name: stepName,
-              data: {
-                tool_name: prevTool.toolName,
-                duration_ms: Date.now() - prevTool.startedAt,
-                tool_call_id: toolCallId,
-                tool_outcome: 'unknown',
-              },
-            })
-            .catch((err: Error) => {
-              getLog().error(
-                { err, workflowRunId: workflowRun.id, eventType: 'tool_completed' },
-                'workflow_event_persist_failed'
-              );
-            });
-          runningTools.delete(toolCallId);
-        }
-        if (msg.sessionId) newSessionId = msg.sessionId;
-        if (msg.resumed !== undefined) nodeResumed = msg.resumed;
-        if (msg.tokens !== undefined) {
-          // Normalized to `{input, output}` — the ONLY two fields every provider
-          // reports the same way, and therefore the only shape a consumer can read
-          // without knowing which provider produced the row. `total` is
-          // provider-defined and is NOT input + output (Pi folds cacheRead/cacheWrite
-          // into it, OpenCode sums its own per-agent totals); `cost` duplicates the
-          // separately-persisted `cost_usd`. Same NaN guard rationale as the
-          // DAG-level accumulator: a non-finite value must be dropped loudly, not
-          // persisted as a wrong number that gets believed.
-          if (Number.isFinite(msg.tokens.input) && Number.isFinite(msg.tokens.output)) {
+          if (msg.sessionId) newSessionId = msg.sessionId;
+          if (msg.resumed !== undefined) nodeResumed = msg.resumed;
+          // Result chunks report cumulative pass usage for providers that can
+          // report usage at all, so the latest result chunk wins. A later result
+          // without tokens deliberately clears an earlier token value; otherwise
+          // a provider's final no-usage result would inherit stale accounting.
+          nodeTokens = undefined;
+          if (msg.tokens !== undefined && isNonnegativeSafeTokenUsage(msg.tokens)) {
             nodeTokens = { input: msg.tokens.input, output: msg.tokens.output };
-          } else {
+          } else if (msg.tokens !== undefined) {
+            passTokenUsageUnknown = true;
             getLog().warn(
               { nodeId: node.id, tokens: msg.tokens },
               'dag_node.usage_tokens_non_finite_ignored'
             );
           }
-        }
-        if (msg.cost !== undefined) nodeCostUsd = msg.cost;
-        if (msg.stopReason !== undefined) nodeStopReason = msg.stopReason;
-        if (msg.numTurns !== undefined) nodeNumTurns = msg.numTurns;
-        // Assigned UNCONDITIONALLY. A guarded assignment cannot CLEAR a stale value:
-        // Pi/Copilot reask loops yield several result chunks, and Pi omits resolvedModel
-        // when its later assistant message has no responseModel — so an earlier attempt's
-        // model would be persisted as the final attempt's answer. Fabricated attribution
-        // is the exact defect #2314 exists to prevent; absence must stay absence.
-        nodeResolvedModel = msg.resolvedModel;
-        if (msg.structuredOutput !== undefined) structuredOutput = msg.structuredOutput;
-        // Fail the node if the SDK reports a cost cap exceeded error
-        if (msg.isError && msg.errorSubtype === 'error_max_budget_usd') {
-          const cap = nodeOptions?.maxBudgetUsd;
+          if (msg.cost !== undefined) nodeCostUsd = msg.cost;
+          if (msg.stopReason !== undefined) nodeStopReason = msg.stopReason;
+          if (msg.numTurns !== undefined) nodeNumTurns = msg.numTurns;
+          // Assigned UNCONDITIONALLY. A guarded assignment cannot CLEAR a stale value:
+          // Pi/Copilot reask loops yield several result chunks, and Pi omits resolvedModel
+          // when its later assistant message has no responseModel — so an earlier attempt's
+          // model would be persisted as the final attempt's answer. Fabricated attribution
+          // is the exact defect #2314 exists to prevent; absence must stay absence.
+          nodeResolvedModel = msg.resolvedModel;
+          if (msg.structuredOutput !== undefined) structuredOutput = msg.structuredOutput;
+          // Fail the node if the SDK reports a cost cap exceeded error
+          if (msg.isError && msg.errorSubtype === 'error_max_budget_usd') {
+            const cap = nodeOptions?.maxBudgetUsd;
+            getLog().warn(
+              { nodeId: node.id, maxBudgetUsd: cap, durationMs: Date.now() - nodeStartTime },
+              'dag.node_budget_cap_exceeded'
+            );
+            throw new Error(
+              `Node '${node.id}' exceeded cost cap${cap !== undefined ? ` of $${cap.toFixed(2)}` : ''}.`
+            );
+          }
+          // Fail loudly on any other SDK error result. Previously we broke out of
+          // the stream silently, producing empty/partial output without signaling
+          // failure — which let failed iterations masquerade as successes.
+          // Exception: errorSubtype === 'success' is the Claude SDK's marker for a
+          // clean stop_sequence termination. The Claude provider already filters
+          // this out, but the guard here keeps a third-party IAgentProvider that
+          // forwards the SDK pair raw from producing a "SDK returned success"
+          // false failure.
+          if (msg.isError && msg.errorSubtype !== 'success') {
+            const subtype = msg.errorSubtype ?? 'unknown';
+            const errorsDetail = msg.errors?.length ? ` — ${msg.errors.join('; ')}` : '';
+            getLog().error(
+              {
+                nodeId: node.id,
+                errorSubtype: subtype,
+                errors: msg.errors,
+                sessionId: msg.sessionId,
+                stopReason: msg.stopReason,
+                durationMs: Date.now() - nodeStartTime,
+              },
+              'dag.node_sdk_error_result'
+            );
+            throw new Error(`Node '${node.id}' failed: SDK returned ${subtype}${errorsDetail}`);
+          }
+          if (backgroundTasks.shouldBreakOnResult()) {
+            break; // Result is the "I'm done" signal — don't wait for subprocess to exit
+          }
+          // Result arrived with background Agent tasks still live (#2083).
+          // Breaking here would .return() the generator chain → SDK cleanup →
+          // SIGTERM the CLI → kill the tasks and lose their pending artifacts.
+          // Keep consuming: the SDK holds the subprocess open until the tasks
+          // drain, runs a follow-up turn to integrate their output, and emits a
+          // final result (whose fields overwrite the captures above — correct,
+          // since SDK cost/usage are session-cumulative). Bounded by the
+          // existing idle timeout; task_progress chunks reset it.
           getLog().warn(
-            { nodeId: node.id, maxBudgetUsd: cap, durationMs: Date.now() - nodeStartTime },
-            'dag.node_budget_cap_exceeded'
-          );
-          throw new Error(
-            `Node '${node.id}' exceeded cost cap${cap !== undefined ? ` of $${cap.toFixed(2)}` : ''}.`
-          );
-        }
-        // Fail loudly on any other SDK error result. Previously we broke out of
-        // the stream silently, producing empty/partial output without signaling
-        // failure — which let failed iterations masquerade as successes.
-        // Exception: errorSubtype === 'success' is the Claude SDK's marker for a
-        // clean stop_sequence termination. The Claude provider already filters
-        // this out, but the guard here keeps a third-party IAgentProvider that
-        // forwards the SDK pair raw from producing a "SDK returned success"
-        // false failure.
-        if (msg.isError && msg.errorSubtype !== 'success') {
-          const subtype = msg.errorSubtype ?? 'unknown';
-          const errorsDetail = msg.errors?.length ? ` — ${msg.errors.join('; ')}` : '';
-          getLog().error(
             {
               nodeId: node.id,
-              errorSubtype: subtype,
-              errors: msg.errors,
-              sessionId: msg.sessionId,
-              stopReason: msg.stopReason,
-              durationMs: Date.now() - nodeStartTime,
+              taskCount: backgroundTasks.count(),
+              taskIds: backgroundTasks.ids(),
             },
-            'dag.node_sdk_error_result'
+            'dag.node_result_with_live_background_tasks'
           );
-          throw new Error(`Node '${node.id}' failed: SDK returned ${subtype}${errorsDetail}`);
-        }
-        if (backgroundTasks.shouldBreakOnResult()) {
-          break; // Result is the "I'm done" signal — don't wait for subprocess to exit
-        }
-        // Result arrived with background Agent tasks still live (#2083).
-        // Breaking here would .return() the generator chain → SDK cleanup →
-        // SIGTERM the CLI → kill the tasks and lose their pending artifacts.
-        // Keep consuming: the SDK holds the subprocess open until the tasks
-        // drain, runs a follow-up turn to integrate their output, and emits a
-        // final result (whose fields overwrite the captures above — correct,
-        // since SDK cost/usage are session-cumulative). Bounded by the
-        // existing idle timeout; task_progress chunks reset it.
-        getLog().warn(
-          {
-            nodeId: node.id,
-            taskCount: backgroundTasks.count(),
-            taskIds: backgroundTasks.ids(),
-          },
-          'dag.node_result_with_live_background_tasks'
-        );
-        if (backgroundTasks.shouldAnnounceWait()) {
-          await safeSendMessage(
-            platform,
-            conversationId,
-            `⏳ Node \`${node.id}\`: turn ended with ${String(backgroundTasks.count())} background agent task(s) still running — waiting for them to finish before completing the node.`,
-            nodeContext
-          );
-        }
-      } else if (msg.type === 'background_tasks') {
-        // Level signal (REPLACE semantics): swap the live set for the payload.
-        backgroundTasks.update(msg.tasks);
-      } else if (msg.type === 'system' && msg.content) {
-        // Providers yield system chunks for user-actionable issues (missing env
-        // vars, Haiku+MCP, structured output failures, etc.). MCP-failure
-        // chunks need filtering: user-level plugin MCPs inherited from
-        // `~/.claude/` (e.g. `telegram`) routinely fail to connect inside the
-        // headless subprocess and aren't actionable for the workflow author.
-        // Other warnings (⚠️) are always actionable and surface verbatim.
-        if (msg.content.startsWith(MCP_FAILURE_PREFIX)) {
-          const failedEntries = parseMcpFailureServerNames(msg.content);
-          const workflowFailures = failedEntries.filter(e => configuredMcpNames.has(e.name));
-          const pluginFailures = failedEntries.filter(e => !configuredMcpNames.has(e.name));
+          if (backgroundTasks.shouldAnnounceWait()) {
+            await safeSendMessage(
+              platform,
+              conversationId,
+              `⏳ Node \`${node.id}\`: turn ended with ${String(backgroundTasks.count())} background agent task(s) still running — waiting for them to finish before completing the node.`,
+              nodeContext
+            );
+          }
+        } else if (msg.type === 'background_tasks') {
+          // Level signal (REPLACE semantics): swap the live set for the payload.
+          backgroundTasks.update(msg.tasks);
+        } else if (msg.type === 'system' && msg.content) {
+          // Providers yield system chunks for user-actionable issues (missing env
+          // vars, Haiku+MCP, structured output failures, etc.). MCP-failure
+          // chunks need filtering: user-level plugin MCPs inherited from
+          // `~/.claude/` (e.g. `telegram`) routinely fail to connect inside the
+          // headless subprocess and aren't actionable for the workflow author.
+          // Other warnings (⚠️) are always actionable and surface verbatim.
+          if (msg.content.startsWith(MCP_FAILURE_PREFIX)) {
+            const failedEntries = parseMcpFailureServerNames(msg.content);
+            const workflowFailures = failedEntries.filter(e => configuredMcpNames.has(e.name));
+            const pluginFailures = failedEntries.filter(e => !configuredMcpNames.has(e.name));
 
-          if (workflowFailures.length > 0) {
-            const filteredMsg = `${MCP_FAILURE_PREFIX}${workflowFailures.map(e => e.segment).join(', ')}`;
+            if (workflowFailures.length > 0) {
+              const filteredMsg = `${MCP_FAILURE_PREFIX}${workflowFailures.map(e => e.segment).join(', ')}`;
+              getLog().warn(
+                { nodeId: node.id, systemContent: filteredMsg },
+                'dag.provider_warning_forwarded'
+              );
+              const delivered = await safeSendMessage(
+                platform,
+                conversationId,
+                filteredMsg,
+                nodeContext
+              );
+              if (!delivered) {
+                getLog().error(
+                  { nodeId: node.id, workflowRunId: workflowRun.id },
+                  'dag.provider_warning_delivery_failed'
+                );
+              }
+            }
+            if (pluginFailures.length > 0) {
+              getLog().debug(
+                { nodeId: node.id, pluginFailures: pluginFailures.map(e => e.name) },
+                'dag.mcp_plugin_connection_suppressed'
+              );
+            }
+          } else if (msg.content.startsWith('⚠️')) {
             getLog().warn(
-              { nodeId: node.id, systemContent: filteredMsg },
+              { nodeId: node.id, systemContent: msg.content },
               'dag.provider_warning_forwarded'
             );
             const delivered = await safeSendMessage(
               platform,
               conversationId,
-              filteredMsg,
+              msg.content,
               nodeContext
             );
             if (!delivered) {
@@ -1847,196 +2205,181 @@ async function executeNodeInternal(
                 'dag.provider_warning_delivery_failed'
               );
             }
-          }
-          if (pluginFailures.length > 0) {
+          } else {
             getLog().debug(
-              { nodeId: node.id, pluginFailures: pluginFailures.map(e => e.name) },
-              'dag.mcp_plugin_connection_suppressed'
+              { nodeId: node.id, systemContent: msg.content },
+              'dag.system_message_unhandled'
             );
           }
-        } else if (msg.content.startsWith('⚠️')) {
-          getLog().warn(
-            { nodeId: node.id, systemContent: msg.content },
-            'dag.provider_warning_forwarded'
-          );
-          const delivered = await safeSendMessage(
-            platform,
-            conversationId,
-            msg.content,
-            nodeContext
-          );
-          if (!delivered) {
-            getLog().error(
-              { nodeId: node.id, workflowRunId: workflowRun.id },
-              'dag.provider_warning_delivery_failed'
-            );
-          }
-        } else {
-          getLog().debug(
-            { nodeId: node.id, systemContent: msg.content },
-            'dag.system_message_unhandled'
-          );
+        } else if (msg.type === 'task_started') {
+          // Subagent task spawned inside this node (Claude Task tool or
+          // inline sub-agent). Forward as a task_activity emitter event so
+          // the Web UI can render it as an expandable sub-item under the
+          // parent node in the run detail view.
+          getWorkflowEventEmitter().emit({
+            type: 'task_activity',
+            runId: workflowRun.id,
+            nodeId: node.id,
+            taskId: msg.taskId,
+            activity: 'started',
+            ...(msg.description !== undefined ? { description: msg.description } : {}),
+            ...(msg.taskType !== undefined ? { taskType: msg.taskType } : {}),
+          });
+          deps.store
+            .createWorkflowEvent({
+              workflow_run_id: workflowRun.id,
+              event_type: 'task_activity',
+              step_name: stepName,
+              data: {
+                task_id: msg.taskId,
+                activity: 'started',
+                ...(msg.description !== undefined ? { description: msg.description } : {}),
+                ...(msg.taskType !== undefined ? { task_type: msg.taskType } : {}),
+              },
+            })
+            .catch((err: Error) => {
+              getLog().error(
+                { err, workflowRunId: workflowRun.id, eventType: 'task_activity' },
+                'workflow_event_persist_failed'
+              );
+            });
+        } else if (msg.type === 'task_progress') {
+          getWorkflowEventEmitter().emit({
+            type: 'task_activity',
+            runId: workflowRun.id,
+            nodeId: node.id,
+            taskId: msg.taskId,
+            activity: 'progress',
+            ...(msg.description !== undefined ? { description: msg.description } : {}),
+            ...(msg.summary !== undefined ? { summary: msg.summary } : {}),
+            ...(msg.usage !== undefined ? { usage: msg.usage } : {}),
+            ...(msg.lastToolName !== undefined ? { lastToolName: msg.lastToolName } : {}),
+          });
+          // task_progress fires every ~30s while a subagent is running. Persist
+          // it for the timeline view but don't log — the volume would dominate.
+          deps.store
+            .createWorkflowEvent({
+              workflow_run_id: workflowRun.id,
+              event_type: 'task_activity',
+              step_name: stepName,
+              data: {
+                task_id: msg.taskId,
+                activity: 'progress',
+                ...(msg.description !== undefined ? { description: msg.description } : {}),
+                ...(msg.summary !== undefined ? { summary: msg.summary } : {}),
+                ...(msg.usage !== undefined ? { usage: msg.usage } : {}),
+                ...(msg.lastToolName !== undefined ? { last_tool_name: msg.lastToolName } : {}),
+              },
+            })
+            .catch((err: Error) => {
+              getLog().error(
+                { err, workflowRunId: workflowRun.id, eventType: 'task_activity' },
+                'workflow_event_persist_failed'
+              );
+            });
+        } else if (msg.type === 'task_notification') {
+          getWorkflowEventEmitter().emit({
+            type: 'task_activity',
+            runId: workflowRun.id,
+            nodeId: node.id,
+            taskId: msg.taskId,
+            activity: msg.status,
+            ...(msg.summary !== undefined ? { summary: msg.summary } : {}),
+            ...(msg.usage !== undefined ? { usage: msg.usage } : {}),
+            ...(msg.outputFile ? { outputFile: msg.outputFile } : {}),
+          });
+          deps.store
+            .createWorkflowEvent({
+              workflow_run_id: workflowRun.id,
+              event_type: 'task_activity',
+              step_name: stepName,
+              data: {
+                task_id: msg.taskId,
+                activity: msg.status,
+                ...(msg.summary !== undefined ? { summary: msg.summary } : {}),
+                ...(msg.usage !== undefined ? { usage: msg.usage } : {}),
+                // Where the settled task wrote its output — the artifact trail
+                // for delegated work (#2083).
+                ...(msg.outputFile ? { output_file: msg.outputFile } : {}),
+              },
+            })
+            .catch((err: Error) => {
+              getLog().error(
+                { err, workflowRunId: workflowRun.id, eventType: 'task_activity' },
+                'workflow_event_persist_failed'
+              );
+            });
+        } else if (msg.type === 'hook_started') {
+          getWorkflowEventEmitter().emit({
+            type: 'hook_activity',
+            runId: workflowRun.id,
+            nodeId: node.id,
+            hookId: msg.hookId,
+            hookName: msg.hookName,
+            hookEvent: msg.hookEvent,
+            activity: 'started',
+          });
+          deps.store
+            .createWorkflowEvent({
+              workflow_run_id: workflowRun.id,
+              event_type: 'hook_activity',
+              step_name: stepName,
+              data: {
+                hook_id: msg.hookId,
+                hook_name: msg.hookName,
+                hook_event: msg.hookEvent,
+                activity: 'started',
+              },
+            })
+            .catch((err: Error) => {
+              getLog().error(
+                { err, workflowRunId: workflowRun.id, eventType: 'hook_activity' },
+                'workflow_event_persist_failed'
+              );
+            });
+        } else if (msg.type === 'hook_response') {
+          getWorkflowEventEmitter().emit({
+            type: 'hook_activity',
+            runId: workflowRun.id,
+            nodeId: node.id,
+            hookId: msg.hookId,
+            hookName: msg.hookName,
+            hookEvent: msg.hookEvent,
+            activity: 'response',
+            outcome: msg.outcome,
+            ...(msg.exitCode !== undefined ? { exitCode: msg.exitCode } : {}),
+          });
+          deps.store
+            .createWorkflowEvent({
+              workflow_run_id: workflowRun.id,
+              event_type: 'hook_activity',
+              step_name: stepName,
+              data: {
+                hook_id: msg.hookId,
+                hook_name: msg.hookName,
+                hook_event: msg.hookEvent,
+                activity: 'response',
+                outcome: msg.outcome,
+                ...(msg.exitCode !== undefined ? { exit_code: msg.exitCode } : {}),
+              },
+            })
+            .catch((err: Error) => {
+              getLog().error(
+                { err, workflowRunId: workflowRun.id, eventType: 'hook_activity' },
+                'workflow_event_persist_failed'
+              );
+            });
         }
-      } else if (msg.type === 'task_started') {
-        // Subagent task spawned inside this node (Claude Task tool or
-        // inline sub-agent). Forward as a task_activity emitter event so
-        // the Web UI can render it as an expandable sub-item under the
-        // parent node in the run detail view.
-        getWorkflowEventEmitter().emit({
-          type: 'task_activity',
-          runId: workflowRun.id,
-          nodeId: node.id,
-          taskId: msg.taskId,
-          activity: 'started',
-          ...(msg.description !== undefined ? { description: msg.description } : {}),
-          ...(msg.taskType !== undefined ? { taskType: msg.taskType } : {}),
-        });
-        deps.store
-          .createWorkflowEvent({
-            workflow_run_id: workflowRun.id,
-            event_type: 'task_activity',
-            step_name: stepName,
-            data: {
-              task_id: msg.taskId,
-              activity: 'started',
-              ...(msg.description !== undefined ? { description: msg.description } : {}),
-              ...(msg.taskType !== undefined ? { task_type: msg.taskType } : {}),
-            },
-          })
-          .catch((err: Error) => {
-            getLog().error(
-              { err, workflowRunId: workflowRun.id, eventType: 'task_activity' },
-              'workflow_event_persist_failed'
-            );
-          });
-      } else if (msg.type === 'task_progress') {
-        getWorkflowEventEmitter().emit({
-          type: 'task_activity',
-          runId: workflowRun.id,
-          nodeId: node.id,
-          taskId: msg.taskId,
-          activity: 'progress',
-          ...(msg.description !== undefined ? { description: msg.description } : {}),
-          ...(msg.summary !== undefined ? { summary: msg.summary } : {}),
-          ...(msg.usage !== undefined ? { usage: msg.usage } : {}),
-          ...(msg.lastToolName !== undefined ? { lastToolName: msg.lastToolName } : {}),
-        });
-        // task_progress fires every ~30s while a subagent is running. Persist
-        // it for the timeline view but don't log — the volume would dominate.
-        deps.store
-          .createWorkflowEvent({
-            workflow_run_id: workflowRun.id,
-            event_type: 'task_activity',
-            step_name: stepName,
-            data: {
-              task_id: msg.taskId,
-              activity: 'progress',
-              ...(msg.description !== undefined ? { description: msg.description } : {}),
-              ...(msg.summary !== undefined ? { summary: msg.summary } : {}),
-              ...(msg.usage !== undefined ? { usage: msg.usage } : {}),
-              ...(msg.lastToolName !== undefined ? { last_tool_name: msg.lastToolName } : {}),
-            },
-          })
-          .catch((err: Error) => {
-            getLog().error(
-              { err, workflowRunId: workflowRun.id, eventType: 'task_activity' },
-              'workflow_event_persist_failed'
-            );
-          });
-      } else if (msg.type === 'task_notification') {
-        getWorkflowEventEmitter().emit({
-          type: 'task_activity',
-          runId: workflowRun.id,
-          nodeId: node.id,
-          taskId: msg.taskId,
-          activity: msg.status,
-          ...(msg.summary !== undefined ? { summary: msg.summary } : {}),
-          ...(msg.usage !== undefined ? { usage: msg.usage } : {}),
-          ...(msg.outputFile ? { outputFile: msg.outputFile } : {}),
-        });
-        deps.store
-          .createWorkflowEvent({
-            workflow_run_id: workflowRun.id,
-            event_type: 'task_activity',
-            step_name: stepName,
-            data: {
-              task_id: msg.taskId,
-              activity: msg.status,
-              ...(msg.summary !== undefined ? { summary: msg.summary } : {}),
-              ...(msg.usage !== undefined ? { usage: msg.usage } : {}),
-              // Where the settled task wrote its output — the artifact trail
-              // for delegated work (#2083).
-              ...(msg.outputFile ? { output_file: msg.outputFile } : {}),
-            },
-          })
-          .catch((err: Error) => {
-            getLog().error(
-              { err, workflowRunId: workflowRun.id, eventType: 'task_activity' },
-              'workflow_event_persist_failed'
-            );
-          });
-      } else if (msg.type === 'hook_started') {
-        getWorkflowEventEmitter().emit({
-          type: 'hook_activity',
-          runId: workflowRun.id,
-          nodeId: node.id,
-          hookId: msg.hookId,
-          hookName: msg.hookName,
-          hookEvent: msg.hookEvent,
-          activity: 'started',
-        });
-        deps.store
-          .createWorkflowEvent({
-            workflow_run_id: workflowRun.id,
-            event_type: 'hook_activity',
-            step_name: stepName,
-            data: {
-              hook_id: msg.hookId,
-              hook_name: msg.hookName,
-              hook_event: msg.hookEvent,
-              activity: 'started',
-            },
-          })
-          .catch((err: Error) => {
-            getLog().error(
-              { err, workflowRunId: workflowRun.id, eventType: 'hook_activity' },
-              'workflow_event_persist_failed'
-            );
-          });
-      } else if (msg.type === 'hook_response') {
-        getWorkflowEventEmitter().emit({
-          type: 'hook_activity',
-          runId: workflowRun.id,
-          nodeId: node.id,
-          hookId: msg.hookId,
-          hookName: msg.hookName,
-          hookEvent: msg.hookEvent,
-          activity: 'response',
-          outcome: msg.outcome,
-          ...(msg.exitCode !== undefined ? { exitCode: msg.exitCode } : {}),
-        });
-        deps.store
-          .createWorkflowEvent({
-            workflow_run_id: workflowRun.id,
-            event_type: 'hook_activity',
-            step_name: stepName,
-            data: {
-              hook_id: msg.hookId,
-              hook_name: msg.hookName,
-              hook_event: msg.hookEvent,
-              activity: 'response',
-              outcome: msg.outcome,
-              ...(msg.exitCode !== undefined ? { exit_code: msg.exitCode } : {}),
-            },
-          })
-          .catch((err: Error) => {
-            getLog().error(
-              { err, workflowRunId: workflowRun.id, eventType: 'hook_activity' },
-              'workflow_event_persist_failed'
-            );
-          });
+        // rate_limit chunks: already log.warn'd in claude.ts; not surfaced to SSE per design
       }
-      // rate_limit chunks: already log.warn'd in claude.ts; not surfaced to SSE per design
+    } finally {
+      if (totalDeadlineTimer !== undefined) clearTimeout(totalDeadlineTimer);
+    }
+
+    if (nodeTotalTimedOut) {
+      throw new Error(
+        `Node '${node.id}' exceeded total timeout of ${String(nodeTotalTimeoutMs(node))}ms`
+      );
     }
 
     // Stream ended with background tasks still live: the SDK subprocess died or
@@ -2107,6 +2450,10 @@ async function executeNodeInternal(
       await emitReask(reaskAttempt);
     };
     while (true) {
+      await budgetPassCheckpoint?.(
+        { state: 'completed', output: '', tokens: { input: 0, output: 0 } },
+        { state: 'completed', output: '', tokens: { input: 0, output: 0 } }
+      );
       // Fresh session per reask attempt (resume only the original session on the
       // first pass) so a prior invalid turn isn't carried forward.
       await runStreamPass(reaskPrompt, reaskAttempt === 0 ? resumeSessionId : undefined);
@@ -2117,6 +2464,31 @@ async function executeNodeInternal(
       // paths (which jump straight to the outer catch) report cost across ALL reask
       // attempts, not just the last pass. runStreamPass clears it next iteration.
       nodeCostUsd = accumulatedCostUsd;
+      if (nodeTokens === undefined) {
+        passTokenUsageUnknown = true;
+      } else if (!passTokenUsageUnknown) {
+        const mergedTokens = mergeTokenUsage(accumulatedNodeTokens, nodeTokens);
+        if (mergedTokens === undefined) {
+          passTokenUsageUnknown = true;
+        } else {
+          accumulatedNodeTokens = mergedTokens;
+        }
+      }
+      const rawPassTokens = passTokenUsageUnknown ? undefined : nodeTokens;
+      nodeTokens = passTokenUsageUnknown ? undefined : accumulatedNodeTokens;
+      nodeTokensAreAccumulated = true;
+      await budgetPassCheckpoint?.(
+        {
+          state: 'completed',
+          output: nodeOutputText,
+          ...(accumulatedNodeTokens !== undefined ? { tokens: accumulatedNodeTokens } : {}),
+        },
+        {
+          state: 'completed',
+          output: nodeOutputText,
+          ...(rawPassTokens !== undefined ? { tokens: rawPassTokens } : {}),
+        }
+      );
 
       // When output_format is set and the provider returned structured_output, use
       // it instead of the concatenated assistant text. Each provider normalizes its
@@ -2193,6 +2565,11 @@ async function executeNodeInternal(
       // Surface the real cause: a timeout/abort produces no structured output too,
       // and reporting it as "the model replied with prose" would mislead.
       if (nodeIdleTimedOut) {
+        if (nodeTotalTimedOut) {
+          throw new Error(
+            `Node '${node.id}' exceeded total timeout of ${String(nodeTotalTimeoutMs(node))}ms before producing the required structured output.`
+          );
+        }
         throw new Error(
           `Node '${node.id}': timed out (no output for ${String(effectiveIdleTimeout / 60000)} min) before producing the required structured output.`
         );
@@ -2200,6 +2577,12 @@ async function executeNodeInternal(
       throw new Error(
         `Node '${node.id}': output_format declared but the provider returned no schema-valid structured output. ` +
           'The model likely replied with prose, refused, or emitted unparseable JSON.'
+      );
+    }
+
+    if (nodeTotalTimedOut) {
+      throw new Error(
+        `Node '${node.id}' exceeded total timeout of ${String(nodeTotalTimeoutMs(node))}ms`
       );
     }
 
@@ -2218,7 +2601,7 @@ async function executeNodeInternal(
     }
 
     // If cancelled during streaming (not idle timeout), return as failed with cancel reason
-    if (nodeAbortController.signal.aborted && !nodeIdleTimedOut) {
+    if (nodeAbortController.signal.aborted && !nodeIdleTimedOut && !nodeTotalTimedOut) {
       const duration = Date.now() - nodeStartTime;
       getLog().info(
         { nodeId: node.id, durationMs: duration },
@@ -2335,6 +2718,8 @@ async function executeNodeInternal(
       return { state: 'failed', output: '', error: emptyError };
     }
 
+    nodeTokens = passTokenUsageUnknown ? undefined : accumulatedNodeTokens;
+
     const duration = Date.now() - nodeStartTime;
     getLog().info({ nodeId: node.id, durationMs: duration }, 'dag_node_completed');
     await logNodeComplete(logDir, workflowRun.id, node.id, node.command ?? '<inline>', {
@@ -2404,20 +2789,26 @@ async function executeNodeInternal(
     };
   } catch (error) {
     const err = error as Error;
+    const failedNodeTokens = resolveFailedNodeTokens(
+      accumulatedNodeTokens,
+      nodeTokens,
+      nodeTokensAreAccumulated,
+      passTokenUsageUnknown
+    );
 
     // Clean up throttle entries on failure
     lastNodeCancelCheck.delete(`${workflowRun.id}:${node.id}`);
     lastNodeActivityUpdate.delete(`${workflowRun.id}:${node.id}`);
 
     // If the abort was triggered by user cancel (not idle timeout), classify as cancel
-    if (nodeAbortController.signal.aborted && !nodeIdleTimedOut) {
+    if (nodeAbortController.signal.aborted && !nodeIdleTimedOut && !nodeTotalTimedOut) {
       getLog().info({ nodeId: node.id }, 'dag_node_cancelled_via_abort');
       return {
         state: 'failed',
         output: nodeOutputText,
         error: 'Cancelled by user',
         costUsd: nodeCostUsd,
-        ...(nodeTokens !== undefined ? { tokens: nodeTokens } : {}),
+        ...(failedNodeTokens !== undefined ? { tokens: failedNodeTokens } : {}),
       };
     }
 
@@ -2451,7 +2842,7 @@ async function executeNodeInternal(
       output: '',
       error: err.message,
       costUsd: nodeCostUsd,
-      ...(nodeTokens !== undefined ? { tokens: nodeTokens } : {}),
+      ...(failedNodeTokens !== undefined ? { tokens: failedNodeTokens } : {}),
     };
   }
 }
@@ -2511,14 +2902,20 @@ async function runSubprocess(
   execContext: ExecutionContext,
   cmd: string,
   args: string[],
-  options: { cwd: string; timeout: number; env: NodeJS.ProcessEnv }
+  options: {
+    cwd: string;
+    timeout: number;
+    env: NodeJS.ProcessEnv;
+    deadlineAt?: number;
+    getRunStatus?: () => Promise<string | null>;
+  }
 ): Promise<{ stdout: string; stderr: string }> {
   if (execContext.kind === 'container') {
     const dockerArgs = buildSubprocessDockerArgs(execContext, cmd, args, {
       cwd: options.cwd,
       env: options.env,
     });
-    return execFileAsync('docker', dockerArgs, { timeout: options.timeout });
+    return runGuardedContainerSubprocess(execContext, dockerArgs, options);
   }
   return execFileAsync(cmd, args, {
     cwd: options.cwd,
@@ -2596,7 +2993,8 @@ async function executeBashNode(
   envVars?: Record<string, string>,
   stepNamePrefix = '',
   iteration?: number,
-  execContext: ExecutionContext = { kind: 'host' }
+  execContext: ExecutionContext = { kind: 'host' },
+  deadlineAt?: number
 ): Promise<NodeOutput> {
   const nodeStartTime = Date.now();
   const nodeContext: SendMessageContext = { workflowId: workflowRun.id, nodeName: node.id };
@@ -2641,7 +3039,7 @@ async function executeBashNode(
     undefined,
     undefined,
     undefined,
-    { shellSafe: true, stateDir }
+    { shellSafe: true, stateDir, execContext: execContext }
   );
   const finalScript = substituteNodeOutputRefs(substitutedScript, nodeOutputs, true, logDir);
 
@@ -2654,11 +3052,12 @@ async function executeBashNode(
   // The GitHub-token scrub keys (GH_TOKEN/GITHUB_TOKEN/COPILOT_GITHUB_TOKEN) are
   // disjoint from the reserved set and stay in the bag, still overriding the ambient
   // host token via runSubprocess's process.env layering — the scrub is unaffected.
+  const agentPaths = resolveAgentOutputPaths(artifactsDir, stateDir, logDir, execContext);
   const subprocessEnv: NodeJS.ProcessEnv = {
     ...(envVars ?? {}),
-    ARTIFACTS_DIR: artifactsDir,
-    STATE_DIR: stateDir,
-    LOG_DIR: logDir,
+    ARTIFACTS_DIR: agentPaths.artifactsDir,
+    STATE_DIR: agentPaths.stateDir,
+    LOG_DIR: agentPaths.logDir,
     BASE_BRANCH: baseBranch,
     USER_MESSAGE: workflowRun.user_message,
     ARGUMENTS: workflowRun.user_message,
@@ -2675,6 +3074,8 @@ async function executeBashNode(
     const { stdout, stderr } = await runSubprocess(execContext, bashPath, ['-c', finalScript], {
       cwd,
       timeout,
+      deadlineAt,
+      getRunStatus: () => deps.store.getWorkflowRunStatus(workflowRun.id),
       env: subprocessEnv,
     });
 
@@ -2856,7 +3257,8 @@ async function executeScriptNode(
   // env (never spliced into source — #2115). '' for top-level scripts and non-first
   // iterations (mirrors executeBashNode, which delivers loop input via quoted splice).
   loopUserInput = '',
-  execContext: ExecutionContext = { kind: 'host' }
+  execContext: ExecutionContext = { kind: 'host' },
+  deadlineAt?: number
 ): Promise<NodeOutput> {
   const nodeStartTime = Date.now();
   const nodeContext: SendMessageContext = { workflowId: workflowRun.id, nodeName: node.id };
@@ -2908,7 +3310,7 @@ async function executeScriptNode(
     undefined,
     undefined,
     undefined,
-    { shellSafe: true, stateDir }
+    { shellSafe: true, stateDir, execContext: execContext }
   );
   const finalScript = substituteNodeOutputRefs(substitutedScript, nodeOutputs, false);
 
@@ -2925,11 +3327,12 @@ async function executeScriptNode(
   // always win — a codebase env var named ARGUMENTS/CONTEXT/… must never shadow this
   // delivery channel. The GitHub-token scrub keys are disjoint from the reserved set
   // and still override the ambient host token via runSubprocess (scrub unaffected).
+  const agentPaths = resolveAgentOutputPaths(artifactsDir, stateDir, logDir, execContext);
   const subprocessEnv: NodeJS.ProcessEnv = {
     ...(envVars ?? {}),
-    ARTIFACTS_DIR: artifactsDir,
-    STATE_DIR: stateDir,
-    LOG_DIR: logDir,
+    ARTIFACTS_DIR: agentPaths.artifactsDir,
+    STATE_DIR: agentPaths.stateDir,
+    LOG_DIR: agentPaths.logDir,
     BASE_BRANCH: baseBranch,
     USER_MESSAGE: workflowRun.user_message,
     ARGUMENTS: workflowRun.user_message,
@@ -3047,6 +3450,8 @@ async function executeScriptNode(
     const { stdout, stderr } = await runSubprocess(execContext, cmd, args, {
       cwd,
       timeout,
+      deadlineAt,
+      getRunStatus: () => deps.store.getWorkflowRunStatus(workflowRun.id),
       env: subprocessEnv,
     });
 
@@ -3316,7 +3721,10 @@ async function executeLoopGroupNode(
   issueContext?: string,
   stepNamePrefix = '',
   execContext: ExecutionContext = { kind: 'host' },
-  runChildWorkflow?: RunChildWorkflowFn
+  runChildWorkflow?: RunChildWorkflowFn,
+  workflowDigest = '',
+  budget?: ActiveWorkflowBudget,
+  budgetBaseUsage: { input: number; output: number } = { input: 0, output: 0 }
 ): Promise<NodeExecutionResult> {
   const group = node.loop_group;
   const msgContext = { workflowId: workflowRun.id, nodeName: node.id };
@@ -3475,6 +3883,7 @@ async function executeLoopGroupNode(
       runChildWorkflow,
       workflowRun,
       workflowName: node.id,
+      workflowDigest,
       config,
       workflowProvider,
       // Forward inherited workflow-level model/tier/options/profile so body AI nodes
@@ -3514,6 +3923,11 @@ async function executeLoopGroupNode(
       totalTokensIn: 0,
       totalTokensOut: 0,
       totalLoopIterations: 0,
+      budget,
+      budgetBaseUsage: {
+        input: budgetBaseUsage.input + (loopTotalTokens?.input ?? 0),
+        output: budgetBaseUsage.output + (loopTotalTokens?.output ?? 0),
+      },
       stepNamePrefix: bodyStepNamePrefix,
       iteration: i,
       // Deliver this iteration's approval-gate free-text to body script: nodes via env
@@ -3617,7 +4031,7 @@ async function executeLoopGroupNode(
           i === startIteration ? loopUserInput : undefined,
           undefined,
           undefined,
-          { shellSafe: true, stateDir }
+          { shellSafe: true, stateDir, execContext: execContext }
         );
         const substitutedBash = substituteNodeOutputRefs(
           bashPrompt,
@@ -3628,6 +4042,8 @@ async function executeLoopGroupNode(
         await runSubprocess(execContext, groupBashPath, ['-c', substitutedBash], {
           cwd,
           timeout: SUBPROCESS_DEFAULT_TIMEOUT,
+          deadlineAt: budget?.deadlineAtMs,
+          getRunStatus: () => deps.store.getWorkflowRunStatus(workflowRun.id),
           // Archon-managed env only (no process.env spread) — runSubprocess
           // layers the host env for host runs, or delivers ONLY this bag into
           // the container. Configured project env spreads FIRST so the reserved
@@ -3964,6 +4380,7 @@ export function applyLoopPrevToBodyNode(
   if (isScriptNode(node)) return { ...node, script: sub(node.script, false, true) };
   // Cancel reason is display text, never executed — mirrors the normal-path default.
   if (isCancelNode(node)) return { ...node, cancel: sub(node.cancel) };
+  if (isControllerActionNode(node)) return node;
   if ('command' in node && typeof node.command === 'string')
     return { ...node, command: sub(node.command) };
   if ('prompt' in node && typeof node.prompt === 'string')
@@ -4001,7 +4418,10 @@ async function executeLoopNode(
   execContext: ExecutionContext = { kind: 'host' },
   resolvedModel?: string,
   resolvedTier?: TierName,
-  resolvedEffort?: string
+  resolvedEffort?: string,
+  budget?: ActiveWorkflowBudget,
+  budgetBaseUsage: { input: number; output: number } = { input: 0, output: 0 },
+  containerCtx?: ContainerRunContext
 ): Promise<NodeExecutionResult> {
   const loop = node.loop;
   const msgContext = { workflowId: workflowRun.id, nodeName: node.id };
@@ -4222,8 +4642,13 @@ async function executeLoopNode(
   const logEventStoreError = (err: Error, iteration: number): void => {
     getLog().error({ err, nodeId: node.id, iteration }, 'loop_node.iteration_event_failed');
   };
+  const hardenedLoopRequiresLedger = isHardenedContainerContext(execContext);
 
   for (let i = startIteration; i <= loop.max_iterations; i++) {
+    assertWorkflowBudgetCanContinue(budget, `Loop '${node.id}' iteration ${String(i)}`, {
+      input: budgetBaseUsage.input + (loopTotalTokens?.input ?? 0),
+      output: budgetBaseUsage.output + (loopTotalTokens?.output ?? 0),
+    });
     const iterationStart = Date.now();
 
     // Check for non-running status between iterations. `paused` is tolerated
@@ -4306,6 +4731,7 @@ async function executeLoopNode(
     // result still carries the iteration's cost, which the totals reported
     // on the failure return must include, matching the old += behavior).
     let iterationUsageFolded = false;
+    let budgetTimer: ReturnType<typeof setTimeout> | undefined;
     const foldIterationUsage = (): void => {
       if (iterationUsageFolded) return;
       iterationUsageFolded = true;
@@ -4342,7 +4768,7 @@ async function executeLoopNode(
         i === startIteration ? loopUserInput : '',
         undefined, // rejectionReason
         i === startIteration ? '' : lastIterationOutput,
-        { stateDir }
+        { stateDir, execContext: execContext }
       );
       const finalPrompt = substituteNodeOutputRefs(substitutedPrompt, nodeOutputs);
 
@@ -4351,6 +4777,31 @@ async function executeLoopNode(
         abortSignal: iterationAbortController.signal,
       };
 
+      if (budget || hardenedLoopRequiresLedger) {
+        const ledgerStatus = await readRequiredVerifiedHardenedBudgetStatus(containerCtx);
+        if (budget) {
+          assertLedgerStatusMatchesBudget(ledgerStatus, budget);
+          await persistWorkflowBudgetState(deps, workflowRun.id, budget, ledgerStatus.consumed);
+          assertWorkflowBudgetCanContinue(
+            budget,
+            `Loop '${node.id}' iteration ${String(i)}`,
+            ledgerStatus.consumed
+          );
+        }
+      }
+      const budgetRemaining = remainingDeadlineMs(budget?.deadlineAtMs);
+      if (budgetRemaining === 0) {
+        iterationAbortController.abort();
+        throw new Error(
+          `Loop '${node.id}' iteration ${String(i)} exceeded hardened workflow deadline`
+        );
+      }
+      budgetTimer =
+        budgetRemaining === undefined
+          ? undefined
+          : setTimeout(() => {
+              iterationAbortController.abort();
+            }, budgetRemaining);
       const generator = aiClient.sendQuery(finalPrompt, cwd, resumeSessionId, iterationOptions);
       const runningTools = new Map<string, RunningTool>();
       let anonymousToolSequence = 0;
@@ -4645,7 +5096,20 @@ async function executeLoopNode(
         }
         // rate_limit chunks: already log.warn'd in claude.ts; not surfaced to SSE per design
       }
+      if (budgetTimer !== undefined) clearTimeout(budgetTimer);
       foldIterationUsage();
+      if (budget || hardenedLoopRequiresLedger) {
+        const ledgerStatus = await readRequiredVerifiedHardenedBudgetStatus(containerCtx);
+        if (budget) {
+          assertLedgerStatusMatchesBudget(ledgerStatus, budget);
+          await persistWorkflowBudgetState(deps, workflowRun.id, budget, ledgerStatus.consumed);
+          assertWorkflowBudgetCanContinue(
+            budget,
+            `Loop '${node.id}' iteration ${String(i)}`,
+            ledgerStatus.consumed
+          );
+        }
+      }
 
       // Stream ended with background tasks still live (idle timeout mid-wait or
       // subprocess death): their artifacts may be missing — record the
@@ -4698,6 +5162,7 @@ async function executeLoopNode(
         });
       }
     } catch (error) {
+      if (budgetTimer !== undefined) clearTimeout(budgetTimer);
       foldIterationUsage();
       const err = error as Error;
       const duration = Date.now() - iterationStart;
@@ -4814,7 +5279,7 @@ async function executeLoopNode(
           undefined,
           undefined,
           undefined,
-          { shellSafe: true, stateDir }
+          { shellSafe: true, stateDir, execContext: execContext }
         );
         const substitutedBash = substituteNodeOutputRefs(
           bashPrompt,
@@ -4825,6 +5290,8 @@ async function executeLoopNode(
         await runSubprocess(execContext, loopBashPath, ['-c', substitutedBash], {
           cwd,
           timeout: SUBPROCESS_DEFAULT_TIMEOUT,
+          deadlineAt: budget?.deadlineAtMs,
+          getRunStatus: () => deps.store.getWorkflowRunStatus(workflowRun.id),
           // Archon-managed env only (no process.env spread) — runSubprocess
           // layers the host env for host runs, or delivers ONLY this bag into
           // the container. Configured project env (managed per-project vars +
@@ -5121,6 +5588,16 @@ async function pauseGateRespectingExternalTransition(
   });
 }
 
+async function persistAuthorityEvent(
+  deps: WorkflowDeps,
+  data: Parameters<WorkflowDeps['store']['createWorkflowEvent']>[0]
+): Promise<void> {
+  if (!deps.store.createWorkflowEventStrict) {
+    throw new Error('Controller authority requires durable event persistence support');
+  }
+  await deps.store.createWorkflowEventStrict(data);
+}
+
 /**
  * Execute an approval node — pauses workflow for human review.
  * On rejection resume (when on_reject is configured): runs the on_reject prompt via AI,
@@ -5149,8 +5626,11 @@ async function executeApprovalNode(
   workflowPreset?: ModelAliasPreset,
   stepNamePrefix = '',
   iteration?: number,
-  execContext: ExecutionContext = { kind: 'host' }
-): Promise<NodeOutput> {
+  execContext: ExecutionContext = { kind: 'host' },
+  budget?: ActiveWorkflowBudget,
+  budgetBaseUsage: { input: number; output: number } = { input: 0, output: 0 }
+): Promise<NodeExecutionResult> {
+  let repromptUsage: Pick<NodeExecutionResult, 'tokens' | 'costUsd'> = {};
   const msgContext = { workflowId: workflowRun.id, nodeName: node.id };
   // Namespaced persisted step_name for loop_group bodies ('' → node.id at top level, #2090).
   const stepName = stepNamePrefix + node.id;
@@ -5211,7 +5691,7 @@ async function executeApprovalNode(
       undefined, // loopUserInput
       rejectionReason,
       undefined, // loopPrevOutput
-      { stateDir }
+      { stateDir, execContext: execContext }
     );
 
     // Build a synthetic PromptNode to reuse executeNodeInternal.
@@ -5277,8 +5757,21 @@ async function executeApprovalNode(
       resolvedTier,
       resolvedEffort,
       stepNamePrefix,
-      iteration
+      iteration,
+      budget?.deadlineAtMs
     );
+    await checkpointHardenedAiAttempt(
+      deps,
+      workflowRun.id,
+      budget,
+      undefined,
+      `Approval ${node.id} rejection`,
+      budgetBaseUsage,
+      { input: 0, output: 0 },
+      output,
+      output
+    );
+    repromptUsage = { tokens: output.tokens, costUsd: output.costUsd };
 
     if (output.state === 'failed') {
       return output;
@@ -5296,19 +5789,18 @@ async function executeApprovalNode(
     `Approve: \`/workflow approve ${workflowRun.id}\` | Reject: \`/workflow reject ${workflowRun.id}\``;
   await safeSendMessage(platform, conversationId, approvalMsg, msgContext);
 
-  deps.store
-    .createWorkflowEvent({
-      workflow_run_id: workflowRun.id,
-      event_type: 'approval_requested',
-      step_name: stepName,
-      data: { message: renderedMessage },
-    })
-    .catch((err: Error) => {
-      getLog().error(
-        { err, workflowRunId: workflowRun.id, eventType: 'approval_requested' },
-        'workflow.event_persist_failed'
-      );
+  const approvalEvent = {
+    workflow_run_id: workflowRun.id,
+    event_type: 'approval_requested' as const,
+    step_name: stepName,
+    data: { message: renderedMessage },
+  };
+  if (execContext.kind === 'container') await persistAuthorityEvent(deps, approvalEvent);
+  else {
+    void deps.store.createWorkflowEvent(approvalEvent).catch((err: Error) => {
+      getLog().error({ err, workflowRunId: workflowRun.id }, 'workflow.event_persist_failed');
     });
+  }
 
   await pauseGateRespectingExternalTransition(deps, workflowRun.id, {
     message: renderedMessage,
@@ -5322,7 +5814,7 @@ async function executeApprovalNode(
   // Return completed — the between-layer status check will see 'paused' (or the
   // external transition that beat the pause) and break.
   // On resume, the approve endpoint writes a real node_completed event with the user's response.
-  return { state: 'completed' as const, output: '' };
+  return { state: 'completed' as const, output: '', ...repromptUsage };
 }
 
 /**
@@ -5596,6 +6088,231 @@ async function executeWorkflowNode(
     return await interpret(childOutcomeFromRun(existing));
   } catch (err) {
     return failResult(`Sub-run '${node.workflow}' errored: ${(err as Error).message}`);
+  }
+}
+
+function controllerActionGrantFor(
+  node: ControllerActionNode,
+  ctx: RunLayersContext
+): ControllerActionGrant | undefined {
+  return (ctx.deps.controllerActionGrants ?? []).find(
+    grant =>
+      grant.runId === ctx.workflowRun.id &&
+      grant.workflowName === ctx.workflowName &&
+      grant.workflowDigest === ctx.workflowDigest &&
+      grant.nodeId === node.id &&
+      grant.action === node.controller_action &&
+      grant.phase === node.phase
+  );
+}
+
+function controllerActionTimeoutMs(node: ControllerActionNode): number {
+  return nodeTotalTimeoutMs(node) ?? 30_000;
+}
+
+const CONTROLLER_ACTION_STATUS_POLL_MS = 25;
+
+async function awaitControllerAction<T>(
+  actionPromise: Promise<T>,
+  abortController: AbortController,
+  timeoutMs: number
+): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  let timedOut = false;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeout = setTimeout(() => {
+      timedOut = true;
+      abortController.abort();
+      reject(new Error(`Controller action exceeded timeout of ${String(timeoutMs)}ms`));
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([
+      actionPromise,
+      timeoutPromise,
+      new Promise<never>((_, reject) => {
+        abortController.signal.addEventListener(
+          'abort',
+          () => {
+            reject(
+              new Error(
+                timedOut
+                  ? `Controller action exceeded timeout of ${String(timeoutMs)}ms`
+                  : 'Controller action cancelled'
+              )
+            );
+          },
+          { once: true }
+        );
+      }),
+    ]);
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+  }
+}
+
+function isHardenedContainerContext(execContext: ExecutionContext): boolean {
+  if (execContext.kind !== 'container') return false;
+  return (execContext as { profile?: unknown }).profile === 'hardened';
+}
+
+async function assertControllerCompletionLive(
+  ctx: RunLayersContext,
+  signal: AbortSignal,
+  deadlineAt: number
+): Promise<void> {
+  if (signal.aborted || Date.now() > deadlineAt)
+    throw new Error('Controller action cancelled or deadline exceeded');
+  const status = await ctx.deps.store.getWorkflowRunStatus(ctx.workflowRun.id);
+  if (signal.aborted || Date.now() > deadlineAt || status !== 'running') {
+    throw new Error('Controller action is no longer live');
+  }
+}
+
+async function executeControllerActionNode(
+  node: ControllerActionNode,
+  ctx: RunLayersContext
+): Promise<NodeExecutionResult> {
+  const action = node.controller_action;
+  const handler = ctx.deps.controllerActions?.[action];
+  const stepName = ctx.stepNamePrefix + node.id;
+  const fail = (error: string): NodeExecutionResult => {
+    ctx.deps.store
+      .createWorkflowEvent({
+        workflow_run_id: ctx.workflowRun.id,
+        event_type: 'node_failed',
+        step_name: stepName,
+        data: { error, type: 'controller_action', action, phase: node.phase },
+      })
+      .catch((err: Error) => {
+        getLog().error(
+          { err, workflowRunId: ctx.workflowRun.id, eventType: 'node_failed' },
+          'workflow_event_persist_failed'
+        );
+      });
+    return { state: 'failed', output: '', error };
+  };
+
+  if (!handler) {
+    return fail(
+      `Controller action '${action}' is not configured for node '${node.id}'. ` +
+        'Privileged workflow actions require a controller-private handler binding; no bash/script fallback is allowed.'
+    );
+  }
+
+  const grant = controllerActionGrantFor(node, ctx);
+  if (!grant) {
+    return fail(
+      `Controller action '${action}' is not authorized for node '${node.id}' in workflow '${ctx.workflowName}'. ` +
+        'Grant must match run id, workflow digest, node id, action, phase, and sealed action manifest.'
+    );
+  }
+
+  if (!isControllerActionManifestSealed(grant.actionManifest)) {
+    return fail(
+      `Controller action '${action}' grant for node '${node.id}' has an invalid action manifest digest.`
+    );
+  }
+
+  const persistCompletion = ctx.deps.store.createControllerCompletionEvent?.bind(ctx.deps.store);
+  if (!persistCompletion)
+    return fail('Controller completion requires atomic running-state persistence support');
+
+  try {
+    const actionManifest = sealControllerActionManifest(grant.actionManifest);
+    const runStatus = await ctx.deps.store.getWorkflowRunStatus(ctx.workflowRun.id);
+    if (runStatus !== 'running') {
+      return fail(
+        `Controller action '${action}' refused because workflow run '${ctx.workflowRun.id}' is ${runStatus ?? 'missing'}.`
+      );
+    }
+
+    const actionAbortController = new AbortController();
+    const deadlineAt = Math.min(
+      Date.now() + controllerActionTimeoutMs(node),
+      ctx.budget?.deadlineAtMs ?? Infinity
+    );
+    const timeoutMs = deadlineAt - Date.now();
+    if (timeoutMs <= 0) return fail(`Controller action '${action}' exceeded the hardened deadline`);
+    await persistAuthorityEvent(ctx.deps, {
+      workflow_run_id: ctx.workflowRun.id,
+      event_type: 'node_started',
+      step_name: stepName,
+      data: {
+        type: 'controller_action',
+        action,
+        phase: node.phase,
+        action_manifest_id: actionManifest.id,
+        action_manifest_digest: actionManifest.digest,
+      },
+    });
+
+    const statusPoller = setInterval(() => {
+      void ctx.deps.store
+        .getWorkflowRunStatus(ctx.workflowRun.id)
+        .then(status => {
+          if (status !== 'running') actionAbortController.abort();
+        })
+        .catch((err: Error) => {
+          getLog().error(
+            { err, workflowRunId: ctx.workflowRun.id },
+            'controller_action_status_poll_failed'
+          );
+          actionAbortController.abort();
+        });
+    }, CONTROLLER_ACTION_STATUS_POLL_MS);
+
+    const startedAt = Date.now();
+    const actionPromise = Promise.resolve().then(() =>
+      handler({
+        workflowRun: ctx.workflowRun,
+        workflowName: ctx.workflowName,
+        workflowDigest: ctx.workflowDigest,
+        node,
+        actionManifest,
+        signal: actionAbortController.signal,
+        deadlineAt,
+        cwd: ctx.cwd,
+        artifactsDir: ctx.artifactsDir,
+        stateDir: ctx.stateDir,
+        logDir: ctx.logDir,
+        baseBranch: ctx.baseBranch,
+        docsDir: ctx.docsDir,
+        config: ctx.config,
+        platform: ctx.platform,
+        conversationId: ctx.conversationId,
+        execContext: ctx.execContext,
+      })
+    );
+    const rawOutput = await awaitControllerAction(
+      actionPromise,
+      actionAbortController,
+      timeoutMs
+    ).finally(() => {
+      if (statusPoller !== undefined) clearInterval(statusPoller);
+    });
+    await assertControllerCompletionLive(ctx, actionAbortController.signal, deadlineAt);
+    const output = normalizeControllerActionOutput(rawOutput);
+    const duration = Date.now() - startedAt;
+    await persistCompletion(
+      {
+        workflow_run_id: ctx.workflowRun.id,
+        event_type: 'node_completed',
+        step_name: stepName,
+        data: {
+          duration_ms: duration,
+          type: 'controller_action',
+          action,
+          phase: node.phase,
+          node_output: output,
+        },
+      },
+      deadlineAt
+    );
+    return { state: 'completed', output };
+  } catch (error) {
+    return fail(`Controller action '${action}' failed: ${(error as Error).message}`);
   }
 }
 
@@ -6437,9 +7154,12 @@ interface RunLayersContext {
   /** Where nodes in these layers execute (host, or the container in Phase B). Threaded
    *  into every AI turn's SendQueryOptions and every deterministic subprocess. */
   execContext: ExecutionContext;
+  containerCtx?: ContainerRunContext;
   workflowRun: WorkflowRun;
   /** Workflow name — used for persist_session keying + telemetry. */
   workflowName: string;
+  /** Stable digest of the loaded workflow definition used for controller grant binding. */
+  workflowDigest: string;
   config: WorkflowConfig;
   workflowProvider: string;
   workflowModel: string | undefined;
@@ -6487,6 +7207,8 @@ interface RunLayersContext {
   totalTokensIn: number;
   totalTokensOut: number;
   totalLoopIterations: number;
+  budget?: ActiveWorkflowBudget;
+  budgetBaseUsage: { input: number; output: number };
   /** Prefix prepended to every persisted `step_name` ('' for top-level, '{groupId}.' for a loop_group body). */
   stepNamePrefix: string;
   /**
@@ -6780,7 +7502,8 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                   config.envVars,
                   stepNamePrefix,
                   iteration,
-                  execContext
+                  execContext,
+                  ctx.budget?.deadlineAtMs
                 )
             );
             return { nodeId: node.id, output };
@@ -6831,7 +7554,13 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
               execContext,
               resolvedLoopModel,
               resolvedLoopTier,
-              resolvedLoopEffort
+              resolvedLoopEffort,
+              ctx.budget,
+              {
+                input: ctx.budgetBaseUsage.input + ctx.totalTokensIn,
+                output: ctx.budgetBaseUsage.output + ctx.totalTokensOut,
+              },
+              ctx.containerCtx
             );
             // Loop nodes run every iteration on the same resolved provider, so the
             // result session (if any) is attributable to loopProvider — tag it so a
@@ -6883,7 +7612,13 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
               issueContext,
               stepNamePrefix,
               execContext,
-              ctx.runChildWorkflow
+              ctx.runChildWorkflow,
+              ctx.workflowDigest,
+              ctx.budget,
+              {
+                input: ctx.budgetBaseUsage.input + ctx.totalTokensIn,
+                output: ctx.budgetBaseUsage.output + ctx.totalTokensOut,
+              }
             );
             return { nodeId: node.id, output };
           }
@@ -6913,7 +7648,12 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
               workflowPreset,
               stepNamePrefix,
               iteration,
-              execContext
+              execContext,
+              ctx.budget,
+              {
+                input: ctx.budgetBaseUsage.input + ctx.totalTokensIn,
+                output: ctx.budgetBaseUsage.output + ctx.totalTokensOut,
+              }
             );
             return { nodeId: node.id, output };
           }
@@ -6950,6 +7690,11 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
             return { nodeId: node.id, output: { state: 'completed' as const, output: reason } };
           }
 
+          if (isControllerActionNode(node)) {
+            const output = await executeControllerActionNode(node, ctx);
+            return { nodeId: node.id, output };
+          }
+
           // 3e. Script node dispatch — runs via bun or uv. Opt-in retry only,
           // same as bash (#2088): retries solely when an explicit `retry:` block
           // is declared, single attempt otherwise.
@@ -6978,7 +7723,8 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                   stepNamePrefix,
                   iteration,
                   ctx.bodyLoopUserInput ?? '',
-                  execContext
+                  execContext,
+                  ctx.budget?.deadlineAtMs
                 )
             );
             return { nodeId: node.id, output };
@@ -7124,7 +7870,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
             conversationId,
             workflowRun,
             getEffectiveNodeRetryConfig(node),
-            () =>
+            (deadlineAt, priorAttemptUsage) =>
               executeNodeInternal(
                 deps,
                 platform,
@@ -7150,9 +7896,35 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                 resolvedTier,
                 resolvedEffort,
                 stepNamePrefix,
-                iteration
+                iteration,
+                earlierDeadline(deadlineAt, ctx.budget?.deadlineAtMs),
+                (accumulatedPassOutput, rawPassOutput) =>
+                  checkpointHardenedAiAttempt(
+                    deps,
+                    workflowRun.id,
+                    ctx.budget,
+                    ctx.containerCtx,
+                    `Node '${node.id}' structured output pass`,
+                    ctx.budgetBaseUsage,
+                    { input: ctx.totalTokensIn, output: ctx.totalTokensOut },
+                    withPriorAttemptUsage(priorAttemptUsage, accumulatedPassOutput),
+                    rawPassOutput
+                  )
               ),
-            { state: 'failed', output: '', error: 'Node did not execute' } as NodeExecutionResult
+            { state: 'failed', output: '', error: 'Node did not execute' } as NodeExecutionResult,
+            nodeTotalTimeoutMs(node),
+            (attemptOutput, attempt, rawAttempt) =>
+              checkpointHardenedAiAttempt(
+                deps,
+                workflowRun.id,
+                ctx.budget,
+                ctx.containerCtx,
+                `Node '${node.id}' attempt ${String(attempt + 1)}`,
+                ctx.budgetBaseUsage,
+                { input: ctx.totalTokensIn, output: ctx.totalTokensOut },
+                attemptOutput,
+                rawAttempt
+              )
           );
 
           // Cold-resume surfacing: this node requested a session resume but the
@@ -7249,6 +8021,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
           return { nodeId: node.id, output, sessionProvider: provider };
         } catch (error) {
           const err = error as Error;
+          if (ctx.budget && isHardenedBudgetError(err)) throw err;
           getLog().error({ err, nodeId: node.id }, 'dag_node_pre_execution_failed');
           deps.store
             .createWorkflowEvent({
@@ -7304,6 +8077,13 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
           }
         }
         if (output.loopIterations !== undefined) ctx.totalLoopIterations += output.loopIterations;
+        const ledgerStatus = await readVerifiedHardenedBudgetStatus(ctx.containerCtx);
+        const consumedBudget = ledgerStatus?.consumed ?? {
+          input: ctx.budgetBaseUsage.input + ctx.totalTokensIn,
+          output: ctx.budgetBaseUsage.output + ctx.totalTokensOut,
+        };
+        await persistWorkflowBudgetState(deps, workflowRun.id, ctx.budget, consumedBudget);
+        assertWorkflowBudgetCanContinue(ctx.budget, `Node '${nodeId}'`, consumedBudget);
         ctx.nodeOutputs.set(nodeId, output);
         // Typed artifact: when a node declares `output_type`, persist its output
         // as a typed sidecar (nodes/<id>.md + .meta.json) so other nodes and
@@ -7355,9 +8135,12 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
         }
         if (output.state === 'failed') layerHadFailure = true;
       } else {
+        const err =
+          result.reason instanceof Error ? result.reason : new Error(String(result.reason));
+        if (ctx.budget && isHardenedBudgetError(err)) throw err;
         // Should not happen — all errors are caught in the inner try-catch
         // Handle defensively: log the unexpected rejection
-        getLog().error({ err: result.reason as Error, layerIdx }, 'dag_node_unexpected_rejection');
+        getLog().error({ err, layerIdx }, 'dag_node_unexpected_rejection');
         layerHadFailure = true;
         await safeSendMessage(
           platform,
@@ -7434,6 +8217,38 @@ function resolveNodeProviderForPreflight(
  * `on_reject` reprompt (the one AI turn it can spawn). Unknown providers are
  * skipped here — they fail later with a clearer "unknown provider" error.
  */
+function assertContainerWorkflowSurfaces(
+  nodes: readonly DagNode[],
+  evidencePolicy?: WorkflowEvidencePolicy
+): void {
+  if (evidencePolicy?.required) {
+    throw new Error(
+      'Legacy presence-only evidence_policy is unsupported in container runs; controller finalization is required'
+    );
+  }
+  for (const node of nodes) {
+    if (node.mcp !== undefined) {
+      throw new Error('Unpinned MCP configuration is unsupported in container runs');
+    }
+    if (isWorkflowNode(node)) {
+      throw new Error(
+        'Child workflows are unsupported in container runs until isolated child contexts and shared budgets are implemented'
+      );
+    }
+    if (('command' in node && node.command) || (isLoopNode(node) && node.loop.command)) {
+      throw new Error(
+        'Mutable host command discovery is unsupported in container runs; use a pinned inline prompt'
+      );
+    }
+    if (isScriptNode(node) && !isInlineScript(node.script)) {
+      throw new Error(
+        'Mutable host named-script discovery is unsupported in container runs; use a pinned inline script'
+      );
+    }
+    if (isLoopGroupNode(node)) assertContainerWorkflowSurfaces(node.loop_group.nodes);
+  }
+}
+
 export function collectContainerIncompatibleProviders(
   nodes: readonly DagNode[],
   workflowProvider: string,
@@ -7446,7 +8261,15 @@ export function collectContainerIncompatibleProviders(
   };
   const visit = (ns: readonly DagNode[]): void => {
     for (const node of ns) {
-      if (isBashNode(node) || isScriptNode(node) || isCancelNode(node)) continue;
+      if (
+        isBashNode(node) ||
+        isScriptNode(node) ||
+        isCancelNode(node) ||
+        isControllerActionNode(node) ||
+        isWorkflowNode(node)
+      ) {
+        continue;
+      }
       if (isLoopGroupNode(node)) {
         check(resolveNodeProviderForPreflight(node, workflowProvider, aiProfile));
         visit(node.loop_group.nodes);
@@ -7859,6 +8682,7 @@ export async function executeDagWorkflow(
     model?: string;
     /** Terminal-success evidence gate (#2230) — read at the completion path. */
     evidence_policy?: WorkflowEvidencePolicy;
+    hardened?: WorkflowHardenedPolicy;
   } & WorkflowLevelOptions,
   workflowRun: WorkflowRun,
   workflowProvider: string,
@@ -7904,12 +8728,20 @@ export async function executeDagWorkflow(
   priorTokenUsage?: { input: number; output: number }
 ): Promise<string | undefined> {
   const dagStartTime = Date.now();
+  assertNoGuardedApprovalRework(workflowRun, execContext);
+
+  if (workflow.hardened?.required === true && !isHardenedContainerContext(execContext)) {
+    throw new Error(
+      `Workflow '${workflow.name}' requires hardened container execution with profile='hardened'.`
+    );
+  }
 
   // Container capability fail-fast: before ANY node runs (and before any
   // container work), reject a container run whose AI nodes resolve to a provider
   // that can't spawn in-container. No silent downgrade to the host — the user
   // asked for isolation and must get it or a clear error.
   if (execContext.kind === 'container') {
+    assertContainerWorkflowSurfaces(workflow.nodes, workflow.evidence_policy);
     const incompatible = collectContainerIncompatibleProviders(
       workflow.nodes,
       workflowProvider,
@@ -7979,6 +8811,30 @@ export async function executeDagWorkflow(
     sandbox: workflow.sandbox,
     workflowTier,
   };
+  const workflowDigest = computeControllerWorkflowDigest(workflow);
+  const initialLedgerStatus = await readVerifiedHardenedBudgetStatus(containerCtx);
+  const budgetPriorUsage =
+    initialLedgerStatus?.consumed ??
+    (hasUnknownPersistedBudgetState(workflowRun) ? undefined : priorTokenUsage);
+  const budget = resolveWorkflowBudget(
+    workflow,
+    workflowRun,
+    workflowDigest,
+    deps.workflowBudgetGrants,
+    budgetPriorUsage,
+    priorCompletedNodes !== undefined || priorTokenUsage !== undefined,
+    undefined,
+    initialLedgerStatus !== undefined
+  );
+  if (initialLedgerStatus && budget) {
+    assertLedgerStatusMatchesBudget(initialLedgerStatus, budget);
+  }
+  await persistWorkflowBudgetState(
+    deps,
+    workflowRun.id,
+    budget,
+    budget?.state.consumed ?? { input: 0, output: 0 }
+  );
   const layers = buildTopologicalLayers(workflow.nodes);
   const nodeOutputs = new Map<string, NodeOutput>();
 
@@ -8046,9 +8902,11 @@ export async function executeDagWorkflow(
     conversationId,
     cwd,
     execContext,
+    containerCtx,
     runChildWorkflow,
     workflowRun,
     workflowName: workflow.name,
+    workflowDigest,
     config,
     workflowProvider,
     workflowModel,
@@ -8072,12 +8930,25 @@ export async function executeDagWorkflow(
     priorCompletedNodes,
     lastSequentialSession: undefined,
     totalCostUsd: 0,
-    totalTokensIn: priorTokenUsage?.input ?? 0,
-    totalTokensOut: priorTokenUsage?.output ?? 0,
+    totalTokensIn: budget?.state.consumed.input ?? priorTokenUsage?.input ?? 0,
+    totalTokensOut: budget?.state.consumed.output ?? priorTokenUsage?.output ?? 0,
     totalLoopIterations: 0,
+    budget,
+    budgetBaseUsage: { input: 0, output: 0 },
     stepNamePrefix: '',
   };
   await runLayers(runCtx);
+  const postLayerLedgerStatus = await readVerifiedHardenedBudgetStatus(containerCtx);
+  if (postLayerLedgerStatus && runCtx.budget) {
+    assertLedgerStatusMatchesBudget(postLayerLedgerStatus, runCtx.budget);
+    await persistWorkflowBudgetState(
+      deps,
+      workflowRun.id,
+      runCtx.budget,
+      postLayerLedgerStatus.consumed
+    );
+  }
+  await snapshotDrainedContainerArtifacts(containerCtx, execContext, artifactsDir);
   // Pull the mutated accumulators back into local scope for the terminal tally below.
   const totalCostUsd = runCtx.totalCostUsd;
   const totalTokensIn = runCtx.totalTokensIn;

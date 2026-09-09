@@ -244,6 +244,65 @@ describe('SqliteAdapter', () => {
     });
   });
 
+  describe('transaction serialization', () => {
+    test('plain queries wait outside active transactions and cannot be rolled back by them', async () => {
+      db = createTestDb();
+      await db.query(
+        `INSERT INTO remote_agent_conversations (id, platform_type, platform_conversation_id)
+         VALUES ('conv-tx', 'web', 'conv-tx')`
+      );
+      await db.query(
+        `INSERT INTO remote_agent_workflow_runs
+           (id, workflow_name, conversation_id, user_message, status)
+         VALUES ('run-tx', 'wf', 'conv-tx', 'msg', 'running')`
+      );
+
+      let cancelSettled = false;
+      let cancelPromise: Promise<unknown> | undefined;
+      await expect(
+        db.withTransaction(async query => {
+          await query(
+            `UPDATE remote_agent_workflow_runs
+             SET status = status
+             WHERE id = $1 AND status = 'running'`,
+            ['run-tx']
+          );
+          cancelPromise = db
+            .query(`UPDATE remote_agent_workflow_runs SET status = 'cancelled' WHERE id = $1`, [
+              'run-tx',
+            ])
+            .then(result => {
+              cancelSettled = true;
+              return result;
+            });
+          await Promise.resolve();
+          await Promise.resolve();
+          expect(cancelSettled).toBe(false);
+          await query(
+            `INSERT INTO remote_agent_workflow_events
+               (workflow_run_id, event_type, data)
+             VALUES ($1, 'node_completed', $2)`,
+            ['run-tx', JSON.stringify({ type: 'controller_action' })]
+          );
+          throw new Error('rollback controller transaction');
+        })
+      ).rejects.toThrow('rollback controller transaction');
+
+      await cancelPromise;
+      const run = await db.query<{ status: string }>(
+        'SELECT status FROM remote_agent_workflow_runs WHERE id = $1',
+        ['run-tx']
+      );
+      const events = await db.query<{ cnt: number }>(
+        'SELECT COUNT(*) AS cnt FROM remote_agent_workflow_events WHERE workflow_run_id = $1',
+        ['run-tx']
+      );
+
+      expect(run.rows[0]?.status).toBe('cancelled');
+      expect(Number(events.rows[0]?.cnt)).toBe(0);
+    });
+  });
+
   describe('datetime() chronological vs lexical comparison', () => {
     // Documents the SQLite-specific bug fixed in getActiveWorkflowRunByPath.
     // `started_at` is TEXT in "YYYY-MM-DD HH:MM:SS" format. Comparing it

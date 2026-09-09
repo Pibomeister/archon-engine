@@ -4,11 +4,11 @@
  * Stores step transitions, parallel agent status, artifacts, and errors.
  * Verbose assistant/tool content stays in JSONL logs only.
  *
- * All write operations use fire-and-forget pattern (catch + log, never throw)
- * because workflow execution must not fail due to event logging.
+ * Telemetry writes are best-effort. Authority-bearing writes propagate failure
+ * so a missing audit event cannot authorize workflow progress.
  * Read operations also throw on error — callers own the degradation policy.
  */
-import { pool, getDialect, getDatabaseType } from './connection';
+import { pool, getDialect, getDatabaseType, getDatabase } from './connection';
 import type { QueryResult } from './adapters/types';
 import type { WorkflowEventRow } from '../schemas/workflow-event';
 import { createLogger } from '@archon/paths';
@@ -100,6 +100,62 @@ export async function insertWorkflowEvent(
   );
 }
 
+/** Persist an authority-bearing event; failure must stop the caller. */
+export async function createWorkflowEventStrict(data: WorkflowEventInput): Promise<void> {
+  await insertWorkflowEvent((sql, params) => pool.query(sql, params), data);
+}
+
+/**
+ * Persist a controller-action completion event only while the run is still
+ * running. The conditional no-op UPDATE is the row lock/CAS shared by SQLite and
+ * PostgreSQL; a cancel/terminal update racing this event makes the UPDATE match
+ * zero rows, so no completion event is inserted.
+ */
+export async function createControllerCompletionEvent(
+  data: WorkflowEventInput,
+  deadlineAt: number
+): Promise<void> {
+  assertControllerCompletionInput(data, deadlineAt);
+  await getDatabase().withTransaction(async query => {
+    const locked = await query(controllerCompletionLockSql(), [data.workflow_run_id]);
+    if ((locked.rowCount ?? 0) !== 1) {
+      throw new Error('Controller completion event requires a running workflow run');
+    }
+    assertControllerCompletionDeadline(deadlineAt);
+    await insertWorkflowEvent(query, data);
+    assertControllerCompletionDeadline(deadlineAt);
+  });
+}
+
+function controllerCompletionLockSql(): string {
+  const returning = getDatabaseType() === 'postgresql' ? '\n       RETURNING id' : '';
+  return `UPDATE remote_agent_workflow_runs
+       SET status = status
+       WHERE id = $1 AND status = 'running'${returning}`;
+}
+
+function assertControllerCompletionInput(data: WorkflowEventInput, deadlineAt: number): void {
+  if (data.event_type !== 'node_completed') {
+    throw new Error('Controller completion event must be node_completed');
+  }
+  if (data.data?.type !== 'controller_action') {
+    throw new Error('Controller completion event data.type must be controller_action');
+  }
+  assertFiniteDeadline(deadlineAt);
+}
+
+function assertFiniteDeadline(deadlineAt: number): void {
+  if (!Number.isFinite(deadlineAt)) {
+    throw new Error('Controller completion deadline must be finite');
+  }
+}
+
+function assertControllerCompletionDeadline(deadlineAt: number): void {
+  if (Date.now() > deadlineAt) {
+    throw new Error('Controller completion deadline expired');
+  }
+}
+
 /**
  * Create a workflow event. Fire-and-forget - never throws.
  */
@@ -113,6 +169,16 @@ export async function createWorkflowEvent(data: WorkflowEventInput): Promise<voi
     );
     // Fire-and-forget: never throw
   }
+}
+
+function parseDatabaseEventOrder(value: unknown): number | null {
+  if (value === null) return null;
+  const order =
+    typeof value === 'string' && /^(0|[1-9][0-9]*)$/.test(value) ? Number(value) : value;
+  if (typeof order !== 'number' || !Number.isSafeInteger(order) || order < 0) {
+    throw new Error('Database event order is malformed or exceeds safe integer precision.');
+  }
+  return order;
 }
 
 /**
@@ -129,6 +195,9 @@ export async function listWorkflowEvents(workflowRunId: string): Promise<Workflo
     );
     return [...result.rows].map(row => ({
       ...row,
+      ...(row.event_order === undefined
+        ? {}
+        : { event_order: parseDatabaseEventOrder(row.event_order) }),
       data: typeof row.data === 'string' ? JSON.parse(row.data) : row.data,
     }));
   } catch (error) {

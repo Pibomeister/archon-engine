@@ -54,6 +54,12 @@ import {
 import { resolveGithubTokenOverrides } from './utils/github-token-policy';
 import { buildAiProfile, isLiteralSpec, resolveModelSpec } from './model-validation';
 import type { ModelAliasPreset, ResolvedAiProfile } from './model-validation';
+import {
+  WORKFLOW_PIN_METADATA_KEY,
+  assertWorkflowPinMatchesRun,
+  buildWorkflowPinState,
+  workflowRunRequiresPin,
+} from './workflow-pinning';
 
 /** The per-user prefs layer as returned by `WorkflowDeps.getUserAiPrefs`. */
 type UserAiPrefsLayer = Awaited<ReturnType<NonNullable<WorkflowDeps['getUserAiPrefs']>>>;
@@ -1116,6 +1122,27 @@ export async function executeWorkflow(
     resolveChildIsolation,
   } = opts;
 
+  const workflowPin = buildWorkflowPinState(workflow, source);
+  if (preCreatedRun && workflowRunRequiresPin(workflow, preCreatedRun, execContext)) {
+    try {
+      assertWorkflowPinMatchesRun(preCreatedRun, workflowPin);
+    } catch (error) {
+      const msg = (error as Error).message;
+      getLog().warn(
+        { workflowRunId: preCreatedRun.id, workflowName: workflow.name, error: msg },
+        'workflow.pin_validation_failed'
+      );
+      await deps.store.failWorkflowRun(preCreatedRun.id, msg).catch((err: unknown) => {
+        getLog().error(
+          { err, workflowRunId: preCreatedRun.id },
+          'workflow.pin_validation_fail_record_failed'
+        );
+      });
+      await safeSendMessage(platform, conversationId, `⚠️ ${msg}`);
+      return { success: false, workflowRunId: preCreatedRun.id, error: msg };
+    }
+  }
+
   // Guard: a container run MUST be resumed with its container rewired (the CLI does
   // this via backend.resumeEnv, threading a `container` context). A resume that
   // reaches here for a container run WITHOUT that context — e.g. approving a
@@ -1140,8 +1167,11 @@ export async function executeWorkflow(
   }
 
   // Load config once for the entire workflow execution
+  const isolatedExecution =
+    execContext.kind === 'container' || workflow.hardened?.required === true;
   const fileConfig = await deps.loadConfig(cwd);
-  const dbEnvVars = codebaseId ? await deps.store.getCodebaseEnvVars(codebaseId) : {};
+  const dbEnvVars =
+    !isolatedExecution && codebaseId ? await deps.store.getCodebaseEnvVars(codebaseId) : {};
   // Resolve a fresh bot GitHub token once at workflow start when:
   //   (a) the codebase URL is a github.com repo, and
   //   (b) deps.resolveBotGitHubToken is registered (App mode).
@@ -1150,8 +1180,12 @@ export async function executeWorkflow(
   // need the credential helper for live token rotation (handled at clone
   // time in the GitHub adapter), but the env injection is enough for the
   // typical <1h workflow.
-  const botGitHubEnv = await resolveBotGitHubEnvForWorkflow(deps, codebaseId);
-  const userGitHubEnv = await resolveUserGithubEnvForWorkflow(deps, userId);
+  const botGitHubEnv = isolatedExecution
+    ? {}
+    : await resolveBotGitHubEnvForWorkflow(deps, codebaseId);
+  const userGitHubEnv = isolatedExecution
+    ? {}
+    : await resolveUserGithubEnvForWorkflow(deps, userId);
   const config: WorkflowConfig = {
     ...fileConfig,
     // Order: file < db < bot-token < per-user. Per-codebase env vars are
@@ -1159,7 +1193,9 @@ export async function executeWorkflow(
     // wins last so a run routes through the originating human's token (or scrubs
     // the org/bot token when they haven't connected). Empty-string values from
     // the per-user policy scrub the corresponding key via the subprocess merge.
-    envVars: { ...fileConfig.envVars, ...dbEnvVars, ...botGitHubEnv, ...userGitHubEnv },
+    envVars: isolatedExecution
+      ? {}
+      : { ...fileConfig.envVars, ...dbEnvVars, ...botGitHubEnv, ...userGitHubEnv },
   };
   const configuredCommandFolder = config.commands.folder;
 
@@ -1338,10 +1374,22 @@ export async function executeWorkflow(
           ...(issueContext ? { github_context: issueContext } : {}),
           ...(execContext.kind === 'container' ? { isolation: 'container' } : {}),
           ...(containerCtx ? { isolation_env_id: containerCtx.envId } : {}),
+          ...(workflowRunRequiresPin(workflow, undefined, execContext)
+            ? { [WORKFLOW_PIN_METADATA_KEY]: workflowPin }
+            : {}),
         },
         parent_conversation_id: parentConversationId,
         user_id: userId,
       });
+      workflowRun = {
+        ...workflowRun,
+        metadata: {
+          ...(workflowRun.metadata ?? {}),
+          ...(workflowRunRequiresPin(workflow, undefined, execContext)
+            ? { [WORKFLOW_PIN_METADATA_KEY]: workflowPin }
+            : {}),
+        },
+      };
     } catch (error) {
       const err = error as Error;
       getLog().error(
@@ -1589,7 +1637,9 @@ export async function executeWorkflow(
   // win over file/db/bot-github env — preserves the GitHub merge order and
   // keeps the no-key path byte-for-byte unchanged (resolveUserProviderEnvForWorkflow
   // returns {} when the feature is disabled or no userId is present).
-  const userProviderEnv = await resolveUserProviderEnvForWorkflow(deps, userId, artifactsDir);
+  const userProviderEnv = isolatedExecution
+    ? {}
+    : await resolveUserProviderEnvForWorkflow(deps, userId, artifactsDir);
   config.envVars = { ...config.envVars, ...userProviderEnv };
 
   // Wrap execution in try-catch to ensure workflow is marked as failed on any error.

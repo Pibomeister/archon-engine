@@ -1,5 +1,5 @@
-import { describe, test, expect, mock, beforeEach } from 'bun:test';
-import { mkdtemp, rm, writeFile } from 'fs/promises';
+import { describe, test, expect, mock, beforeEach, spyOn } from 'bun:test';
+import { mkdtemp, readFile, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { createMockLogger } from '../test/mocks/logger';
@@ -42,7 +42,15 @@ mock.module('@openai/codex-sdk', () => ({
   Codex: MockCodex,
 }));
 
-import { CodexProvider, resetCodexSingleton } from './provider';
+import { CodexProvider, buildCodexContainerWrapperScript, resetCodexSingleton } from './provider';
+import type { ExecutionContext } from '../types';
+
+const SEALED_OPENAI_EXEC_CONTEXT: ExecutionContext = {
+  kind: 'container',
+  profile: 'hardened',
+  containerId: 'cid-1',
+  providerOrigins: [{ provider: 'openai', baseUrl: 'https://api.openai.com/v1' }],
+};
 
 describe('CodexProvider', () => {
   let client: CodexProvider;
@@ -89,7 +97,7 @@ describe('CodexProvider', () => {
         sandbox: false,
         settingSources: false,
         nativeTools: false,
-        containerExec: false,
+        containerExec: true,
       });
     });
   });
@@ -1157,6 +1165,331 @@ describe('CodexProvider', () => {
       }
     });
 
+    test('container env does not inherit host credential or service canaries', async () => {
+      const savedEnv = {
+        OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+        CODEX_API_KEY: process.env.CODEX_API_KEY,
+        GH_TOKEN: process.env.GH_TOKEN,
+        DATABASE_URL: process.env.DATABASE_URL,
+      };
+      process.env.OPENAI_API_KEY = 'host-openai-canary';
+      process.env.CODEX_API_KEY = 'host-codex-canary';
+      process.env.GH_TOKEN = 'host-gh-canary';
+      process.env.DATABASE_URL = 'postgres://host-canary';
+
+      try {
+        mockRunStreamed.mockResolvedValue({
+          events: (async function* () {
+            yield { type: 'turn.completed', usage: defaultUsage };
+          })(),
+        });
+
+        for await (const _ of client.sendQuery('test prompt', '/workspace', undefined, {
+          execContext: SEALED_OPENAI_EXEC_CONTEXT,
+        })) {
+          // consume
+        }
+
+        const call = MockCodex.mock.calls[0][0] as { env: Record<string, string> };
+        expect(call.env.OPENAI_API_KEY).toBeUndefined();
+        expect(call.env.CODEX_API_KEY).toBeUndefined();
+        expect(call.env.GH_TOKEN).toBeUndefined();
+        expect(call.env.DATABASE_URL).toBeUndefined();
+        expect(Object.values(call.env)).not.toContain('host-openai-canary');
+        expect(Object.values(call.env)).not.toContain('host-codex-canary');
+        expect(Object.values(call.env)).not.toContain('host-gh-canary');
+        expect(Object.values(call.env)).not.toContain('postgres://host-canary');
+      } finally {
+        for (const [key, value] of Object.entries(savedEnv)) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+      }
+    });
+
+    test('container env forwards only explicit allowlisted request credentials', async () => {
+      mockRunStreamed.mockResolvedValue({
+        events: (async function* () {
+          yield { type: 'turn.completed', usage: defaultUsage };
+        })(),
+      });
+
+      for await (const _ of client.sendQuery('test prompt', '/workspace', undefined, {
+        env: {
+          OPENAI_API_KEY: 'explicit-openai',
+          CODEX_API_KEY: 'explicit-codex',
+          GH_TOKEN: 'blocked-gh',
+          DATABASE_URL: 'postgres://blocked',
+        },
+        execContext: SEALED_OPENAI_EXEC_CONTEXT,
+      })) {
+        // consume
+      }
+
+      const call = MockCodex.mock.calls[0][0] as { env: Record<string, string> };
+      expect(call.env.OPENAI_API_KEY).toBe('explicit-openai');
+      expect(call.env.CODEX_API_KEY).toBe('explicit-codex');
+      expect(call.env.GH_TOKEN).toBeUndefined();
+      expect(call.env.DATABASE_URL).toBeUndefined();
+    });
+
+    test('container execution pins the sealed OpenAI origin when request env omits base URL', async () => {
+      mockRunStreamed.mockResolvedValue({
+        events: (async function* () {
+          yield { type: 'turn.completed', usage: defaultUsage };
+        })(),
+      });
+
+      for await (const _ of client.sendQuery('test prompt', '/workspace', undefined, {
+        env: { CODEX_API_KEY: 'managed-key' },
+        execContext: SEALED_OPENAI_EXEC_CONTEXT,
+      })) {
+        // consume
+      }
+
+      const call = MockCodex.mock.calls[0][0] as {
+        baseUrl?: string;
+        config?: Record<string, string>;
+        env: Record<string, string>;
+      };
+      expect(call.baseUrl).toBe('https://api.openai.com/v1');
+      expect(call.config?.openai_base_url).toBe('https://api.openai.com/v1');
+      expect(call.config?.model_provider).toBe('archon-openai');
+      expect(call.config?.model_providers).toEqual({
+        'archon-openai': {
+          name: 'OpenAI',
+          base_url: 'https://api.openai.com/v1',
+          env_key: 'OPENAI_API_KEY',
+          wire_api: 'responses',
+          supports_websockets: false,
+        },
+      });
+      expect(call.env.OPENAI_BASE_URL).toBe('https://api.openai.com/v1');
+      expect(call.env.CODEX_API_KEY).toBe('managed-key');
+    });
+
+    test('container execution overrides hostile home model provider configuration', async () => {
+      mockRunStreamed.mockResolvedValue({
+        events: (async function* () {
+          yield { type: 'turn.completed', usage: defaultUsage };
+        })(),
+      });
+
+      for await (const _ of client.sendQuery('test prompt', '/workspace', undefined, {
+        execContext: SEALED_OPENAI_EXEC_CONTEXT,
+      })) {
+        // consume
+      }
+
+      const call = MockCodex.mock.calls[0][0] as { config?: Record<string, unknown> };
+      expect(call.config).toMatchObject({
+        model_provider: 'archon-openai',
+        openai_base_url: 'https://api.openai.com/v1',
+        model_providers: {
+          'archon-openai': {
+            name: 'OpenAI',
+            base_url: 'https://api.openai.com/v1',
+            env_key: 'OPENAI_API_KEY',
+            wire_api: 'responses',
+            supports_websockets: false,
+          },
+        },
+      });
+    });
+
+    test('container execution normalizes a matching sealed OpenAI base URL override', async () => {
+      mockRunStreamed.mockResolvedValue({
+        events: (async function* () {
+          yield { type: 'turn.completed', usage: defaultUsage };
+        })(),
+      });
+
+      for await (const _ of client.sendQuery('test prompt', '/workspace', undefined, {
+        env: { OPENAI_BASE_URL: 'https://api.openai.com/v1/' },
+        execContext: SEALED_OPENAI_EXEC_CONTEXT,
+      })) {
+        // consume
+      }
+
+      const call = MockCodex.mock.calls[0][0] as { env: Record<string, string> };
+      expect(call.env.OPENAI_BASE_URL).toBe('https://api.openai.com/v1');
+    });
+
+    test('container execution rejects hostile OpenAI base URL overrides before SDK setup', async () => {
+      const hostileUrls = [
+        'http://127.0.0.1:3141/v1',
+        'https://api.openai.com/v1?redirect=local',
+        'https://user:pass@api.openai.com/v1',
+        'https://api.evil.example/v1',
+      ];
+
+      for (const hostileUrl of hostileUrls) {
+        const consumeGenerator = async (): Promise<void> => {
+          for await (const _ of client.sendQuery('test prompt', '/workspace', undefined, {
+            env: { OPENAI_BASE_URL: hostileUrl },
+            execContext: SEALED_OPENAI_EXEC_CONTEXT,
+          })) {
+            // consume
+          }
+        };
+
+        await expect(consumeGenerator()).rejects.toThrow(/exact HTTPS|controller-sealed/);
+      }
+      expect(MockCodex).not.toHaveBeenCalled();
+      expect(mockStartThread).not.toHaveBeenCalled();
+      expect(mockRunStreamed).not.toHaveBeenCalled();
+    });
+
+    test('container execution rejects missing OpenAI controller origin before SDK setup', async () => {
+      const consumeGenerator = async (): Promise<void> => {
+        for await (const _ of client.sendQuery('test prompt', '/workspace', undefined, {
+          execContext: {
+            kind: 'container',
+            profile: 'hardened',
+            containerId: 'cid-1',
+            providerOrigins: [{ provider: 'anthropic', baseUrl: 'https://api.anthropic.com' }],
+          },
+        })) {
+          // consume
+        }
+      };
+
+      await expect(consumeGenerator()).rejects.toThrow(
+        /exactly one controller-sealed OpenAI origin/
+      );
+      expect(MockCodex).not.toHaveBeenCalled();
+      expect(mockStartThread).not.toHaveBeenCalled();
+    });
+
+    test('container execution rejects duplicate OpenAI controller origins before SDK setup', async () => {
+      const contexts: ExecutionContext[] = [
+        {
+          kind: 'container',
+          profile: 'hardened',
+          containerId: 'cid-1',
+          providerOrigins: [
+            { provider: 'openai', baseUrl: 'https://api.openai.com/v1' },
+            { provider: 'openai', baseUrl: 'https://api.openai.com/v1' },
+          ],
+        },
+        {
+          kind: 'container',
+          profile: 'hardened',
+          containerId: 'cid-1',
+          providerOrigins: [
+            { provider: 'openai', baseUrl: 'https://api.openai.com/v1' },
+            { provider: 'codex', baseUrl: 'https://api.other-openai.example/v1' },
+          ],
+        },
+      ];
+
+      for (const execContext of contexts) {
+        const consumeGenerator = async (): Promise<void> => {
+          for await (const _ of client.sendQuery('test prompt', '/workspace', undefined, {
+            execContext,
+          })) {
+            // consume
+          }
+        };
+
+        await expect(consumeGenerator()).rejects.toThrow(
+          /exactly one controller-sealed OpenAI origin/
+        );
+      }
+      expect(MockCodex).not.toHaveBeenCalled();
+      expect(mockStartThread).not.toHaveBeenCalled();
+    });
+
+    test('container execution accepts public DNS origins with fc prefix', async () => {
+      mockRunStreamed.mockResolvedValue({
+        events: (async function* () {
+          yield { type: 'turn.completed', usage: defaultUsage };
+        })(),
+      });
+
+      for await (const _ of client.sendQuery('test prompt', '/workspace', undefined, {
+        execContext: {
+          kind: 'container',
+          profile: 'hardened',
+          containerId: 'cid-1',
+          providerOrigins: [{ provider: 'openai', baseUrl: 'https://fc-api.openai.example/v1' }],
+        },
+      })) {
+        // consume
+      }
+
+      const call = MockCodex.mock.calls[0][0] as { baseUrl?: string };
+      expect(call.baseUrl).toBe('https://fc-api.openai.example/v1');
+    });
+
+    test('container execution rejects non-DNS controller-sealed OpenAI origins before SDK setup', async () => {
+      const hostileOrigins = [
+        'https://localhost/v1',
+        'https://127.0.0.1/v1',
+        'https://[::1]/v1',
+        'https://[::ffff:127.0.0.1]/v1',
+        'https://bad_host.example/v1',
+      ];
+
+      for (const baseUrl of hostileOrigins) {
+        const consumeGenerator = async (): Promise<void> => {
+          for await (const _ of client.sendQuery('test prompt', '/workspace', undefined, {
+            execContext: {
+              kind: 'container',
+              profile: 'hardened',
+              containerId: 'cid-1',
+              providerOrigins: [{ provider: 'openai', baseUrl }],
+            },
+          })) {
+            // consume
+          }
+        };
+
+        await expect(consumeGenerator()).rejects.toThrow(/localhost|IP literal|DNS hostname/);
+      }
+      expect(MockCodex).not.toHaveBeenCalled();
+      expect(mockStartThread).not.toHaveBeenCalled();
+    });
+
+    test('container execution rejects MCP config before loading host-expanded config', async () => {
+      const consumeGenerator = async (): Promise<void> => {
+        for await (const _ of client.sendQuery('test prompt', '/workspace', undefined, {
+          nodeConfig: { mcp: 'mcp.json' },
+          execContext: SEALED_OPENAI_EXEC_CONTEXT,
+        })) {
+          // consume
+        }
+      };
+
+      await expect(consumeGenerator()).rejects.toThrow(
+        'Codex container execution does not support MCP config'
+      );
+      expect(MockCodex).not.toHaveBeenCalled();
+    });
+
+    test('container execution rejects native tools before SDK setup', async () => {
+      const consumeGenerator = async (): Promise<void> => {
+        for await (const _ of client.sendQuery('test prompt', '/workspace', undefined, {
+          nativeTools: [
+            {
+              name: 'manage_run',
+              description: 'controller action',
+              inputSchema: { type: 'object', properties: {} },
+              handler: async () => 'ok',
+            },
+          ],
+          execContext: SEALED_OPENAI_EXEC_CONTEXT,
+        })) {
+          // consume
+        }
+      };
+
+      await expect(consumeGenerator()).rejects.toThrow(
+        'Codex container execution does not support native tools'
+      );
+      expect(MockCodex).not.toHaveBeenCalled();
+    });
+
     test('passes workflow MCP config as Codex mcp_servers overrides', async () => {
       const testDir = await mkdtemp(join(tmpdir(), 'codex-provider-mcp-'));
       const originalToken = process.env.ARCHON_CODEX_MCP_TOKEN;
@@ -1358,6 +1691,82 @@ describe('CodexProvider', () => {
       expect(chunks).toHaveLength(2);
       expect(chunks[0]).toEqual({ type: 'assistant', content: 'Before turn' });
       expect(chunks[1]).toMatchObject({ type: 'result', sessionId: 'new-thread-id' });
+    });
+
+    test('omits tokens when turn.completed usage is missing instead of fabricating zero', async () => {
+      mockRunStreamed.mockResolvedValue({
+        events: (async function* () {
+          yield { type: 'turn.completed' };
+        })(),
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) {
+        chunks.push(chunk);
+      }
+
+      expect(chunks).toEqual([{ type: 'result', sessionId: 'new-thread-id' }]);
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        { eventType: 'turn.completed' },
+        'codex.usage_missing_on_turn_completed'
+      );
+    });
+
+    test('does not retain stale token usage when a later query completes with unknown usage', async () => {
+      mockRunStreamed.mockResolvedValueOnce({
+        events: (async function* () {
+          yield { type: 'turn.completed', usage: defaultUsage };
+        })(),
+      });
+      mockRunStreamed.mockResolvedValueOnce({
+        events: (async function* () {
+          yield { type: 'turn.completed' };
+        })(),
+      });
+
+      const firstChunks = [];
+      for await (const chunk of client.sendQuery('first', '/workspace')) {
+        firstChunks.push(chunk);
+      }
+      const secondChunks = [];
+      for await (const chunk of client.sendQuery('second', '/workspace')) {
+        secondChunks.push(chunk);
+      }
+
+      expect(firstChunks.at(-1)).toEqual({
+        type: 'result',
+        sessionId: 'new-thread-id',
+        tokens: { input: 10, output: 5 },
+      });
+      expect(secondChunks.at(-1)).toEqual({ type: 'result', sessionId: 'new-thread-id' });
+    });
+
+    test('rejects malformed turn.completed usage counts', async () => {
+      const malformedUsages = [
+        { input_tokens: -1, cached_input_tokens: 0, output_tokens: 5 },
+        { input_tokens: 1.5, cached_input_tokens: 0, output_tokens: 5 },
+        { input_tokens: Number.MAX_SAFE_INTEGER + 1, cached_input_tokens: 0, output_tokens: 5 },
+        { input_tokens: 10, cached_input_tokens: 0, output_tokens: -1 },
+        { input_tokens: 10, cached_input_tokens: 0, output_tokens: 2.5 },
+        { input_tokens: 10, cached_input_tokens: 0, output_tokens: Number.NaN },
+        { input_tokens: '10', cached_input_tokens: 0, output_tokens: 5 },
+      ];
+
+      for (const usage of malformedUsages) {
+        mockRunStreamed.mockResolvedValueOnce({
+          events: (async function* () {
+            yield { type: 'turn.completed', usage };
+          })(),
+        });
+
+        await expect(
+          (async (): Promise<void> => {
+            for await (const _ of client.sendQuery('test', '/workspace')) {
+              // consume
+            }
+          })()
+        ).rejects.toThrow(/Codex unknown: Codex turn.completed usage .* malformed/);
+      }
     });
 
     test('logs progress for item.started and item.completed events', async () => {
@@ -2372,7 +2781,7 @@ describe('sendQuery decomposition behaviors', () => {
   // The fix removes the explicit abort() — the per-attempt controller is short-lived
   // and goes out of scope naturally.
   test('successful attempt does not throw from stale abort cleanup (#1735)', async () => {
-    mockRunStreamed.mockImplementation((_prompt, opts: { signal?: AbortSignal }) => {
+    mockRunStreamed.mockImplementation(() => {
       return Promise.resolve({
         events: (async function* () {
           yield {
@@ -2406,4 +2815,159 @@ describe('sendQuery decomposition behaviors', () => {
       process.removeListener('uncaughtException', handler);
     }
   }, 5_000);
+});
+
+describe('CodexProvider container transport', () => {
+  test('builds a fixed docker-exec wrapper for hardened containers', () => {
+    const script = buildCodexContainerWrapperScript({
+      kind: 'container',
+      profile: 'hardened',
+      containerId: 'cid-1',
+      execUser: 'archon',
+    });
+
+    expect(script).toContain('docker exec -i');
+    expect(script).not.toContain('docker stop');
+    expect(script).toContain("--user 'archon'");
+    expect(script).toContain('--env CODEX_API_KEY');
+    expect(script).toContain(`'cid-1' codex "$@"`);
+    expect(script).toContain('ARCHON_CODEX_EXEC_TOKEN');
+    expect(script).not.toContain('/repo');
+    expect(script).not.toContain('controller_action');
+  });
+
+  test('rejects non-hardened or shell-like container handles before creating a wrapper', () => {
+    expect(() =>
+      buildCodexContainerWrapperScript({
+        kind: 'container',
+        profile: 'hardened',
+        containerId: 'cid;rm-rf',
+      })
+    ).toThrow(/Invalid Codex container id/);
+  });
+
+  test('streams through the container wrapper without using the host Codex binary', async () => {
+    const client = new CodexProvider({ retryBaseDelayMs: 1 });
+    const originalCanary = process.env.ARCHON_CODEX_HOST_CANARY;
+    process.env.ARCHON_CODEX_HOST_CANARY = 'must-not-forward';
+    mockRunStreamed.mockResolvedValue({
+      events: (async function* () {
+        yield { type: 'item.completed', item: { type: 'agent_message', text: 'container ok' } };
+        yield { type: 'turn.completed', usage: defaultUsage };
+      })(),
+    });
+
+    try {
+      const chunks = [];
+      for await (const chunk of client.sendQuery('hi', '/repo', undefined, {
+        env: { CODEX_API_KEY: 'managed-key', EXTRA_SECRET: 'nope' },
+        execContext: SEALED_OPENAI_EXEC_CONTEXT,
+      })) {
+        chunks.push(chunk);
+      }
+
+      expect(chunks[0]).toEqual({ type: 'assistant', content: 'container ok' });
+      const codexOptions = MockCodex.mock.calls.at(-1)?.[0] as {
+        codexPathOverride?: string;
+        env?: Record<string, string>;
+      };
+      expect(codexOptions.codexPathOverride).toContain('archon-codex-container-');
+      expect(codexOptions.env).toMatchObject({ CODEX_API_KEY: 'managed-key' });
+      expect(codexOptions.env).not.toHaveProperty('EXTRA_SECRET');
+      expect(codexOptions.env).not.toHaveProperty('ARCHON_CODEX_HOST_CANARY');
+      await expect(readFile(codexOptions.codexPathOverride as string, 'utf8')).rejects.toThrow();
+    } finally {
+      if (originalCanary === undefined) delete process.env.ARCHON_CODEX_HOST_CANARY;
+      else process.env.ARCHON_CODEX_HOST_CANARY = originalCanary;
+    }
+  });
+
+  test('stops the owned container when a container query is pre-aborted', async () => {
+    const spawnSpy = spyOn(Bun, 'spawn').mockImplementation(
+      () =>
+        ({
+          exited: Promise.resolve(0),
+          stderr: new Blob([]).stream(),
+        }) as unknown as ReturnType<typeof Bun.spawn>
+    );
+    const client = new CodexProvider({ retryBaseDelayMs: 1 });
+    mockStartThread.mockClear();
+    const controller = new AbortController();
+    controller.abort();
+
+    try {
+      await expect(
+        (async () => {
+          for await (const _ of client.sendQuery('test prompt', '/workspace', undefined, {
+            abortSignal: controller.signal,
+            execContext: SEALED_OPENAI_EXEC_CONTEXT,
+          })) {
+          }
+        })()
+      ).rejects.toThrow(/Query aborted/);
+
+      expect(spawnSpy).toHaveBeenCalledWith(
+        ['docker', 'stop', 'cid-1'],
+        expect.objectContaining({ stdout: 'ignore', stderr: 'pipe' })
+      );
+      expect(mockStartThread).not.toHaveBeenCalled();
+    } finally {
+      spawnSpy.mockRestore();
+    }
+  });
+
+  test('surfaces docker stop failures instead of reporting cancellation success', async () => {
+    const spawnSpy = spyOn(Bun, 'spawn').mockImplementation(
+      () =>
+        ({
+          exited: Promise.resolve(1),
+          stderr: new Blob(['daemon denied']).stream(),
+        }) as unknown as ReturnType<typeof Bun.spawn>
+    );
+    const client = new CodexProvider({ retryBaseDelayMs: 1 });
+    const controller = new AbortController();
+    controller.abort();
+
+    try {
+      await expect(
+        (async () => {
+          for await (const _ of client.sendQuery('test prompt', '/workspace', undefined, {
+            abortSignal: controller.signal,
+            execContext: SEALED_OPENAI_EXEC_CONTEXT,
+          })) {
+          }
+        })()
+      ).rejects.toThrow(/docker stop cid-1 exited 1.*daemon denied/);
+    } finally {
+      spawnSpy.mockRestore();
+    }
+  });
+
+  test('resumes and forwards an AbortSignal through the container transport', async () => {
+    const client = new CodexProvider({ retryBaseDelayMs: 1 });
+    const controller = new AbortController();
+    mockRunStreamed.mockResolvedValue({
+      events: (async function* () {
+        yield { type: 'turn.completed', usage: defaultUsage };
+      })(),
+    });
+
+    const chunks = [];
+    for await (const chunk of client.sendQuery('continue', '/repo', 'thread-1', {
+      abortSignal: controller.signal,
+      execContext: SEALED_OPENAI_EXEC_CONTEXT,
+    })) {
+      chunks.push(chunk);
+    }
+
+    expect(mockResumeThread).toHaveBeenCalledWith(
+      'thread-1',
+      expect.objectContaining({ workingDirectory: '/repo' })
+    );
+    expect(mockRunStreamed).toHaveBeenCalledWith(
+      'continue',
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
+    );
+    expect(chunks.find(chunk => chunk.type === 'result')).toMatchObject({ resumed: true });
+  });
 });

@@ -86,8 +86,9 @@ export interface CleanupReport {
  * placeholder is correct for the cleanup path — it never prepares a container.
  */
 const CLEANUP_PLACEHOLDER_CONTAINER_CONFIG: ContainerBackendConfig = {
+  profile: 'hardened',
   image: 'archon-runner:latest',
-  network: 'bridge',
+  network: 'none',
   memoryMb: 4096,
   pidsLimit: 512,
 };

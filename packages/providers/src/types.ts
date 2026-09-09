@@ -343,9 +343,23 @@ export type SystemPromptInput = string | string[] | SystemPromptPreset;
  * (Phase B) — a `container` value reaching a provider that can't honor it is a
  * bug the executor prevents, not something the provider silently downgrades.
  */
+export interface ProviderOrigin {
+  provider: string;
+  baseUrl: string;
+}
+
 export type ExecutionContext =
   | { kind: 'host' }
-  | { kind: 'container'; containerId: string; execUser?: string };
+  | {
+      kind: 'container';
+      profile: 'hardened';
+      containerId: string;
+      execUser?: string;
+      /** In-container artifact root for untrusted agent writes; host artifacts stay controller-owned. */
+      agentArtifactsDir?: string;
+      /** Controller-sealed provider API origins; user env/config cannot redirect hardened native CLIs. */
+      providerOrigins?: readonly ProviderOrigin[];
+    };
 
 /**
  * Container write-back contract (folder-project container backend, Phase C).
@@ -629,11 +643,11 @@ export interface ProviderCapabilities {
   /**
    * Whether the provider can execute inside the folder-project container backend
    * (`execContext.kind === 'container'`) — i.e. it knows how to spawn its CLI via
-   * `docker exec` rather than a local process. `true` for Claude
-   * (`spawnClaudeCodeProcess` hook). The engine's pre-dispatch fail-fast rejects
-   * a container run whose resolved provider has this `false`, so an unsupported
-   * provider can never silently downgrade to running on the host. Codex/Pi/
-   * community providers set `false` until they implement their in-container path.
+   * `docker exec` rather than a local process. `true` for Claude and Codex.
+   * The engine's pre-dispatch fail-fast rejects a container run whose resolved
+   * provider has this `false`, so an unsupported provider can never silently
+   * downgrade to running on the host. Pi/community providers keep `false` until
+   * they implement their in-container path.
    */
   containerExec: boolean;
 }

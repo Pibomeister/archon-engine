@@ -20,6 +20,8 @@ const promisifiedExecFile = promisify(execFile);
 export interface DockerExecOptions {
   /** Milliseconds before the docker invocation is killed. */
   timeout?: number;
+  /** Abort signal for controller-owned cancellation. */
+  signal?: AbortSignal;
   /** Max stdout/stderr bytes buffered before the call rejects. */
   maxBuffer?: number;
   /**
@@ -61,6 +63,7 @@ export async function dockerCli(
   const result = await promisifiedExecFile('docker', args, {
     timeout: options?.timeout ?? DOCKER_DEFAULT_TIMEOUT,
     maxBuffer: options?.maxBuffer ?? DOCKER_DEFAULT_MAX_BUFFER,
+    ...(options?.signal ? { signal: options.signal } : {}),
     ...(options?.env ? { env: options.env } : {}),
   });
   return {
@@ -80,7 +83,7 @@ export async function dockerCli(
 export async function dockerPreflight(
   image: string,
   runner: DockerRunner = dockerCli
-): Promise<void> {
+): Promise<string> {
   // 1. Daemon reachable. `docker version --format {{.Server.Version}}` errors
   //    with "Cannot connect to the Docker daemon" when the daemon is down.
   try {
@@ -105,7 +108,14 @@ export async function dockerPreflight(
   // 2. Runner image present locally. We never auto-pull — the image is built
   //    from the in-repo Dockerfile, so a miss means "build it", not "pull it".
   try {
-    await runner(['image', 'inspect', image], { timeout: 15_000 });
+    const { stdout } = await runner(['image', 'inspect', '--format', '{{.Id}}', image], {
+      timeout: 15_000,
+    });
+    const imageId = stdout.trim();
+    if (!imageId.startsWith('sha256:')) {
+      throw new Error(`Docker image '${image}' resolved to an invalid image id '${imageId}'.`);
+    }
+    return imageId;
   } catch (err) {
     const detail = extractDockerError(err);
     throw new Error(

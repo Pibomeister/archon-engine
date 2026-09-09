@@ -8,7 +8,7 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "test": "bun test src/resolver.test.ts && bun test src/providers/ && bun test src/errors.test.ts src/factory.test.ts src/worktree-copy.test.ts && bun test src/pr-state.test.ts && bun test src/backend-router.test.ts src/backends/in-place.test.ts src/backends/container.test.ts src/container/docker-exec.test.ts src/container/overlay.test.ts src/container/overlay-scripts.test.ts",
+    "test": "bun test src/resolver.test.ts && bun test src/providers/ && bun test src/errors.test.ts src/factory.test.ts src/worktree-copy.test.ts && bun test src/pr-state.test.ts && bun test src/backend-router.test.ts src/backends/in-place.test.ts src/backends/container.test.ts src/egress/policy.test.ts src/egress/connect-proxy.test.ts && bun test src/egress/proxy-budget-ledger.test.ts && bun test src/egress/provider-budget-contract.test.ts && bun test src/egress/proxy-budget-client.test.ts src/egress/proxy-budget.container.test.ts && bun test src/egress/docker-fixture.test.ts src/container/docker-exec.test.ts src/container/overlay.test.ts src/container/overlay-scripts.test.ts && bun test src/egress/tls-material.test.ts src/egress/strict-policy.test.ts src/egress/strict-proxy-launcher.test.ts && bun test src/egress/strict-https-proxy.test.ts && bun test src/egress/strict-https-proxy.container.test.ts && bun test src/container/artifact-snapshot.test.ts && bun test src/browser/browser-observation.test.ts",
     "type-check": "bun x tsc --noEmit"
   },
   "dependencies": {

@@ -14,6 +14,14 @@ import type {
 
 export type { WorkflowNodeSession } from './schemas';
 
+export interface WorkflowEventRecord {
+  event_type: string;
+  step_name?: string | null;
+  data?: Record<string, unknown> | string | null;
+  created_at?: string | Date;
+  event_order?: number | null;
+}
+
 export interface DagResumeSnapshot {
   completedNodeOutputs: Map<string, string>;
   tokens: {
@@ -212,6 +220,17 @@ export interface IWorkflowStore extends IRunTreeStore {
     data?: Record<string, unknown>;
   }): Promise<void>;
 
+  /** Required by controller actions and hardened approval gates; unlike telemetry, MUST throw on persistence failure. */
+  createWorkflowEventStrict?(
+    data: Parameters<IWorkflowStore['createWorkflowEvent']>[0]
+  ): Promise<void>;
+
+  /** Atomically require a running run and persist controller completion before its deadline. */
+  createControllerCompletionEvent?(
+    data: Parameters<IWorkflowStore['createWorkflowEvent']>[0],
+    deadlineAt: number
+  ): Promise<void>;
+
   /**
    * Return completed node outputs and cumulative token usage from a prior DAG
    * workflow run. Used for resume hydration so completed nodes are skipped and
@@ -220,6 +239,7 @@ export interface IWorkflowStore extends IRunTreeStore {
    * Throws on DB error — caller (executor.ts) owns the degradation policy.
    */
   getDagResumeSnapshot(workflowRunId: string): Promise<DagResumeSnapshot>;
+  listWorkflowEvents?(workflowRunId: string): Promise<WorkflowEventRecord[]>;
 
   // Per-codebase env vars for workflow node injection
   getCodebaseEnvVars(codebaseId: string): Promise<Record<string, string>>;

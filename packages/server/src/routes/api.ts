@@ -11,6 +11,7 @@ import { rm, readFile, writeFile, unlink, mkdir, readdir, stat } from 'fs/promis
 import { existsSync, readFileSync } from 'fs';
 import { normalize, join, sep, basename } from 'path';
 import { randomUUID } from 'crypto';
+import { isIP } from 'net';
 import type { Context } from 'hono';
 import type {
   ConversationLockManager,
@@ -243,6 +244,74 @@ if (BUNDLED_IS_BINARY) {
 }
 
 type WorkflowSource = 'project' | 'bundled' | 'global';
+const SAFE_API_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
+
+function isUnsafeApiMethod(method: string): boolean {
+  return !SAFE_API_METHODS.has(method.toUpperCase());
+}
+
+function parseHttpOrigin(value: string): URL | null {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+      return null;
+    }
+    if (value !== url.origin) {
+      return null;
+    }
+    return url;
+  } catch {
+    return null;
+  }
+}
+
+function configuredWebUiOrigin(): string | null | undefined {
+  const raw = process.env.WEB_UI_ORIGIN;
+  if (raw === undefined || raw.trim() === '') {
+    return undefined;
+  }
+  const configured = raw.trim();
+  if (configured === '*') {
+    return null;
+  }
+
+  return parseHttpOrigin(configured)?.origin ?? null;
+}
+
+function isLocalhostOrIp(hostname: string): boolean {
+  const address =
+    hostname.startsWith('[') && hostname.endsWith(']') ? hostname.slice(1, -1) : hostname;
+  return hostname === 'localhost' || isIP(address) !== 0;
+}
+
+function isTrustedApiOrigin(c: Context, origin: string): boolean {
+  const parsed = parseHttpOrigin(origin);
+  if (!parsed) {
+    return false;
+  }
+  const configured = configuredWebUiOrigin();
+  if (configured === null) {
+    return false;
+  }
+  if (configured !== undefined && parsed.origin === configured) return true;
+  const requestUrl = new URL(c.req.url);
+  return parsed.origin === requestUrl.origin && isLocalhostOrIp(requestUrl.hostname);
+}
+
+function unsafeApiOriginRejection(c: Context): string | null {
+  if (!isUnsafeApiMethod(c.req.method)) {
+    return null;
+  }
+  const origin = c.req.header('origin');
+  if (origin !== undefined) {
+    return isTrustedApiOrigin(c, origin) ? null : 'Untrusted browser origin';
+  }
+  const fetchSite = c.req.header('sec-fetch-site')?.toLowerCase();
+  if (fetchSite !== undefined && !['same-origin', 'none'].includes(fetchSite)) {
+    return 'Browser fetch metadata does not prove same-origin';
+  }
+  return null;
+}
 
 /**
  * Resolve the on-disk artifact directory for a run, for EVERY project kind
@@ -1394,7 +1463,7 @@ export function registerApiRoutes(
 ): void {
   function apiError(
     c: Context,
-    status: 400 | 401 | 404 | 422 | 500 | 503,
+    status: 400 | 401 | 403 | 404 | 422 | 500 | 503,
     message: string,
     detail?: string
   ): Response {
@@ -1414,9 +1483,20 @@ export function registerApiRoutes(
     });
   }
 
-  // CORS for Web UI — allow-all is fine for a single-developer tool.
-  // Override with WEB_UI_ORIGIN env var to restrict if exposing publicly.
-  app.use('/api/*', cors({ origin: process.env.WEB_UI_ORIGIN || '*' }));
+  // CORS controls read visibility only; unsafe methods are guarded separately
+  // below so a browser cannot deputy local workflow mutations.
+  app.use(
+    '/api/*',
+    cors({ origin: (origin, c) => (isTrustedApiOrigin(c, origin) ? origin : null) })
+  );
+
+  app.use('/api/*', async (c, next) => {
+    const rejection = unsafeApiOriginRejection(c);
+    if (rejection) {
+      return apiError(c, 403, rejection);
+    }
+    return next();
+  });
 
   // Server-side access gate: when web auth is enabled (and not opted out via
   // ARCHON_WEB_AUTH_REQUIRED=false), every /api/* request must resolve to an
@@ -4207,7 +4287,7 @@ export function registerApiRoutes(
       : 'text/plain; charset=utf-8';
     return new Response(content, {
       status: 200,
-      headers: { 'Content-Type': contentType },
+      headers: { 'Content-Type': contentType, 'X-Content-Type-Options': 'nosniff' },
     });
   });
 

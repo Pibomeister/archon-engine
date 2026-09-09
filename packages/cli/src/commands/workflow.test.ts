@@ -1,12 +1,33 @@
 /**
  * Tests for workflow commands
  */
-import { describe, it, expect, beforeEach, afterEach, spyOn, mock, jest } from 'bun:test';
-import { appendFileSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { describe, it, expect, beforeEach, afterEach, afterAll, spyOn, mock, jest } from 'bun:test';
+import {
+  appendFileSync,
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { WorkflowEmitterEvent } from '@archon/workflows/event-emitter';
 import { makeTestWorkflow, makeTestWorkflowWithSource } from '@archon/workflows/test-utils';
+import { computeControllerWorkflowDigest } from '@archon/workflows/controller-actions';
+import {
+  prepareHardenedControllerSession,
+  assertHardenedControllerResumeRoute,
+} from '@archon/core/workflows/hardened-controller';
+import {
+  encodeStrictEgressPolicy,
+  decodeStrictEgressPolicy,
+} from '../../../isolation/src/egress/strict-policy';
 import type { WorkflowEventRow } from '@archon/core/schemas/workflow-event';
 import {
   workflowListCommand,
@@ -23,7 +44,9 @@ import {
   buildDetachedRunCmd,
   maybePrintTierNotice,
   resolveContainerBackendConfig,
+  assertHardenedEgressEnvironment,
   hasUnresolvedWriteback,
+  shouldPreserveHardenedContainer,
   buildNodeSummaries,
 } from './workflow';
 
@@ -37,19 +60,60 @@ const mockLogger = {
   child: mock(() => mockLogger),
 };
 
+const defaultArchonRoot = mkdtempSync(join(tmpdir(), 'archon-cli-home-'));
+const defaultArchonHome = join(defaultArchonRoot, 'home');
+let mockArchonHome = defaultArchonHome;
+afterAll(() => rmSync(defaultArchonRoot, { recursive: true, force: true }));
+const MOCK_IMAGE_ID = `sha256:${'d'.repeat(64)}`;
+
 // Mock @archon/paths (createLogger moved here from @archon/core)
 mock.module('@archon/paths', () => ({
   captureApprovalResolved: () => undefined,
   createLogger: mock(() => mockLogger),
-  getArchonHome: mock(() => '/home/test/.archon'),
+  getArchonHome: mock(() => mockArchonHome),
   BUNDLED_IS_BINARY: false,
   BUNDLED_VERSION: '0.0.0-test',
   readTierNoticeState: mock(() => null),
   markTierNoticeShown: mock(() => undefined),
 }));
 
+const mockContainerPrepare = mock(() =>
+  Promise.resolve({
+    cwd: '/test/path',
+    execContext: { kind: 'container' as const, profile: 'hardened' as const, containerId: 'cid-1' },
+    envId: 'container-env-1',
+  })
+);
+const mockContainerResumeEnv = mock(() =>
+  Promise.resolve({
+    cwd: '/test/path',
+    execContext: { kind: 'container' as const, profile: 'hardened' as const, containerId: 'cid-1' },
+    envId: 'container-env-1',
+  })
+);
+const mockContainerDestroy = mock(() => Promise.resolve());
+const mockInPlacePrepare = mock(() =>
+  Promise.resolve({ cwd: '/test/path', execContext: { kind: 'host' as const } })
+);
+const mockResolveFolderBackend = mock((_codebase: unknown, opts?: { container?: boolean }) => {
+  if (opts?.container) {
+    return {
+      prepare: mockContainerPrepare,
+      resumeEnv: mockContainerResumeEnv,
+      resolveImage: mock(() => Promise.resolve(MOCK_IMAGE_ID)),
+      destroy: mockContainerDestroy,
+      finalize: mock(() => Promise.reject(new Error('not wired'))),
+      applyChanges: mock(() => Promise.reject(new Error('not wired'))),
+      discardChanges: mock(() => Promise.resolve()),
+    };
+  }
+  return { prepare: mockInPlacePrepare, destroy: mock(() => Promise.resolve()) };
+});
+
 // Mock @archon/isolation (getIsolationProvider moved here from @archon/core)
 mock.module('@archon/isolation', () => ({
+  encodeStrictEgressPolicy,
+  decodeStrictEgressPolicy,
   configureIsolation: mock(() => undefined),
   getIsolationProvider: mock(() => ({
     create: mock(() =>
@@ -65,6 +129,8 @@ mock.module('@archon/isolation', () => ({
     ),
     healthCheck: mock(() => Promise.resolve(true)),
   })),
+  resolveFolderBackend: mockResolveFolderBackend,
+  classifyIsolationError: (error: Error) => error.message,
 }));
 
 // Mock the @archon/core modules
@@ -111,6 +177,34 @@ mock.module('@archon/core/db/users', () => ({
 mock.module('@archon/workflows/workflow-discovery', () => ({
   discoverWorkflowsWithConfig: mock(() => Promise.resolve({ workflows: [], errors: [] })),
 }));
+const mockCreateWorkflowDepsOptions: unknown[] = [];
+mock.module('@archon/core/workflows/store-adapter', () => ({
+  createWorkflowDeps: mock((options?: unknown) => {
+    mockCreateWorkflowDepsOptions.push(options ?? {});
+    const workflowDb = require('@archon/core/db/workflows');
+    const workflowEventsDb = require('@archon/core/db/workflow-events');
+    const codebaseDb = require('@archon/core/db/codebases');
+    return {
+      ...(typeof options === 'object' && options !== null
+        ? (options as Record<string, unknown>)
+        : {}),
+      store: {
+        createWorkflowRun: workflowDb.createWorkflowRun,
+        getWorkflowRun: workflowDb.getWorkflowRun,
+        updateWorkflowRun: workflowDb.updateWorkflowRun,
+        failWorkflowRun: workflowDb.failWorkflowRun,
+        createWorkflowEvent: workflowEventsDb.createWorkflowEvent,
+        getCodebase: codebaseDb.getCodebase,
+        getCodebaseEnvVars: mock(() => Promise.resolve({})),
+      },
+      getAgentProvider: mock(() => ({})),
+      loadConfig: mock(() =>
+        Promise.resolve({ assistant: 'claude', assistants: { claude: {} }, commands: {} })
+      ),
+    };
+  }),
+}));
+
 mock.module('@archon/workflows/executor', () => ({
   executeWorkflow: mock(() => Promise.resolve({ success: true, workflowRunId: 'test-run-id' })),
   hydrateResumableRun: mock(() => Promise.resolve(null)),
@@ -122,6 +216,7 @@ const mockUnsubscribe = mock(() => undefined);
 
 mock.module('@archon/workflows/event-emitter', () => ({
   getWorkflowEventEmitter: mock(() => ({
+    emit: mock(() => undefined),
     subscribeForConversation: mock(
       (_convId: string, handler: (event: WorkflowEmitterEvent) => void) => {
         capturedSubscribeHandler = handler;
@@ -163,6 +258,16 @@ mock.module('@archon/core/db/isolation-environments', () => ({
   // module, so omitting this would leave the REAL implementation in place and
   // open a live SQLite handle rather than failing loudly (#2240).
   listByCodebase: mock(() => Promise.resolve([])),
+  createIsolationStore: mock(() => ({
+    create: mock(() => Promise.resolve({ id: 'container-env-1' })),
+    getById: mock(() =>
+      Promise.resolve({
+        id: 'container-env-1',
+        metadata: { image: MOCK_IMAGE_ID, ownerRunId: 'actual-run-resume' },
+      })
+    ),
+    updateStatus: mock(() => Promise.resolve()),
+  })),
 }));
 
 mock.module('@archon/core/db/messages', () => ({
@@ -170,6 +275,25 @@ mock.module('@archon/core/db/messages', () => ({
 }));
 
 mock.module('@archon/core/db/workflows', () => ({
+  createWorkflowRun: mock(() =>
+    Promise.resolve({
+      id: 'precreated-run-1',
+      workflow_name: 'hardened-container',
+      conversation_id: 'conv-123',
+      parent_conversation_id: null,
+      codebase_id: 'cb-folder',
+      status: 'pending',
+      user_message: 'go',
+      metadata: {},
+      started_at: new Date('2026-01-01T00:00:00.000Z'),
+      completed_at: null,
+      last_activity_at: null,
+      working_path: '/test/path',
+      user_id: null,
+      parent_run_id: null,
+      output_root: null,
+    })
+  ),
   getActiveWorkflowRun: mock(() => Promise.resolve(null)),
   getWorkflowRunStatus: mock(() => Promise.resolve(null)),
   failWorkflowRun: mock(() => Promise.resolve()),
@@ -637,6 +761,219 @@ describe('workflowRunCommand — requires: [github] gate', () => {
   });
 });
 
+const precreatedRunFixture = {
+  id: 'precreated-run-1',
+  workflow_name: 'hardened-container',
+  conversation_id: 'conv-123',
+  parent_conversation_id: null,
+  codebase_id: 'cb-folder',
+  status: 'pending' as const,
+  user_message: 'go',
+  metadata: {},
+  started_at: new Date('2026-01-01T00:00:00.000Z'),
+  completed_at: null,
+  last_activity_at: null,
+  working_path: '/test/path',
+  user_id: null,
+  parent_run_id: null,
+  output_root: null,
+};
+
+async function expectHardenedRunRetainsContainer(status: 'failed' | 'cancelled'): Promise<void> {
+  const fixture = makeHardenedCliFixture();
+  const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+  const { executeWorkflow } = await import('@archon/workflows/executor');
+  const codebaseDb = await import('@archon/core/db/codebases');
+  const workflowDb = await import('@archon/core/db/workflows');
+
+  (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+    workflows: [
+      makeTestWorkflowWithSource({
+        name: 'hardened-container',
+        hardened: { required: true },
+        nodes: [{ id: 'test', bash: 'exit 1' }],
+      }),
+    ],
+    errors: [],
+  });
+  (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce({
+    id: 'cb-folder',
+    name: 'platform',
+    default_cwd: fixture.source,
+    kind: 'folder',
+  });
+  (workflowDb.createWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+    ...precreatedRunFixture,
+    id: `actual-run-${status}`,
+    working_path: fixture.source,
+  });
+  (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+    ...precreatedRunFixture,
+    id: `actual-run-${status}`,
+    status,
+    metadata: { isolation: 'container' },
+  });
+  (executeWorkflow as ReturnType<typeof mock>).mockResolvedValueOnce({
+    success: false,
+    workflowRunId: `actual-run-${status}`,
+    error: status,
+  });
+
+  try {
+    await expect(
+      workflowRunCommand(fixture.source, 'hardened-container', 'go', { container: true })
+    ).rejects.toThrow(status);
+    expect(mockContainerDestroy).not.toHaveBeenCalled();
+  } finally {
+    fixture.cleanup();
+  }
+}
+
+function makeHardenedCliFixture(): {
+  source: string;
+  cleanup: () => void;
+  addRepo: (name: string, readme: string) => string;
+} {
+  const root = mkdtempSync(join(tmpdir(), 'archon-cli-hardened-'));
+  const source = join(root, 'source');
+  mockArchonHome = join(root, 'archon-home');
+  mkdirSync(source, { recursive: true });
+  writeFileSync(join(source, 'README.md'), 'seed\n');
+  writeFileSync(join(source, '.env'), 'SECRET=1\n');
+  git(source, ['init']);
+  git(source, ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'add', 'README.md']);
+  git(source, [
+    '-c',
+    'user.name=Test',
+    '-c',
+    'user.email=test@example.com',
+    'commit',
+    '-m',
+    'seed',
+  ]);
+  mockContainerPrepare.mockClear();
+  mockContainerResumeEnv.mockClear();
+  mockContainerDestroy.mockClear();
+  mockInPlacePrepare.mockClear();
+  mockCreateWorkflowDepsOptions.length = 0;
+  return {
+    source,
+    addRepo: (name: string, readme: string) => createChildRepo(source, name, readme),
+    cleanup: () => {
+      rmSync(root, { recursive: true, force: true });
+      mockArchonHome = defaultArchonHome;
+    },
+  };
+}
+
+function createChildRepo(parent: string, name: string, readme: string): string {
+  const repo = join(parent, name);
+  mkdirSync(repo, { recursive: true });
+  writeFileSync(join(repo, 'README.md'), readme);
+  git(repo, ['init']);
+  git(repo, ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'add', 'README.md']);
+  git(repo, ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-m', 'seed']);
+  return repo;
+}
+
+function createValidatorNodeModules(root: string): {
+  nodeModules: string;
+  playwrightDigest: string;
+  coreDigest: string;
+} {
+  const nodeModules = join(root, 'validator-node-modules');
+  const playwright = join(nodeModules, 'playwright');
+  const core = join(nodeModules, 'playwright-core');
+  mkdirSync(join(playwright, 'lib'), { recursive: true });
+  mkdirSync(join(core, 'lib'), { recursive: true });
+  chmodSync(nodeModules, 0o700);
+  writeFileSync(
+    join(playwright, 'package.json'),
+    JSON.stringify({ name: 'playwright', version: '1.60.0' }),
+    { mode: 0o600 }
+  );
+  writeFileSync(join(playwright, 'lib', 'runner.js'), 'module.exports = "runner";\n', {
+    mode: 0o600,
+  });
+  writeFileSync(
+    join(core, 'package.json'),
+    JSON.stringify({ name: 'playwright-core', version: '1.60.0' }),
+    { mode: 0o600 }
+  );
+  writeFileSync(join(core, 'lib', 'client.js'), 'module.exports = "client";\n', {
+    mode: 0o600,
+  });
+  return {
+    nodeModules,
+    playwrightDigest: validatorTreeDigest(playwright),
+    coreDigest: validatorTreeDigest(core),
+  };
+}
+
+function validatorTreeDigest(root: string): string {
+  const files: Record<string, unknown>[] = [];
+  collectValidatorFiles(root, root, files);
+  return stableDigest(
+    files.sort((left, right) => compareCodepoint(String(left.path), String(right.path)))
+  );
+}
+
+function compareCodepoint(left: string, right: string): number {
+  if (left < right) return -1;
+  if (left > right) return 1;
+  return 0;
+}
+
+function collectValidatorFiles(
+  root: string,
+  current: string,
+  files: Record<string, unknown>[]
+): void {
+  for (const entry of readdirSync(current, { withFileTypes: true })) {
+    const path = join(current, entry.name);
+    if (entry.isDirectory()) {
+      collectValidatorFiles(root, path, files);
+      continue;
+    }
+    const bytes = readFileSync(path);
+    files.push({
+      path: path
+        .slice(root.length + 1)
+        .split(/[\\/]+/)
+        .join('/'),
+      sha256: createHash('sha256').update(bytes).digest('hex'),
+      size: statSync(path).size,
+      type: 'file',
+    });
+  }
+}
+
+function stableDigest(value: unknown): string {
+  return createHash('sha256').update(stableSerialize(value)).digest('hex');
+}
+
+function stableSerialize(value: unknown): string {
+  if (value === undefined) return 'null';
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stableSerialize).join(',')}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .sort()
+    .filter(key => record[key] !== undefined)
+    .map(key => `${JSON.stringify(key)}:${stableSerialize(record[key])}`)
+    .join(',')}}`;
+}
+
+function git(cwd: string, args: string[]): void {
+  execFileSync('git', ['-C', cwd, ...args], { stdio: 'ignore' });
+}
+
+function gitText(cwd: string, args: string[]): string {
+  return execFileSync('git', ['-C', cwd, ...args], { stdio: ['ignore', 'pipe', 'pipe'] })
+    .toString('utf8')
+    .trim();
+}
+
 describe('workflowRunCommand', () => {
   let consoleSpy: ReturnType<typeof spyOn>;
 
@@ -645,6 +982,8 @@ describe('workflowRunCommand', () => {
     mockLogger.warn.mockClear();
     mockLogger.error.mockClear();
     mockLogger.info.mockClear();
+    const coreModule = require('@archon/core') as { loadConfig: ReturnType<typeof mock> };
+    coreModule.loadConfig.mockResolvedValue({ defaults: {} });
   });
 
   afterEach(() => {
@@ -1381,6 +1720,608 @@ describe('workflowRunCommand', () => {
     await expect(workflowRunCommand('/test/path', 'assist', 'hello', {})).rejects.toThrow(
       'requires a worktree'
     );
+  });
+
+  it('threads declared repo seeds, grants, and precreated run into a hardened container run', async () => {
+    const fixture = makeHardenedCliFixture();
+    const api = fixture.addRepo('api', 'api v1\n');
+    fixture.addRepo('web-app', 'web v1\n');
+    writeFileSync(join(api, '.env'), 'API_SECRET=1\n');
+    writeFileSync(join(fixture.source, 'controller.secret.backup'), 'controller canary\n');
+    const apiCommit = gitText(api, ['rev-parse', 'HEAD']);
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const { executeWorkflow } = await import('@archon/workflows/executor');
+    const core = await import('@archon/core');
+    const codebaseDb = await import('@archon/core/db/codebases');
+    const workflowDb = await import('@archon/core/db/workflows');
+    const executeBefore = (executeWorkflow as ReturnType<typeof mock>).mock.calls.length;
+
+    const workflow = makeTestWorkflowWithSource({
+      name: 'hardened-container',
+      hardened: { required: true },
+      nodes: [{ id: 'test', bash: 'echo ok' }],
+    });
+    const egressPolicy = {
+      targets: [{ host: 'registry.example', port: 443 }],
+      httpGrants: [{ host: 'registry.example', port: 443, methods: ['GET'], paths: ['/package'] }],
+    };
+    const policyDir = join(mockArchonHome, 'controller-policy');
+    mkdirSync(policyDir, { recursive: true, mode: 0o700 });
+    writeFileSync(
+      join(policyDir, 'planning-approval.json'),
+      JSON.stringify({
+        schema: 'archon.hardened-controller-planning-policy.v1',
+        version: 1,
+        workflowDigest: computeControllerWorkflowDigest(workflow.workflow),
+        grants: [],
+        egress: { image: MOCK_IMAGE_ID, policy: egressPolicy },
+        providerBudget: {
+          policies: [
+            {
+              provider: 'openai',
+              host: 'registry.example',
+              model: 'gpt-5.6-sol',
+              maxInputTokens: 1024,
+              maxOutputTokens: 256,
+            },
+          ],
+        },
+      }),
+      { mode: 0o600 }
+    );
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [workflow],
+      errors: [],
+    });
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'cb-folder',
+      name: 'platform',
+      default_cwd: fixture.source,
+      kind: 'folder',
+    });
+    (core.loadConfig as ReturnType<typeof mock>).mockResolvedValue({
+      defaults: {},
+      container: {
+        enabled: true,
+        image: 'archon-runner:test',
+        repo_inputs: [{ path: 'api' }, { path: 'web-app' }],
+      },
+    });
+    (workflowDb.createWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      ...precreatedRunFixture,
+      id: 'actual-run-123',
+      working_path: fixture.source,
+    });
+    (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      ...precreatedRunFixture,
+      id: 'actual-run-123',
+      status: 'completed',
+      metadata: { isolation: 'container', writeback_resolved: true },
+    });
+
+    await workflowRunCommand(fixture.source, 'hardened-container', 'go', { container: true });
+
+    const backendOptions = mockResolveFolderBackend.mock.calls.at(-1)?.[1] as {
+      containerConfig: {
+        image: string;
+        egressPolicy: typeof egressPolicy;
+        proxyBudget: {
+          grant: { runId: string; workflowDigest: string; totalTokenLimit: number };
+          providerPolicies: Array<{ provider: string; host: string; model: string }>;
+        };
+      };
+    };
+    expect(backendOptions.containerConfig.image).toBe(MOCK_IMAGE_ID);
+    expect(backendOptions.containerConfig.egressPolicy.httpGrants[0]?.paths).toEqual(['/package']);
+    expect(backendOptions.containerConfig.proxyBudget).toMatchObject({
+      grant: {
+        runId: 'actual-run-123',
+        workflowDigest: computeControllerWorkflowDigest(workflow.workflow),
+        totalTokenLimit: 8000000,
+      },
+      providerPolicies: [{ provider: 'openai', host: 'registry.example', model: 'gpt-5.6-sol' }],
+    });
+
+    expect(mockContainerPrepare).toHaveBeenCalledTimes(1);
+    const prepareArg = mockContainerPrepare.mock.calls[0]?.[0] as {
+      ownerRunId?: string;
+      seed?: { path: string; allowGitMetadata?: boolean };
+    };
+    const seedPath = prepareArg.seed?.path ?? '';
+    expect(seedPath).toContain('actual-run-123');
+    expect(prepareArg.ownerRunId).toBe('actual-run-123');
+    expect(prepareArg.seed?.allowGitMetadata).toBe(true);
+    expect(readFileSync(join(seedPath, 'api', 'README.md'), 'utf8')).toBe('api v1\n');
+    expect(readFileSync(join(seedPath, 'web-app', 'README.md'), 'utf8')).toBe('web v1\n');
+    expect(() => readFileSync(join(seedPath, 'api', '.env'), 'utf8')).toThrow();
+    expect(() => readFileSync(join(seedPath, 'controller.secret.backup'), 'utf8')).toThrow();
+    writeFileSync(join(api, 'README.md'), 'api v2\n');
+    git(api, ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-am', 'v2']);
+    expect(readFileSync(join(seedPath, 'api', 'README.md'), 'utf8')).toBe('api v1\n');
+
+    const executeArgs = (executeWorkflow as ReturnType<typeof mock>).mock.calls.at(-1) ?? [];
+    const deps = executeArgs[0] as {
+      workflowBudgetGrants?: unknown[];
+      controllerActionGrants?: unknown[];
+    };
+    const opts = executeArgs[7] as {
+      preCreatedRun?: { id: string };
+      execContext?: { kind: string };
+    };
+    expect(deps.workflowBudgetGrants?.[0]).toMatchObject({ runId: 'actual-run-123' });
+    expect(deps.controllerActionGrants).toEqual([]);
+    expect(opts.preCreatedRun?.id).toBe('actual-run-123');
+    expect(opts.execContext?.kind).toBe('container');
+    expect(
+      (workflowDb.updateWorkflowRun as ReturnType<typeof mock>).mock.calls.at(-1)?.[1]
+    ).toMatchObject({
+      metadata: {
+        hardened_budget: {
+          workflowDigest: expect.any(String),
+          tokens: { total: 8000000 },
+          consumed: { input: 0, output: 0 },
+        },
+        hardened_controller_policy: {
+          image: MOCK_IMAGE_ID,
+          proxyBudgetSeedDigest: expect.any(String),
+          requestedImage: 'archon-runner:test',
+          repoInputs: [
+            expect.objectContaining({ targetPath: 'api', commit: apiCommit }),
+            expect.objectContaining({ targetPath: 'web-app' }),
+          ],
+        },
+      },
+    });
+    fixture.cleanup();
+  }, 15_000);
+
+  it('destroys the exact prepared hardened env if run metadata stamping fails', async () => {
+    const fixture = makeHardenedCliFixture();
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const { executeWorkflow } = await import('@archon/workflows/executor');
+    const core = await import('@archon/core');
+    const codebaseDb = await import('@archon/core/db/codebases');
+    const workflowDb = await import('@archon/core/db/workflows');
+    const executeBefore = (executeWorkflow as ReturnType<typeof mock>).mock.calls.length;
+
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [
+        makeTestWorkflowWithSource({
+          name: 'hardened-container',
+          hardened: { required: true },
+          nodes: [{ id: 'test', bash: 'echo ok' }],
+        }),
+      ],
+      errors: [],
+    });
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'cb-folder',
+      name: 'platform',
+      default_cwd: fixture.source,
+      kind: 'folder',
+    });
+    (core.loadConfig as ReturnType<typeof mock>).mockResolvedValue({
+      defaults: {},
+      container: { enabled: true, image: 'archon-runner:test' },
+    });
+    (workflowDb.createWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      ...precreatedRunFixture,
+      id: 'actual-run-stamp-fail',
+      working_path: fixture.source,
+    });
+    (workflowDb.updateWorkflowRun as ReturnType<typeof mock>).mockRejectedValueOnce(
+      new Error('stamp failed')
+    );
+
+    try {
+      await expect(
+        workflowRunCommand(fixture.source, 'hardened-container', 'go', { container: true })
+      ).rejects.toThrow(/stamp failed/);
+      expect(mockContainerPrepare).toHaveBeenCalledTimes(1);
+      expect(mockContainerDestroy).toHaveBeenCalledWith('container-env-1');
+      expect((executeWorkflow as ReturnType<typeof mock>).mock.calls.length).toBe(executeBefore);
+    } finally {
+      (workflowDb.updateWorkflowRun as ReturnType<typeof mock>).mockResolvedValue(undefined);
+      fixture.cleanup();
+    }
+  });
+
+  it('rejects a tampered precreated hardened run id before container prepare or agent work', async () => {
+    const fixture = makeHardenedCliFixture();
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const { executeWorkflow } = await import('@archon/workflows/executor');
+    const codebaseDb = await import('@archon/core/db/codebases');
+    const workflowDb = await import('@archon/core/db/workflows');
+    const prepareBefore = mockContainerPrepare.mock.calls.length;
+    const executeBefore = (executeWorkflow as ReturnType<typeof mock>).mock.calls.length;
+
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [
+        makeTestWorkflowWithSource({
+          name: 'hardened-container',
+          hardened: { required: true },
+          nodes: [{ id: 'test', bash: 'echo ok' }],
+        }),
+      ],
+      errors: [],
+    });
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'cb-folder',
+      name: 'platform',
+      default_cwd: fixture.source,
+      kind: 'folder',
+    });
+    (workflowDb.createWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      ...precreatedRunFixture,
+      id: '../tampered',
+      working_path: fixture.source,
+    });
+
+    try {
+      await expect(
+        workflowRunCommand(fixture.source, 'hardened-container', 'go', { container: true })
+      ).rejects.toThrow(/run id is missing or malformed/);
+    } finally {
+      fixture.cleanup();
+    }
+
+    expect(mockContainerPrepare.mock.calls.length).toBe(prepareBefore);
+    expect((executeWorkflow as ReturnType<typeof mock>).mock.calls.length).toBe(executeBefore);
+  });
+
+  it('rejects hardened container resume without persisted budget before resource or agent work', async () => {
+    const fixture = makeHardenedCliFixture();
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const { executeWorkflow } = await import('@archon/workflows/executor');
+    const codebaseDb = await import('@archon/core/db/codebases');
+    const workflowDb = await import('@archon/core/db/workflows');
+    const resumeBefore = mockContainerResumeEnv.mock.calls.length;
+    const executeBefore = (executeWorkflow as ReturnType<typeof mock>).mock.calls.length;
+
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [
+        makeTestWorkflowWithSource({
+          name: 'hardened-container',
+          hardened: { required: true },
+          nodes: [{ id: 'test', bash: 'echo ok' }],
+        }),
+      ],
+      errors: [],
+    });
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'cb-folder',
+      name: 'platform',
+      default_cwd: fixture.source,
+      kind: 'folder',
+    });
+    (workflowDb.findResumableRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      ...precreatedRunFixture,
+      id: 'actual-run-resume',
+      status: 'failed',
+      working_path: fixture.source,
+      metadata: { isolation: 'container', isolation_env_id: 'container-env-1' },
+    });
+
+    try {
+      await expect(
+        workflowRunCommand(fixture.source, 'hardened-container', 'go', {
+          container: true,
+          resume: true,
+        })
+      ).rejects.toThrow(/persisted budget state is missing or malformed/);
+    } finally {
+      fixture.cleanup();
+    }
+
+    expect(mockContainerResumeEnv.mock.calls.length).toBe(resumeBefore);
+    expect((executeWorkflow as ReturnType<typeof mock>).mock.calls.length).toBe(executeBefore);
+  });
+
+  it('resumes hardened containers from frozen policy metadata without recapturing current sources', async () => {
+    const fixture = makeHardenedCliFixture();
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const { executeWorkflow, hydrateResumableRun } = await import('@archon/workflows/executor');
+    const core = await import('@archon/core');
+    const codebaseDb = await import('@archon/core/db/codebases');
+    const workflowDb = await import('@archon/core/db/workflows');
+    const prepareBefore = mockContainerPrepare.mock.calls.length;
+    const workflow = makeTestWorkflowWithSource({
+      name: 'hardened-container',
+      hardened: { required: true },
+      nodes: [{ id: 'test', bash: 'echo ok' }],
+    });
+    const workflowDigest = computeControllerWorkflowDigest(workflow.workflow);
+
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [workflow],
+      errors: [],
+    });
+    (core.loadConfig as ReturnType<typeof mock>).mockResolvedValue({
+      defaults: {},
+      container: { enabled: true, image: 'archon-runner:resume' },
+    });
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'cb-folder',
+      name: 'platform',
+      default_cwd: fixture.source,
+      kind: 'folder',
+    });
+    const session = prepareHardenedControllerSession({
+      runId: 'actual-run-resume',
+      workflow: workflow.workflow,
+      workflowSource: 'bundled',
+      sourceRoot: fixture.source,
+      conversationId: 'frozen-conv',
+      userMessage: 'go',
+      image: MOCK_IMAGE_ID,
+      requestedImage: 'archon-runner:resume',
+      budget: { deadlineAt: '2030-01-01T00:00:00.000Z', tokens: { total: 5555 } },
+    });
+    writeFileSync(join(fixture.source, 'README.md'), 'changed after capture\n');
+    (workflowDb.findResumableRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      ...precreatedRunFixture,
+      id: 'actual-run-resume',
+      status: 'failed',
+      working_path: fixture.source,
+      metadata: {
+        isolation: 'container',
+        isolation_env_id: 'container-env-1',
+        hardened_budget: {
+          workflowDigest,
+          deadlineAt: '2030-01-01T00:00:00.000Z',
+          tokens: { total: 5555 },
+        },
+        hardened_controller_policy: session.policyMetadata,
+      },
+    });
+    (hydrateResumableRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      preCreatedRun: { id: 'actual-run-resume', workflow_name: 'hardened-container' },
+      priorCompletedNodes: new Map([['prior', 'ok']]),
+    });
+
+    try {
+      await workflowRunCommand(fixture.source, 'hardened-container', 'go', {
+        container: true,
+        resume: true,
+      });
+    } finally {
+      fixture.cleanup();
+    }
+
+    expect(mockContainerPrepare.mock.calls.length).toBe(prepareBefore);
+    expect(mockContainerResumeEnv).toHaveBeenCalledWith('container-env-1', {
+      egressPolicyB64: undefined,
+      image: MOCK_IMAGE_ID,
+      ownerRunId: 'actual-run-resume',
+    });
+    const executeArgs = (executeWorkflow as ReturnType<typeof mock>).mock.calls.at(-1) ?? [];
+    const deps = executeArgs[0] as { workflowBudgetGrants?: Array<Record<string, unknown>> };
+    expect(deps.workflowBudgetGrants?.[0]).toMatchObject({
+      runId: 'actual-run-resume',
+      tokens: { total: 5555 },
+    });
+  });
+
+  it('wires operator-private validator node modules into hardened controller actions', async () => {
+    const fixture = makeHardenedCliFixture();
+    fixture.addRepo('api', 'api v1\n');
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const { executeWorkflow } = await import('@archon/workflows/executor');
+    const core = await import('@archon/core');
+    const codebaseDb = await import('@archon/core/db/codebases');
+    const workflowDb = await import('@archon/core/db/workflows');
+    const validator = createValidatorNodeModules(mockArchonHome);
+    const workflow = makeTestWorkflowWithSource({
+      name: 'hardened-container',
+      hardened: { required: true },
+      nodes: [
+        { id: 'freeze', controller_action: 'finalize-evidence', phase: 'planning-freeze' },
+        {
+          id: 'approval-check',
+          controller_action: 'verify-approval',
+          phase: 'planning-approval',
+        },
+        {
+          id: 'candidate-import',
+          controller_action: 'finalize-evidence',
+          phase: 'candidate-import',
+        },
+        {
+          id: 'candidate-blackbox',
+          depends_on: ['candidate-import'],
+          controller_action: 'finalize-evidence',
+          phase: 'candidate-blackbox-test',
+        },
+      ],
+    });
+    const policyDir = join(mockArchonHome, 'controller-policy');
+    mkdirSync(policyDir, { recursive: true, mode: 0o700 });
+    chmodSync(mockArchonHome, 0o700);
+    chmodSync(policyDir, 0o700);
+    writeFileSync(
+      join(policyDir, 'planning-approval.json'),
+      JSON.stringify({
+        schema: 'archon.hardened-controller-planning-policy.v1',
+        version: 1,
+        workflowDigest: computeControllerWorkflowDigest(workflow.workflow),
+        validatorSource: { nodeModulesPath: validator.nodeModules },
+        grants: [
+          {
+            nodeId: 'candidate-import',
+            action: 'finalize-evidence',
+            phase: 'candidate-import',
+            repositoryTarget: 'api',
+            bundleArtifact: 'run/candidate.bundle',
+            candidateArtifact: 'run/candidate.json',
+          },
+          {
+            nodeId: 'candidate-blackbox',
+            action: 'finalize-evidence',
+            phase: 'candidate-blackbox-test',
+            repositoryTarget: 'api',
+            candidateImportNodeId: 'candidate-import',
+            freezeNodeId: 'freeze',
+            approvalReceiptNodeId: 'approval-check',
+            profile: 'static-web-http-v1',
+            acceptancePolicyPath: 'run/oracle/acceptance.browser.json',
+            appRoot: '.',
+            port: 4173,
+            staticHelperImage: MOCK_IMAGE_ID,
+            verifierImage: MOCK_IMAGE_ID,
+            validatorPackageDigest: validator.playwrightDigest,
+            validatorCorePackageDigest: validator.coreDigest,
+          },
+        ],
+      }),
+      { mode: 0o600 }
+    );
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [workflow],
+      errors: [],
+    });
+    (core.loadConfig as ReturnType<typeof mock>).mockResolvedValue({
+      defaults: {},
+      container: {
+        enabled: true,
+        image: 'archon-runner:test',
+        repo_inputs: [{ path: 'api' }],
+      },
+    });
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'cb-folder',
+      name: 'platform',
+      default_cwd: fixture.source,
+      kind: 'folder',
+    });
+    (workflowDb.createWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      ...precreatedRunFixture,
+      id: 'actual-run-validator',
+      working_path: fixture.source,
+    });
+
+    try {
+      await workflowRunCommand(fixture.source, 'hardened-container', 'go', { container: true });
+    } finally {
+      fixture.cleanup();
+    }
+
+    const executeArgs = (executeWorkflow as ReturnType<typeof mock>).mock.calls.at(-1) ?? [];
+    const deps = executeArgs[0] as {
+      controllerActions?: Record<string, unknown>;
+      controllerActionGrants?: Array<{ nodeId: string }>;
+    };
+    expect(deps.controllerActions?.['finalize-evidence']).toBeFunction();
+    expect(deps.controllerActionGrants?.map(grant => grant.nodeId)).toEqual([
+      'candidate-import',
+      'candidate-blackbox',
+    ]);
+  });
+
+  it('rejects black-box controller grants without an operator-private validator source', async () => {
+    const fixture = makeHardenedCliFixture();
+    fixture.addRepo('api', 'api v1\n');
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const { executeWorkflow } = await import('@archon/workflows/executor');
+    const core = await import('@archon/core');
+    const codebaseDb = await import('@archon/core/db/codebases');
+    const workflowDb = await import('@archon/core/db/workflows');
+    const executeBefore = (executeWorkflow as ReturnType<typeof mock>).mock.calls.length;
+    const validator = createValidatorNodeModules(mockArchonHome);
+    const workflow = makeTestWorkflowWithSource({
+      name: 'hardened-container',
+      hardened: { required: true },
+      nodes: [
+        {
+          id: 'candidate-blackbox',
+          controller_action: 'finalize-evidence',
+          phase: 'candidate-blackbox-test',
+        },
+      ],
+    });
+    const policyDir = join(mockArchonHome, 'controller-policy');
+    mkdirSync(policyDir, { recursive: true, mode: 0o700 });
+    chmodSync(mockArchonHome, 0o700);
+    chmodSync(policyDir, 0o700);
+    writeFileSync(
+      join(policyDir, 'planning-approval.json'),
+      JSON.stringify({
+        schema: 'archon.hardened-controller-planning-policy.v1',
+        version: 1,
+        workflowDigest: computeControllerWorkflowDigest(workflow.workflow),
+        grants: [
+          {
+            nodeId: 'candidate-blackbox',
+            action: 'finalize-evidence',
+            phase: 'candidate-blackbox-test',
+            repositoryTarget: 'api',
+            candidateImportNodeId: 'candidate-import',
+            freezeNodeId: 'freeze',
+            approvalReceiptNodeId: 'approval-check',
+            profile: 'static-web-http-v1',
+            acceptancePolicyPath: 'run/oracle/acceptance.browser.json',
+            appRoot: '.',
+            port: 4173,
+            staticHelperImage: MOCK_IMAGE_ID,
+            verifierImage: MOCK_IMAGE_ID,
+            validatorPackageDigest: validator.playwrightDigest,
+            validatorCorePackageDigest: validator.coreDigest,
+          },
+        ],
+      }),
+      { mode: 0o600 }
+    );
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [workflow],
+      errors: [],
+    });
+    (core.loadConfig as ReturnType<typeof mock>).mockResolvedValue({
+      defaults: {},
+      container: {
+        enabled: true,
+        image: 'archon-runner:test',
+        repo_inputs: [{ path: 'api' }],
+      },
+    });
+    (codebaseDb.findCodebaseByDefaultCwd as ReturnType<typeof mock>).mockResolvedValueOnce({
+      id: 'cb-folder',
+      name: 'platform',
+      default_cwd: fixture.source,
+      kind: 'folder',
+    });
+    (workflowDb.createWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
+      ...precreatedRunFixture,
+      id: 'actual-run-validator-missing',
+      working_path: fixture.source,
+    });
+
+    const priorValidatorEnv = process.env.ARCHON_PLAYWRIGHT_NODE_MODULES;
+    process.env.ARCHON_PLAYWRIGHT_NODE_MODULES = validator.nodeModules;
+    try {
+      await expect(
+        workflowRunCommand(fixture.source, 'hardened-container', 'go', { container: true })
+      ).rejects.toThrow(/validator source is missing/);
+    } finally {
+      if (priorValidatorEnv === undefined) delete process.env.ARCHON_PLAYWRIGHT_NODE_MODULES;
+      else process.env.ARCHON_PLAYWRIGHT_NODE_MODULES = priorValidatorEnv;
+      fixture.cleanup();
+    }
+
+    expect((executeWorkflow as ReturnType<typeof mock>).mock.calls.length).toBe(executeBefore);
+  });
+
+  it('preserves hardened container volumes after failed or cancelled outcomes', () => {
+    expect(shouldPreserveHardenedContainer({ isolation: 'container' }, 'failed')).toBe(true);
+    expect(shouldPreserveHardenedContainer({ isolation: 'container' }, 'cancelled')).toBe(true);
+    expect(shouldPreserveHardenedContainer({ isolation: 'container' }, 'completed')).toBe(false);
+    expect(shouldPreserveHardenedContainer({ isolation: 'worktree' }, 'failed')).toBe(false);
+  });
+
+  it('retains the owned hardened container when the engine reports an early node failure', async () => {
+    await expectHardenedRunRetainsContainer('failed');
+  });
+
+  it('retains the owned hardened container when the engine reports cancellation', async () => {
+    await expectHardenedRunRetainsContainer('cancelled');
   });
 
   it('creates worktree with auto-generated branch when no --branch given', async () => {
@@ -4603,7 +5544,6 @@ describe('workflowApproveCommand', () => {
     const codebaseDb = await import('@archon/core/db/codebases');
     const workflowDiscovery = await import('@archon/workflows/workflow-discovery');
     const core = await import('@archon/core');
-
     (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
       id: 'run-approve-1',
       workflow_name: 'implement',
@@ -4611,7 +5551,7 @@ describe('workflowApproveCommand', () => {
       user_message: 'add auth',
       working_path: '/tmp/test-worktree',
       codebase_id: 'cb-existing',
-      metadata: { approval: { nodeId: 'review-node' } },
+      metadata: { approval: { type: 'approval', nodeId: 'review-node', message: 'Approve?' } },
     });
 
     (core.createWorkflowStore as ReturnType<typeof mock>).mockReturnValueOnce({
@@ -4720,7 +5660,6 @@ describe('workflowApproveCommand', () => {
     const codebaseDb = await import('@archon/core/db/codebases');
     const conversationsDb = await import('@archon/core/db/conversations');
     const workflowDiscovery = await import('@archon/workflows/workflow-discovery');
-    const core = await import('@archon/core');
 
     (workflowDb.getWorkflowRun as ReturnType<typeof mock>).mockResolvedValueOnce({
       id: 'run-approve-conv',
@@ -6158,11 +7097,119 @@ describe('hasUnresolvedWriteback (H2 teardown-preserve decision)', () => {
 });
 
 describe('resolveContainerBackendConfig', () => {
+  it('refuses isolation egress drift instead of resuming broader or stripped authority', () => {
+    const base = { ...resolveContainerBackendConfig(undefined), image: MOCK_IMAGE_ID };
+    const owner = 'run-bound';
+    const identity = { image: MOCK_IMAGE_ID, ownerRunId: owner };
+    const egressPolicy = {
+      targets: [{ host: 'registry.example', port: 443 }],
+      httpGrants: [{ host: 'registry.example', port: 443, methods: ['GET'], paths: ['/package'] }],
+    };
+    const proxyBudget = {
+      grant: {
+        schema: 'archon.proxy-budget-grant.v1' as const,
+        rootChainId: owner,
+        runId: owner,
+        workflowDigest: 'workflow-digest',
+        policyDigest: 'policy-digest',
+        deadlineEpochMs: Date.parse('2030-01-01T00:00:00.000Z'),
+        inputTokenLimit: 100,
+        outputTokenLimit: 50,
+        totalTokenLimit: 150,
+      },
+      providerPolicies: [
+        {
+          provider: 'openai' as const,
+          host: 'registry.example',
+          model: 'gpt-5.6-sol',
+          maxInputTokens: 100,
+          maxOutputTokens: 50,
+        },
+      ],
+    };
+    const encoded = encodeStrictEgressPolicy(egressPolicy);
+    expect(() =>
+      assertHardenedEgressEnvironment(base, { ...identity, egressPolicyB64: encoded }, owner)
+    ).toThrow(/egress differs/);
+    expect(() =>
+      assertHardenedEgressEnvironment({ ...base, egressPolicy }, identity, owner)
+    ).toThrow(/egress differs/);
+    expect(() => assertHardenedEgressEnvironment(base, undefined, owner)).toThrow(
+      /metadata is missing/
+    );
+    expect(() =>
+      assertHardenedEgressEnvironment(
+        { ...base, egressPolicy, proxyBudget },
+        {
+          ...identity,
+          egressPolicyB64: encoded,
+          proxyBudgetSeedDigest: stableDigestForTest(proxyBudget),
+        },
+        owner
+      )
+    ).not.toThrow();
+    expect(() =>
+      assertHardenedEgressEnvironment(
+        base,
+        { ...identity, image: 'sha256:' + 'a'.repeat(64) },
+        owner
+      )
+    ).toThrow(/image or run ownership/);
+    expect(() =>
+      assertHardenedEgressEnvironment(base, { ...identity, ownerRunId: 'sibling' }, owner)
+    ).toThrow(/image or run ownership/);
+  });
+  it('refuses stripped host routing when the trusted private run marker exists', () => {
+    const fixture = makeHardenedCliFixture();
+    try {
+      mkdirSync(
+        join(
+          mockArchonHome,
+          'controller-runs',
+          'captured-run-11111111-1111-4111-8111-111111111111'
+        ),
+        { recursive: true, mode: 0o700 }
+      );
+      expect(() => assertHardenedControllerResumeRoute('captured-run', undefined, false)).toThrow(
+        /host isolation route/
+      );
+      expect(() => assertHardenedControllerResumeRoute('other-run', undefined, true)).toThrow(
+        /host isolation route/
+      );
+      expect(() =>
+        assertHardenedControllerResumeRoute('unrelated-run', undefined, false)
+      ).not.toThrow();
+    } finally {
+      fixture.cleanup();
+    }
+  });
+  it('preserves container opt-in and repository declarations consumed by the surrounding runner', () => {
+    for (const declarations of [
+      { enabled: true, repoInputs: [{ path: 'api', source: 'api' }] },
+      { enabled: false, repo_inputs: [{ path: 'web', source: 'web-app' }] },
+    ]) {
+      expect(resolveContainerBackendConfig(declarations as never).network).toBe('none');
+    }
+  });
+  it('rejects unsupported security settings rather than silently dropping them', () => {
+    for (const value of [
+      { egressPolicy: { targets: [{ host: 'evil.example', port: 443 }] } },
+      { proxyBudget: { grant: {}, providerPolicies: [] } },
+      { providerBudget: { policies: [] } },
+      { privileged: true },
+      { mounts: ['/home:/home'] },
+      null,
+      [],
+    ]) {
+      expect(() => resolveContainerBackendConfig(value as never)).toThrow(/container/);
+    }
+  });
   it('applies defaults when config is absent', () => {
     const cfg = resolveContainerBackendConfig(undefined);
     expect(cfg).toEqual({
+      profile: 'hardened',
       image: 'archon-runner:latest',
-      network: 'bridge',
+      network: 'none',
       memoryMb: 4096,
       pidsLimit: 512,
     });
@@ -6174,8 +7221,10 @@ describe('resolveContainerBackendConfig', () => {
       network: 'none',
       memoryMb: 2048,
       pidsLimit: 256,
+      profile: 'hardened',
     });
     expect(cfg).toEqual({
+      profile: 'hardened',
       image: 'my-runner:1',
       network: 'none',
       memoryMb: 2048,
@@ -6183,8 +7232,15 @@ describe('resolveContainerBackendConfig', () => {
     });
   });
 
-  it('rejects a non bridge/none network (no silent --network host)', () => {
-    expect(() => resolveContainerBackendConfig({ network: 'host' })).toThrow(/bridge.*none/);
+  it('rejects non-hardened profiles instead of falling back to legacy overlay isolation', () => {
+    expect(() => resolveContainerBackendConfig({ profile: 'native-overlay' })).toThrow(
+      /only 'hardened' is supported/
+    );
+  });
+
+  it('rejects bridge/host networks until a restricted provider proxy exists', () => {
+    expect(() => resolveContainerBackendConfig({ network: 'bridge' })).toThrow(/must be 'none'/);
+    expect(() => resolveContainerBackendConfig({ network: 'host' })).toThrow(/must be 'none'/);
   });
 
   it('rejects a fractional memoryMb (docker --memory needs an integer)', () => {
@@ -6196,3 +7252,19 @@ describe('resolveContainerBackendConfig', () => {
     expect(() => resolveContainerBackendConfig({ pidsLimit: 0 })).toThrow(/positive integer/);
   });
 });
+
+function stableDigestForTest(value: unknown): string {
+  return createHash('sha256').update(stableSerializeForTest(value)).digest('hex');
+}
+
+function stableSerializeForTest(value: unknown): string {
+  if (value === undefined) return 'null';
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stableSerializeForTest).join(',')}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .sort()
+    .filter(key => record[key] !== undefined)
+    .map(key => `${JSON.stringify(key)}:${stableSerializeForTest(record[key])}`)
+    .join(',')}}`;
+}

@@ -1,161 +1,132 @@
-# Container isolation — security posture
+# Hardened container isolation — security posture
 
-The folder-project **container backend** (`--container`) runs a workflow inside a
-Docker container over a read-only bind of the project root plus a writable
-overlayfs upper layer. This document states, honestly, what that boundary does and
-does **not** protect against, so operators can decide when it is appropriate.
+The folder-project container backend runs workflow agents inside an unprivileged
+Docker container over controller-seeded, per-run named volumes. It is designed to
+protect the operator/controller environment from actively misbehaving workflow
+agents within the stated boundary below.
 
-> **One-line summary:** the container backend is an **isolation-hardening** feature
-> for a **single-tenant, operator-trusted** deployment — it keeps a _well-behaved_
-> agent's writes off the live root until an (approval-gated, Phase C) write-back.
-> When it runs in the `native` overlay mode — the **fallback** used on a standard
-> rootful daemon (the `fuse` mode is attempted first and is what runs on
-> rootless/userns daemons) — it is **NOT** a sandbox against a **malicious or
-> prompt-injected** agent.
+## Trusted boundary
 
-## Threat model
+Trusted: the operator/controller process, host, and Docker daemon. Untrusted:
+workflow agents, repository code, generated scripts, and artifacts produced by a
+run. This does not claim protection against a compromised host, Docker daemon, or
+malicious human operator.
 
-**In scope (what it does buy you):**
+## Enforced boundary
 
-- A well-behaved agent's file writes land in the overlay upper layer, not the live
-  project root — so a buggy or mistaken run can't corrupt live business data
-  mid-run. The approval-gated **write-back** (Phase C) lets changes land on the
-  live root only after review — and the apply is hardened against an adversarial
-  overlay even though the review itself assumes a cooperative agent (see
-  **Write-back apply hardening** below).
-- Host `process.env` never crosses into the container — the container receives
-  only the Archon-managed env bag (codebase env + per-user AI creds + GitHub
-  token) plus a minimal base. See the env-isolation invariant.
-- Resource caps: `--memory`, `--pids-limit`, and `--network bridge|none`.
+- The agent-facing container does **not** mount the live worktree, live `.git`,
+  host home, credential files, or the Docker socket.
+- The controller seeds a per-run workspace named volume before the run starts.
+  Credential paths (`.env*`, `.npmrc`, `.netrc`, `.aws`, `.docker`, `.config/gh`)
+  are refused. Live Git directories are never copied. Declared repository inputs
+  may use fresh controller-generated shallow Git metadata containing only the
+  pinned commit and its tree/blob objects, not parent history or local hooks/config.
+- Agent processes run as the non-root `archon` user with `--cap-drop ALL`,
+  `--security-opt no-new-privileges`, `--read-only` image filesystem, explicit
+  `--memory` and `--pids-limit`, and `--network none`. Optional provider/registry egress is available only through a controller-pinned CONNECT proxy over a per-run Unix-socket volume; Docker bridge/NAT remains unavailable to the agent container.
+- Runtime state that must be writable lives on per-run named volumes or small
+  tmpfs mounts (`/tmp`, `/run`).
+- Host `process.env` does not cross into container exec calls. Providers and
+  deterministic subprocesses receive only the Archon-managed env bag, with
+  PATH/HOME/PWD-like keys denied so the image controls binary and home lookup.
+- Container provider requests reject unpinned MCP configurations and host in-process
+  native tools before config interpolation. Claude settings sources default to an
+  empty list; nonempty sources require future pinned-bundle support and are refused.
+  Codex forwards only explicitly supplied provider credentials, never ambient host keys.
+- Unsupported write-back from the hardened volume to the live worktree fails
+  closed until a controller-owned publication/write-back action exists.
+- Configured backend egress requires explicit HTTP grants in addition to transport
+  targets. The TLS-terminating gateway binds CONNECT, SNI and HTTP Host, checks
+  methods/paths, and verifies public-address upstream TLS. Legacy CONNECT-only
+  policies cannot start or resume a hardened backend environment.
 
-**Out of scope (what it does NOT buy you):**
+## Strict HTTPS gateway (production admission disabled)
 
-- **`native` overlay mode grants CAP_SYS_ADMIN, which is an isolation escape.**
-  Native mode runs the container with `--cap-add SYS_ADMIN --security-opt
-apparmor=unconfined` because the kernel `mount -t overlay` needs it. With
-  CAP_SYS_ADMIN, in-container **root can remount the read-only bind read-write**:
+`src/egress/strict-https-proxy.ts` provides a separately tested Node TLS-terminating
+gateway. Controller-supplied certificate material and HTTP grants bind CONNECT,
+SNI, HTTP Host, method and request path; upstream certificates are verified. Its
+bounded HTTP/1.1 subset refuses WebSockets, HTTP/2 and chunked request bodies
+rather than falling back to an opaque tunnel. Cancellation, pending DNS admission,
+partial uploads, slow readers and truncated responses have real local TLS tests.
 
-  ```sh
-  mount -o remount,rw /mnt/lower   # succeeds under native mode → writes hit the LIVE host root
-  ```
+The backend generates a per-run ephemeral CA and leaf through fixed system OpenSSL.
+The CA private key is never returned. Only the proxy mounts the read-only private
+TLS volume; agents receive a read-only public CA and Unix socket volume. Staging
+uses only CHOWN beyond dropped capabilities and never mounts live host directories.
+The launcher checks bounded, nonlinked, appropriately owned private files against
+the exact frozen policy. Serving ends at the earlier CA/leaf expiry. Resume preserves
+those credentials and rejects missing volumes, expired material or proxy binding drift;
+cleanup remains possible after expiry. No certificate regeneration occurs on resume.
 
-  A hostile or prompt-injected agent that reaches a shell (bash/script node, or a
-  tool call) can do this and write straight through to the live project root,
-  bypassing the overlay entirely. Treat native mode as _isolation for cooperative
-  runs_, not containment of an adversary.
+Real container fixtures cover approved HTTPS, forged Host and method denial, private
+key absence, suspend/resume and expiry shutdown. They do not certify installation,
+provider authentication or authoritative usage accounting. Repository configuration
+cannot enable egress by itself. The existing private
+`controller-policy/planning-approval.json` may include `egress: { image, policy }`:
+`image` must equal the resolved immutable runner ID and `policy` must specify strict
+transport targets and HTTP grants. The policy's workflow digest must match the run.
+This is operator-owned configuration, not an agent artifact or approval substitute.
 
-- **`docker exec -e` puts secrets in the host process table.** Per-user API
-  keys / tokens are delivered to in-container processes as `-e KEY=VALUE` flags on
-  the `docker exec` argv, so they are briefly visible to anything that can read the
-  **host** process list (`ps auxe`, `/proc/<pid>/cmdline`) during a node's
-  execution. This is acceptable only on a single-tenant host the operator controls.
-  A transient in-container env file is a tracked follow-up.
+Every new controller session is now v2 and HMAC-bound, including sessions with no
+egress or action grants. Signing keys and bindings must occupy fixed direct paths
+under `controller-runs/<runId>-<UUID>`; imported snapshots cannot supply them. On
+resume, copied policy and session authentication precede backend effects. Captured
+image, egress and owner bindings are checked against controller authority and actual
+Docker resource labels. Trusted private run markers prevent host-routing downgrades.
+Unsigned/v1 sessions require a fresh guarded run, not reconstructed authority.
 
-- **`$ARTIFACTS_DIR` is not mounted into the container.** The run's artifacts dir
-  is created after the container is prepared, so it isn't bind-mounted. Engine-side
-  typed-output sidecars still work (written on the host from captured stdout), but
-  a container node that writes **directly** to `$ARTIFACTS_DIR` will fail (the path
-  is absent inside the container). Workflows should write to the workspace (the
-  overlay), not `$ARTIFACTS_DIR`.
+Production activation remains disabled pending authoritative budgets, final receipt
+services and the complete hardened run contract. These controls do not authorize
+publication or backfill writes.
 
-- **Running as root.** In-container work runs as root under `IS_SANDBOX=1`.
-  Combined with the CAP_SYS_ADMIN of native mode, the in-container root is
-  powerful; the boundary is the container + the daemon's own confinement, not the
-  in-container uid.
+## Browser observation profile (not release authority)
 
-- **Build-time installers are version-pinned but not checksum-verified.** The
-  runner image pins the base image by digest and pins the Claude/bun/uv **tool
-  versions** (`runner.Dockerfile` build args), so a build won't silently pull a
-  newer binary. But the vendor installer **scripts** (`claude.ai/install.sh`,
-  `bun.sh/install`, `astral.sh/uv/<v>/install.sh`) are fetched over TLS and run as
-  root at build time without an independent checksum/signature (they aren't
-  published with stable checksums). A compromised installer endpoint could still
-  tamper with the built image. Accepted residual for v1; re-evaluate if a
-  published-checksum path becomes available.
+The optional browser observation service runs the application and verifier in separate
+containers sharing a network namespace from a network-none pod. The application has no
+mount of verifier definitions or evidence. Only the verifier uses the custom seccomp
+profile; workflow agents, applications, seed helpers and artifact readers retain Docker's
+default filter. The controller-only volume initializer may use UID 0 and CHOWN on a fresh
+named volume; it executes no repository code.
 
-## Overlay modes and how to get the stronger boundary
+The source profile is pinned to [Playwright v1.60.0 commit
+87bb9dd](https://github.com/microsoft/playwright/blob/87bb9ddbd78f329df18c2b24847bc9409240cd07/utils/docker/seccomp_profile.json).
+Its SHA256 is `cc3e61cabda6bbc1e53e54d27ba4d55a9d3be829b6dd1a596f4a7b31b1cc7849`.
+The reviewed effective profile removes io_uring syscalls and allows the chroot syscall
+for Chromium's nested user-namespace sandbox, without adding container capabilities.
+Its SHA256 is `153cb94e0bb74823af2e2e4e8548fc5a0895639e4bf16fa98ecac258b5641019`.
+A seccomp option alone is not proof: tests inspect kernel filtering, no-new-privileges,
+UID/GID and capability state and run harmless denial controls. There is no no-sandbox,
+unconfined-seccomp, host-IPC or SYS_ADMIN fallback.
 
-The backend picks the **least-privileged mode that mounts**, preferring `fuse`:
+Imported observations explicitly have `authority: none`. Image labels are not build
+attestations. Publication requires separate immutable build/oracle/approval binding and
+a trusted receipt handler. Request cancellation, total observation deadlines and
+owned-resource cleanup have isolated container tests. Binding this service to the
+workflow's durable cumulative budget and final receipt authority remains required
+before production admission.
 
-| Mode                | Flags                                                    | Remount escape?                                          | Where it mounts                                                                                         |
-| ------------------- | -------------------------------------------------------- | -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| `fuse` (preferred)  | `--device /dev/fuse`, **no** CAP_SYS_ADMIN               | **Closed** — no CAP_SYS_ADMIN, so `remount,rw` is denied | Only where the daemon grants unprivileged FUSE mounts: **rootless Docker** or a **userns-remap** daemon |
-| `native` (fallback) | `--cap-add SYS_ADMIN --security-opt apparmor=unconfined` | **Open** — see above                                     | Everywhere (standard rootful daemon)                                                                    |
+## Out of scope
 
-On a **standard rootful daemon** (e.g. default Docker Desktop, default Docker
-Engine), unprivileged FUSE mounts are denied, so the `fuse` attempt fails fast and
-the backend falls back to `native` — meaning the remount escape is present. To get
-the hardened boundary (no CAP_SYS_ADMIN), run the daemon **rootless** or with
-**userns-remap**, where the `fuse` mode succeeds and the container never holds
-CAP_SYS_ADMIN.
-
-The mode that actually mounted is recorded on the `isolation_environments` row
-(`metadata.overlayMode`) and logged (`isolation.container_overlay_fallback` warns
-when native was used).
-
-## Write-back apply hardening
-
-The overlay's upper layer is **attacker-controlled** (a compromised in-container
-agent chooses the filenames, whiteouts, symlink targets, and modes). The diff/apply
-scripts (`container/overlay.ts`) therefore treat it as hostile input even though the
-_approval_ step assumes a cooperative run. Both the summary and apply helpers run in
-throwaway containers with `--cap-drop ALL --network none --security-opt
-no-new-privileges` (defense-in-depth around the script logic), and the apply:
-
-- decodes whiteout names and **rejects** empty / `.` / `..` / slash-containing names
-  (a `.wh.` marker whose decoded name is empty would otherwise `rm -rf` the parent);
-- **confines** every write/delete under the destination with a parent-directory
-  symlink guard (blocks traversal through a pre-existing dest symlink), and runs
-  with `set -f` (noglob) so malicious filenames can't glob-expand;
-- reproduces **only** regular files, real directories, and **in-project** symlinks —
-  block/char/fifo/socket **special files** are skipped entirely (a planted device
-  never lands on the host), and a `(0,0)` overlay-whiteout char device is
-  distinguished from a planted real device by its major/minor;
-- a regular **setuid/setgid binary DOES land** as a normal file, but its
-  setuid/setgid/sticky bits are **stripped** (`chmod u-s,g-s,o-t`) and it is copied by
-  **contents only** (no `cp -a`), dropping ownership and xattrs (incl. `security.*`
-  capability xattrs) — so the file arrives inert, not privilege-escalating;
-- **refuses** symlinks whose target escapes the project root (absolute-outside-root
-  or a `..`-escaping relative target) — a secret-exfiltration / foothold vector —
-  and flags them in the change summary so the approver sees the refusal.
-
-The change summary is derived from the same classification so it faithfully
-predicts what apply will do (escaping symlinks and skipped specials are shown).
-
-> **Note on native mode:** these guards protect the **write-back apply path**. They
-> do **not** re-close the `native`-mode remount escape — an agent with CAP_SYS_ADMIN
-> can still write the live root directly during the run, before write-back. The
-> engine emits a loud run-start warning when a run lands in native mode.
-
-## Known limitations (not silently wrong)
-
-- **Opaque directory markers** on native overlay use a `trusted.overlay.opaque`
-  xattr with no on-disk marker file, so a "replace an entire directory" operation
-  may not fully apply in native mode (the walk can't see the xattr). Rare for
-  folder-ops file add/modify/delete changes.
-- **Hardlinks** in the upper layer are copied as independent files (content
-  amplification), not re-linked — a correctness-preserving divergence, not a bug.
-- The **SIGKILL grace** on `docker stop` (suspend) means a container killed at the
-  grace deadline can under-report; the volume (the overlay) is unaffected.
-- **Applied file ownership.** The write-back apply runs as root in the helper
-  container, so, on a Linux rootful daemon, files it writes to the live root land
-  root-owned (usability caveat — the operator may need to `chown` them back). On
-  Docker Desktop (macOS/Windows) the VM maps writes to the host user, so this does
-  not arise there.
-
-## Concurrency caveat
-
-Multiple Claude nodes in the same DAG layer share one run container. The
-in-container kill targets a per-invocation PID file (not a broad `pkill`), so an
-abort of one node does not kill its siblings — but any hostile-agent caveat above
-applies per node.
+- Docker daemon or kernel escape vulnerabilities.
+- Secrets explicitly handed to an agent process as part of the approved managed
+  credential envelope.
+- Malicious controller/operator behavior.
+- Build-time installer compromise. Tool versions and the Debian base digest are
+  pinned, but vendor installer scripts are still fetched over TLS at image build
+  time and are not independently checksum-verified.
 
 ## Review gate
 
-Because native mode is an opt-in feature whose isolation depends on the daemon's
-configuration, **any change to the mount strategy, the granted capabilities, the
-env-delivery mechanism, the bind topology, or the write-back diff/apply scripts must
-be re-reviewed against this document.** Do not widen capabilities, forward host env,
-or relax the apply guards (whiteout-name rejection, dest confinement, special-file
-skip, setuid/xattr stripping, symlink-escape refusal) without updating this file and
-the threat model above.
+Any change that adds a host bind mount, broadens capabilities, runs agent work as
+root, mounts the Docker socket, forwards host env, or copies hidden credential/VCS
+state into the agent workspace must be treated as a security-boundary change and
+reviewed against this document.
+
+## Unclosed rollout requirements
+
+Planning snapshots and provider-reported token counters are not release certificates.
+Independent immutable-commit test/browser execution and publication/backfill handlers
+remain gated. Token enforcement against unmanaged in-container API calls or forged
+provider transport usage has not been established; the CONNECT transport alone is
+not an authoritative billing meter. Do not enable production admission on the basis
+of helper/schema or fake-provider fixture tests alone.

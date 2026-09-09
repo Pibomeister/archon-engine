@@ -70,6 +70,13 @@ export type AssistantDefaults = ProviderDefaultsMap & {
  */
 export interface ContainerConfig {
   /**
+   * Container execution profile. `hardened` is the only supported profile; legacy
+   * overlay/native profiles are rejected rather than downgraded.
+   * @default 'hardened'
+   */
+  profile?: 'hardened';
+
+  /**
    * Runner image tag. Defaults to `archon-runner:latest` — the `build:runner-image`
    * script tags both `archon-runner:<version>` and `:latest`, and defaulting to
    * `:latest` avoids coupling to the dev-vs-binary version string. Pin an explicit
@@ -79,10 +86,11 @@ export interface ContainerConfig {
   image?: string;
 
   /**
-   * Container network mode. `none` disables egress; `bridge` is default NAT.
-   * @default 'bridge'
+   * Container network mode. Hardened runs currently allow only `none`; provider egress
+   * must go through a future restricted controller proxy rather than Docker NAT.
+   * @default 'none'
    */
-  network?: 'bridge' | 'none';
+  network?: 'none';
 
   /**
    * Hard memory cap in MiB (`docker run --memory <n>m`).
@@ -103,6 +111,17 @@ export interface ContainerConfig {
    * @default false
    */
   enabled?: boolean;
+
+  /**
+   * Controller-declared repositories to export into a hardened folder run.
+   * Each source is captured at an exact clean commit/tree and materialized under
+   * the relative target path inside the agent workspace. Sources default to the
+   * same relative path under the folder root.
+   */
+  repoInputs?: { path: string; source?: string }[];
+
+  /** YAML-friendly alias for repoInputs. */
+  repo_inputs?: { path: string; source?: string }[];
 }
 
 export interface GlobalConfig {

@@ -1,5 +1,7 @@
 import { describe, test, expect, mock, beforeEach } from 'bun:test';
 import type { IWorkflowStore } from '@archon/workflows/store';
+import type { WorkflowBudgetGrant } from '@archon/workflows/budget';
+import type { ControllerActionHandlers } from '@archon/workflows/controller-actions';
 
 // Mock DB modules before importing store-adapter
 const mockCreateWorkflowRun = mock(() => Promise.resolve({ id: 'run-1' }));
@@ -35,6 +37,8 @@ mock.module('../db/workflows', () => ({
 }));
 
 const mockCreateWorkflowEvent = mock(() => Promise.resolve());
+const mockCreateWorkflowEventStrict = mock(() => Promise.resolve());
+const mockCreateControllerCompletionEvent = mock(() => Promise.resolve());
 const mockGetDagResumeSnapshot = mock(() =>
   Promise.resolve({
     completedNodeOutputs: new Map<string, string>(),
@@ -43,6 +47,8 @@ const mockGetDagResumeSnapshot = mock(() =>
 );
 mock.module('../db/workflow-events', () => ({
   createWorkflowEvent: mockCreateWorkflowEvent,
+  createWorkflowEventStrict: mockCreateWorkflowEventStrict,
+  createControllerCompletionEvent: mockCreateControllerCompletionEvent,
   getDagResumeSnapshot: mockGetDagResumeSnapshot,
 }));
 
@@ -52,8 +58,29 @@ mock.module('../db/codebases', () => ({
 }));
 
 mock.module('@archon/providers', () => ({
+  registerProvider: mock(() => undefined),
   getAgentProvider: mock(() => ({})),
-  getRegisteredProviders: mock(() => []),
+  getProviderCapabilities: mock(() => ({
+    sessionResume: false,
+    mcp: false,
+    hooks: false,
+    skills: false,
+    agents: false,
+    toolRestrictions: false,
+    structuredOutput: false,
+    envInjection: false,
+    costControl: false,
+    effortControl: false,
+    thinkingControl: false,
+    fallbackModel: false,
+    sandbox: false,
+    settingSources: false,
+    nativeTools: false,
+    containerExec: true,
+  })),
+  getRegisteredProviders: mock(() => ['mock-provider']),
+  isRegisteredProvider: mock(() => true),
+  validateStructuredOutput: mock(() => ({ valid: true, data: undefined })),
   // Vendor → env-var map consumed by credentials/delivery (#1955). A realistic
   // subset of the generated map (incl. HF_TOKEN, the upstream var).
   PI_PROVIDER_ENV_VARS: {
@@ -112,7 +139,20 @@ mock.module('../db/workflow-node-sessions', () => ({
 
 const { createWorkflowStore, createWorkflowDeps } = await import('./store-adapter');
 
+type ControllerCompletionStore = IWorkflowStore & {
+  createControllerCompletionEvent(
+    data: Parameters<IWorkflowStore['createWorkflowEvent']>[0],
+    deadlineAt: number
+  ): Promise<void>;
+};
+
 describe('createWorkflowStore', () => {
+  beforeEach(() => {
+    mockCreateWorkflowEvent.mockClear();
+    mockCreateWorkflowEventStrict.mockClear();
+    mockCreateControllerCompletionEvent.mockClear();
+  });
+
   test('returns object with all IWorkflowStore methods', () => {
     const store = createWorkflowStore();
     const requiredMethods: (keyof IWorkflowStore)[] = [
@@ -132,6 +172,7 @@ describe('createWorkflowStore', () => {
       'releaseWritebackClaim',
       'cancelWorkflowRun',
       'createWorkflowEvent',
+      'createWorkflowEventStrict',
       'getDagResumeSnapshot',
       'getCodebase',
       'getCodebaseEnvVars',
@@ -139,6 +180,9 @@ describe('createWorkflowStore', () => {
     for (const method of requiredMethods) {
       expect(typeof store[method]).toBe('function');
     }
+    expect(typeof (store as ControllerCompletionStore).createControllerCompletionEvent).toBe(
+      'function'
+    );
   });
 
   test('delegates getWorkflowRunStatus to DB and returns typed status', async () => {
@@ -154,6 +198,34 @@ describe('createWorkflowStore', () => {
     const store = createWorkflowStore();
     const result = await store.getWorkflowRunStatus('nonexistent');
     expect(result).toBeNull();
+  });
+
+  test('authority event port propagates persistence failure', async () => {
+    const store = createWorkflowStore();
+    mockCreateWorkflowEventStrict.mockRejectedValueOnce(new Error('audit write failed'));
+    if (!store.createWorkflowEventStrict) throw new Error('strict authority event port missing');
+    await expect(
+      store.createWorkflowEventStrict({
+        workflow_run_id: 'run-authority',
+        event_type: 'node_completed',
+      })
+    ).rejects.toThrow('audit write failed');
+  });
+
+  test('delegates controller completion events through the explicit DB method', async () => {
+    const store = createWorkflowStore() as ControllerCompletionStore;
+    const event = {
+      workflow_run_id: 'run-controller',
+      event_type: 'node_completed' as const,
+      step_name: 'publish',
+      data: { type: 'controller_action' },
+    };
+
+    await store.createControllerCompletionEvent(event, 123_456);
+
+    expect(mockCreateControllerCompletionEvent).toHaveBeenCalledWith(event, 123_456);
+    expect(mockCreateWorkflowEventStrict).not.toHaveBeenCalled();
+    expect(mockCreateWorkflowEvent).not.toHaveBeenCalled();
   });
 
   test('createWorkflowEvent catches and logs unexpected throws', async () => {
@@ -221,6 +293,30 @@ describe('createWorkflowDeps', () => {
     expect(typeof deps.store.getWorkflowRun).toBe('function');
     expect(typeof deps.store.createWorkflowEvent).toBe('function');
     expect(typeof deps.store.getCodebase).toBe('function');
+  });
+
+  test('threads controller-private hardened grants without deriving them in the adapter', () => {
+    const controllerActions: ControllerActionHandlers = {
+      publish: async () => 'refused',
+    };
+    const workflowBudgetGrants: WorkflowBudgetGrant[] = [
+      {
+        runId: 'run-1',
+        workflowName: 'hardened',
+        workflowDigest: 'workflow-digest',
+        deadlineAt: '2030-01-01T00:00:00.000Z',
+        tokens: { total: 100 },
+      },
+    ];
+    const deps = createWorkflowDeps({
+      controllerActions,
+      controllerActionGrants: [],
+      workflowBudgetGrants,
+    });
+
+    expect(deps.controllerActions).toBe(controllerActions);
+    expect(deps.controllerActionGrants).toEqual([]);
+    expect(deps.workflowBudgetGrants).toBe(workflowBudgetGrants);
   });
 
   describe('provider credential fields', () => {

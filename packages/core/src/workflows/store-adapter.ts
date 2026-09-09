@@ -4,6 +4,11 @@
  */
 import type { IWorkflowStore } from '@archon/workflows/store';
 import type { WorkflowConfig, WorkflowDeps } from '@archon/workflows/deps';
+import type {
+  ControllerActionGrant,
+  ControllerActionHandlers,
+} from '@archon/workflows/controller-actions';
+import type { WorkflowBudgetGrant } from '@archon/workflows/budget';
 import type { WorkflowRunStatus } from '@archon/workflows/schemas/workflow-run';
 import type { MergedConfig } from '../config/config-types';
 import * as workflowDb from '../db/workflows';
@@ -40,7 +45,7 @@ function getLog(): ReturnType<typeof createLogger> {
 }
 
 export function createWorkflowStore(): IWorkflowStore {
-  return {
+  const store: IWorkflowStore = {
     createWorkflowRun: workflowDb.createWorkflowRun,
     getWorkflowRun: workflowDb.getWorkflowRun,
     findChildRuns: workflowDb.findChildRuns,
@@ -74,13 +79,17 @@ export function createWorkflowStore(): IWorkflowStore {
         );
       }
     },
+    createWorkflowEventStrict: workflowEventDb.createWorkflowEventStrict,
+    createControllerCompletionEvent: workflowEventDb.createControllerCompletionEvent,
     getDagResumeSnapshot: workflowEventDb.getDagResumeSnapshot,
+    listWorkflowEvents: workflowEventDb.listWorkflowEvents,
     getCodebase: codebaseDb.getCodebase,
     getCodebaseEnvVars: envVarDb.getCodebaseEnvVars,
     getWorkflowNodeSession: workflowNodeSessionDb.getWorkflowNodeSession,
     upsertWorkflowNodeSession: workflowNodeSessionDb.upsertWorkflowNodeSession,
     deleteWorkflowNodeSessions: workflowNodeSessionDb.deleteWorkflowNodeSessions,
   };
+  return store;
 }
 
 /**
@@ -105,7 +114,13 @@ export function registerGitHubAppAuthProvider(provider: IGitHubAppAuthProvider |
  * Create the canonical WorkflowDeps for the workflow engine.
  * Single construction point — avoids duplicating the wiring across callers.
  */
-export function createWorkflowDeps(): WorkflowDeps {
+export interface CreateWorkflowDepsOptions {
+  controllerActions?: ControllerActionHandlers;
+  controllerActionGrants?: readonly ControllerActionGrant[];
+  workflowBudgetGrants?: readonly WorkflowBudgetGrant[];
+}
+
+export function createWorkflowDeps(options: CreateWorkflowDepsOptions = {}): WorkflowDeps {
   const provider = registeredGitHubAppAuthProvider;
   return {
     store: createWorkflowStore(),
@@ -191,6 +206,11 @@ export function createWorkflowDeps(): WorkflowDeps {
     // Per-user AI prefs (Phase 3): personal tiers/aliases/default-provider,
     // folded into buildAiProfile as the highest-precedence layer. Non-throwing —
     // a DB failure means the run falls back to install-wide config.
+    ...(options.controllerActions ? { controllerActions: options.controllerActions } : {}),
+    ...(options.controllerActionGrants
+      ? { controllerActionGrants: options.controllerActionGrants }
+      : {}),
+    ...(options.workflowBudgetGrants ? { workflowBudgetGrants: options.workflowBudgetGrants } : {}),
     getUserAiPrefs: async (userId: string): Promise<UserAiPrefs> => {
       try {
         return await getUserAiPrefs(userId);

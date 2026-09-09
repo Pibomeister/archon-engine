@@ -167,6 +167,28 @@ describe('Workflow Loader', () => {
       expect(result.workflows[0].workflow.evidence_policy).toEqual({ required: true });
     });
 
+    it('should parse hardened.required: true', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+      const yaml = `name: hardened\ndescription: requires container\nhardened:\n  required: true\nnodes:\n  - id: n\n    prompt: p\n`;
+      await writeFile(join(workflowDir, 'hardened.yaml'), yaml);
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(0);
+      expect(result.workflows[0].workflow.hardened).toEqual({ required: true });
+    });
+
+    it('should REJECT unsupported hardened fields', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+      const yaml = `name: bad-hardened\ndescription: bad\nhardened:\n  required: true\n  allow_host_fallback: true\nnodes:\n  - id: n\n    prompt: p\n`;
+      await writeFile(join(workflowDir, 'bad-hardened.yaml'), yaml);
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.workflows).toHaveLength(0);
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0].errorType).toBe('validation_error');
+      expect(result.errors[0].error).toContain('hardened');
+    });
+
     it('should parse evidence_policy.required: false', async () => {
       const workflowDir = join(testDir, '.archon', 'workflows');
       await mkdir(workflowDir, { recursive: true });
@@ -4961,6 +4983,14 @@ describe('workflow-level field parity (#2457)', () => {
     evidence_policy: {
       yaml: 'evidence_policy:\n  required: true',
       present: w => w.evidence_policy?.required === true,
+    },
+    hardened: {
+      yaml: 'hardened:\n  required: true',
+      present: w => w.hardened?.required === true,
+    },
+    budget: {
+      yaml: 'budget:\n  required: true',
+      present: w => w.budget?.required === true,
     },
     mutates_checkout: {
       yaml: 'mutates_checkout: false',

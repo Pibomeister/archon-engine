@@ -6,6 +6,7 @@
  * utilities. Single source of truth; no logic changes from either copy.
  */
 import { readFile } from 'fs/promises';
+import type { ExecutionContext } from '@archon/providers/types';
 import { join } from 'path';
 import type { IWorkflowPlatform, WorkflowDeps, WorkflowMessageMetadata } from './deps';
 import * as archonPaths from '@archon/paths';
@@ -405,6 +406,25 @@ export async function loadCommandPrompt(
 export const CONTEXT_VAR_PATTERN_STR =
   '\\$(?:CONTEXT|EXTERNAL_CONTEXT|ISSUE_CONTEXT)(?![A-Za-z0-9_])';
 
+export function resolveAgentOutputPaths(
+  artifactsDir: string,
+  stateDir: string | undefined,
+  logDir: string,
+  execContext?: ExecutionContext
+): { artifactsDir: string; stateDir: string | undefined; logDir: string } {
+  if (execContext?.kind !== 'container' || !execContext.agentArtifactsDir) {
+    return { artifactsDir, stateDir, logDir };
+  }
+  if (execContext.agentArtifactsDir !== '/archon-artifacts') {
+    throw new Error('Container artifact path must be controller-owned /archon-artifacts');
+  }
+  return {
+    artifactsDir: '/archon-artifacts/run',
+    stateDir: '/archon-artifacts/state',
+    logDir: '/archon-artifacts/logs',
+  };
+}
+
 /**
  * Substitute workflow variables in a prompt.
  *
@@ -439,8 +459,14 @@ export function substituteWorkflowVariables(
   loopUserInput?: string,
   rejectionReason?: string,
   loopPrevOutput?: string,
-  options?: { shellSafe?: boolean; stateDir?: string }
+  options?: { shellSafe?: boolean; stateDir?: string; execContext?: ExecutionContext }
 ): { prompt: string; contextSubstituted: boolean } {
+  const agentPaths = resolveAgentOutputPaths(
+    artifactsDir,
+    options?.stateDir,
+    '',
+    options?.execContext
+  );
   // Fail fast if the prompt references $BASE_BRANCH but no base branch could be resolved
   if (!baseBranch && prompt.includes('$BASE_BRANCH')) {
     throw new Error(
@@ -453,7 +479,7 @@ export function substituteWorkflowVariables(
   // executor to every substitution site; a site that forgot to pass it would
   // otherwise leave the variable literal (AI nodes) or empty (shell nodes),
   // silently writing state to the wrong place. Loud beats silent.
-  if (!options?.stateDir && prompt.includes('$STATE_DIR')) {
+  if (!agentPaths.stateDir && prompt.includes('$STATE_DIR')) {
     throw new Error(
       '$STATE_DIR is referenced but no state directory was resolved for this run. ' +
         '$STATE_DIR is only available inside a workflow run; if you are seeing this from a workflow node, ' +
@@ -469,10 +495,10 @@ export function substituteWorkflowVariables(
   // via subprocess environment variables instead to prevent shell injection.
   let result = prompt
     .replace(/\$WORKFLOW_ID/g, workflowId)
-    .replace(/\$ARTIFACTS_DIR/g, artifactsDir)
+    .replace(/\$ARTIFACTS_DIR/g, agentPaths.artifactsDir)
     // Engine-controlled like $ARTIFACTS_DIR — substituted even under shellSafe,
     // or `bash:`/`script:` bodies would never see it.
-    .replace(/\$STATE_DIR/g, options?.stateDir ?? '')
+    .replace(/\$STATE_DIR/g, agentPaths.stateDir ?? '')
     .replace(/\$BASE_BRANCH/g, baseBranch)
     .replace(/\$DOCS_DIR/g, resolvedDocsDir);
 
@@ -534,7 +560,7 @@ export function buildPromptWithContext(
   docsDir: string,
   issueContext: string | undefined,
   logLabel: string,
-  options?: { shellSafe?: boolean; stateDir?: string }
+  options?: { shellSafe?: boolean; stateDir?: string; execContext?: ExecutionContext }
 ): string {
   const { prompt, contextSubstituted } = substituteWorkflowVariables(
     template,

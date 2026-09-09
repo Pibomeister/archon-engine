@@ -37,6 +37,7 @@ import {
   type SDKResultMessage,
   type ModelUsage,
 } from '@anthropic-ai/claude-agent-sdk';
+import { isIP } from 'node:net';
 import type {
   IAgentProvider,
   SendQueryOptions,
@@ -44,10 +45,14 @@ import type {
   TokenUsage,
   ProviderCapabilities,
   NodeConfig,
+  ExecutionContext,
 } from '../types';
 import { parseClaudeConfig } from './config';
 import { CLAUDE_CAPABILITIES } from './capabilities';
-import { buildContainerSpawn } from './container-spawn';
+import {
+  buildContainerSpawn,
+  stopContainerOnAbort as defaultStopContainerOnAbort,
+} from './container-spawn';
 import { resolveClaudeBinaryPath } from './binary-resolver';
 import { buildArchonMcpServer, ARCHON_TOOL_SERVER } from './native-tools';
 import { createLogger } from '@archon/paths';
@@ -149,23 +154,141 @@ function buildSubprocessEnv(): NodeJS.ProcessEnv {
 
 /**
  * Build the base env for a CONTAINER run. Deliberately does NOT spread
- * `process.env` — that is the isolation boundary itself (the container must
- * never inherit the host's environment). The Archon-managed bag
- * (`requestOptions.env`: codebase env vars + per-user AI creds + GitHub token)
- * is layered on top by the caller, and PATH/HOME/CLAUDE_CONFIG_DIR come from the
- * runner image. Only a minimal, host-independent base is seeded here.
+ * `process.env` — that is the first isolation boundary. The final docker-exec
+ * boundary applies the same strict allowlist again in case the SDK reintroduces
+ * ambient values. PATH/HOME come from the runner image.
  */
 function buildContainerBaseEnv(): NodeJS.ProcessEnv {
   return { TERM: 'dumb' };
 }
 
+const CONTAINER_CLAUDE_ENV_ALLOWLIST: ReadonlySet<string> = new Set([
+  'ANTHROPIC_API_KEY',
+  'ANTHROPIC_OAUTH_TOKEN',
+  'CLAUDE_CODE_DISABLE_1M_CONTEXT',
+  'CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS',
+  'CLAUDE_CODE_OAUTH_TOKEN',
+  'TERM',
+]);
+
+const CONTAINER_CLAUDE_ENV_MIRROR_SOURCES: ReadonlySet<string> = new Set(['CLAUDE_API_KEY']);
+
+const CONTAINER_CLAUDE_ENV_HARD_DENY_KEYS: ReadonlySet<string> = new Set([
+  'AWS_SECRET_ACCESS_KEY',
+  'AWS_SESSION_TOKEN',
+  'DATABASE_URL',
+  'ANTHROPIC_BASE_URL',
+  'DOCKER_HOST',
+  'GH_TOKEN',
+  'GITHUB_TOKEN',
+  'LD_PRELOAD',
+  'NODE_OPTIONS',
+]);
+
+const ANTHROPIC_PROVIDER_NAMES: ReadonlySet<string> = new Set(['anthropic', 'claude']);
+
+function isDnsHostname(hostname: string): boolean {
+  if (hostname.length === 0 || hostname.length > 253) return false;
+  const labels = hostname.split('.');
+  return labels.every(label => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(label));
+}
+
+function normalizeSealedAnthropicBaseUrl(rawBaseUrl: string): string {
+  let url: URL;
+  try {
+    url = new URL(rawBaseUrl);
+  } catch {
+    throw new Error('Claude hardened provider origin is malformed.');
+  }
+  if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash) {
+    throw new Error('Claude hardened provider origin must be an exact HTTPS API root.');
+  }
+  if (url.pathname !== '/') {
+    throw new Error('Claude hardened provider origin must be the HTTPS API origin root.');
+  }
+  const hostname = url.hostname.replace(/^\[|\]$/g, '');
+  if (hostname.toLowerCase() === 'localhost' || isIP(hostname) !== 0 || !isDnsHostname(hostname)) {
+    throw new Error('Claude hardened provider origin must use a non-local DNS hostname.');
+  }
+  return url.origin;
+}
+
+function requiredSealedAnthropicBaseUrl(execContext: ExecutionContext | undefined): string {
+  if (execContext?.kind !== 'container') {
+    throw new Error(
+      'Claude container execution requires exactly one sealed Anthropic provider origin.'
+    );
+  }
+  const matches = (execContext.providerOrigins ?? []).filter(origin =>
+    ANTHROPIC_PROVIDER_NAMES.has(origin.provider.toLowerCase())
+  );
+  if (matches.length !== 1) {
+    throw new Error(
+      'Claude container execution requires exactly one sealed Anthropic provider origin.'
+    );
+  }
+  return normalizeSealedAnthropicBaseUrl(matches[0].baseUrl);
+}
+
+function assertRequestedAnthropicBaseUrlAllowed(
+  requestedBaseUrl: string | undefined,
+  sealedBaseUrl: string
+): void {
+  if (requestedBaseUrl === undefined) return;
+  if (normalizeSealedAnthropicBaseUrl(requestedBaseUrl) !== sealedBaseUrl) {
+    throw new Error(
+      'Claude container execution ANTHROPIC_BASE_URL does not match sealed provider origin.'
+    );
+  }
+}
+
+function isHardDeniedContainerEnvKey(key: string): boolean {
+  return (
+    CONTAINER_CLAUDE_ENV_HARD_DENY_KEYS.has(key) ||
+    key.startsWith('PG') ||
+    key.startsWith('AWS_') ||
+    key.startsWith('DOCKER_')
+  );
+}
+
+function assertContainerEnvOverrideSafe(key: string, value: string | undefined): void {
+  if (value === undefined) return;
+  if (!isHardDeniedContainerEnvKey(key)) return;
+  throw new Error(`Claude container execution does not allow request env key ${key}`);
+}
+
+function sanitizeContainerRequestEnv(
+  requestOptions: SendQueryOptions | undefined
+): NodeJS.ProcessEnv {
+  const env = buildContainerBaseEnv();
+  const requestEnv = requestOptions?.env;
+  const sealedBaseUrl = requiredSealedAnthropicBaseUrl(requestOptions?.execContext);
+  assertRequestedAnthropicBaseUrlAllowed(requestEnv?.ANTHROPIC_BASE_URL, sealedBaseUrl);
+  if (sealedBaseUrl) env.ANTHROPIC_BASE_URL = sealedBaseUrl;
+  if (!requestEnv) return env;
+  const anthropicKey = requestEnv.ANTHROPIC_API_KEY || requestEnv.CLAUDE_API_KEY;
+  for (const [key, value] of Object.entries(requestEnv)) {
+    if (key !== 'ANTHROPIC_BASE_URL') assertContainerEnvOverrideSafe(key, value);
+    if (value === undefined) continue;
+    if (key === 'ANTHROPIC_BASE_URL') continue;
+    if (CONTAINER_CLAUDE_ENV_MIRROR_SOURCES.has(key)) continue;
+    if (!CONTAINER_CLAUDE_ENV_ALLOWLIST.has(key)) continue;
+    env[key] = value;
+  }
+  if (anthropicKey && !env.ANTHROPIC_API_KEY && !env.CLAUDE_CODE_OAUTH_TOKEN) {
+    env.ANTHROPIC_API_KEY = anthropicKey;
+    getLog().debug('claude.api_key_mirrored');
+  }
+  return env;
+}
+
 /**
  * Resolve the environment delivered to the Claude subprocess for a request.
  *
- * This is the env-isolation ENFORCEMENT POINT. A container run
- * (`execContext.kind === 'container'`) gets ONLY the Archon-managed bag
- * (`requestOptions.env`: codebase env + per-user creds + GitHub token) layered
- * over a minimal base — host `process.env` NEVER crosses the boundary. A host run
+ * This is the provider-level env-isolation enforcement point. A container run
+ * (`execContext.kind === 'container'`) gets a minimal base plus only the narrow
+ * Claude/container values Archon is allowed to provide; arbitrary project env,
+ * host process env, and security-sensitive overrides do not cross. A host run
  * inherits the (already-cleaned) host env exactly as before. Exported so the
  * invariant can be unit-tested with a `process.env` canary.
  */
@@ -173,7 +296,9 @@ export function buildRequestSubprocessEnv(
   requestOptions: SendQueryOptions | undefined
 ): NodeJS.ProcessEnv {
   const isContainerRun = requestOptions?.execContext?.kind === 'container';
-  const subprocessEnv = isContainerRun ? buildContainerBaseEnv() : buildSubprocessEnv();
+  if (isContainerRun) return sanitizeContainerRequestEnv(requestOptions);
+
+  const subprocessEnv = buildSubprocessEnv();
   const env = requestOptions?.env ? { ...subprocessEnv, ...requestOptions.env } : subprocessEnv;
   // CLAUDE_API_KEY is Archon's variable name; the Claude Code CLI only reads
   // ANTHROPIC_API_KEY, so mirror it or solo .env installs never authenticate
@@ -448,187 +573,148 @@ interface ProviderWarning {
  * Called inside sendQuery when nodeConfig is present (workflow path).
  * Returns structured warnings that the caller should yield as system chunks.
  */
-async function applyNodeConfig(
+function applyToolRestrictions(options: Options, nodeConfig: NodeConfig): void {
+  if (nodeConfig.allowed_tools !== undefined) options.tools = nodeConfig.allowed_tools;
+  if (nodeConfig.denied_tools !== undefined) options.disallowedTools = nodeConfig.denied_tools;
+}
+
+function applyHookConfig(options: Options, nodeConfig: NodeConfig): void {
+  if (!nodeConfig.hooks) return;
+  const builtHooks = buildSDKHooksFromYAML(
+    nodeConfig.hooks as Record<string, YAMLHookMatcher[] | undefined>
+  );
+  if (Object.keys(builtHooks).length === 0) return;
+  const existingHooks = options.hooks as SDKHooksMap | undefined;
+  if (!options.hooks) (options as Record<string, unknown>).hooks = {};
+  for (const [event, matchers] of Object.entries(builtHooks)) {
+    if (!matchers) continue;
+    const existing = existingHooks?.[event] as HookCallbackMatcher[] | undefined;
+    (options.hooks as Record<string, HookCallbackMatcher[]>)[event] = existing
+      ? [...(matchers as HookCallbackMatcher[]), ...existing]
+      : (matchers as HookCallbackMatcher[]);
+  }
+}
+
+function warnForMcpMissingVars(missingVars: string[]): ProviderWarning[] {
+  if (missingVars.length === 0) return [];
+  const uniqueVars = [...new Set(missingVars)];
+  getLog().warn({ missingVars: uniqueVars }, 'claude.mcp_env_vars_missing');
+  return [
+    {
+      code: 'mcp_env_vars_missing',
+      message: `MCP config references undefined env vars: ${uniqueVars.join(', ')}. These will be empty strings — MCP servers may fail to authenticate.`,
+    },
+  ];
+}
+
+function warnForHaikuMcp(model: string | undefined): ProviderWarning[] {
+  if (!model?.toLowerCase().includes('haiku')) return [];
+  getLog().warn({ model }, 'claude.mcp_haiku_tool_search_unsupported');
+  return [
+    {
+      code: 'mcp_haiku_tool_search',
+      message:
+        'Using Haiku model with MCP servers — tool search (lazy loading for many tools) is not supported on Haiku. Consider using Sonnet or Opus.',
+    },
+  ];
+}
+
+async function applyMcpConfig(
   options: Options,
   nodeConfig: NodeConfig,
   cwd: string
 ): Promise<ProviderWarning[]> {
-  const warnings: ProviderWarning[] = [];
-  // allowed_tools → tools
-  if (nodeConfig.allowed_tools !== undefined) {
-    options.tools = nodeConfig.allowed_tools;
-  }
+  if (!nodeConfig.mcp) return [];
+  const mcpPath = nodeConfig.mcp;
+  const { servers, serverNames, missingVars } = await loadMcpConfig(mcpPath, cwd);
+  options.mcpServers = servers as Options['mcpServers'];
+  const mcpWildcards = serverNames.map(name => `mcp__${name}__*`);
+  options.allowedTools = [...(options.allowedTools ?? []), ...mcpWildcards];
+  getLog().info({ serverNames, mcpPath }, 'claude.mcp_config_loaded');
+  return [...warnForMcpMissingVars(missingVars), ...warnForHaikuMcp(options.model)];
+}
 
-  // denied_tools → disallowedTools
-  if (nodeConfig.denied_tools !== undefined) {
-    options.disallowedTools = nodeConfig.denied_tools;
+function applySkillsConfig(options: Options, nodeConfig: NodeConfig): void {
+  if (!nodeConfig.skills) return;
+  const skills = nodeConfig.skills;
+  const agentId = 'dag-node-skills';
+  const agentDef: {
+    description: string;
+    prompt: string;
+    skills: string[];
+    tools?: string[];
+    model?: string;
+  } = {
+    description: 'DAG node with skills',
+    prompt: `You have preloaded skills: ${skills.join(', ')}. Use them when relevant.`,
+    skills,
+  };
+  if (options.tools) agentDef.tools = [...(options.tools as string[]), 'Skill'];
+  if (options.model) agentDef.model = options.model;
+  options.agents = { [agentId]: agentDef };
+  options.agent = agentId;
+  if (!options.allowedTools?.includes('Skill')) {
+    options.allowedTools = [...(options.allowedTools ?? []), 'Skill'];
   }
+  getLog().info({ skills, agentId }, 'claude.skills_agent_created');
+}
 
-  // hooks → build SDK hooks
-  if (nodeConfig.hooks) {
-    const builtHooks = buildSDKHooksFromYAML(
-      nodeConfig.hooks as Record<string, YAMLHookMatcher[] | undefined>
+function applyInlineAgentsConfig(options: Options, nodeConfig: NodeConfig): void {
+  if (!nodeConfig.agents) return;
+  if (
+    Object.hasOwn(nodeConfig.agents, 'dag-node-skills') &&
+    options.agents?.['dag-node-skills'] !== undefined
+  ) {
+    getLog().warn(
+      { nodeSkills: nodeConfig.skills ?? [] },
+      'claude.inline_agents_override_skills_wrapper'
     );
-    if (Object.keys(builtHooks).length > 0) {
-      // Merge with existing hooks (PostToolUse capture hook)
-      const existingHooks = options.hooks as SDKHooksMap | undefined;
-      if (!options.hooks) {
-        (options as Record<string, unknown>).hooks = {};
-      }
-      for (const [event, matchers] of Object.entries(builtHooks)) {
-        if (!matchers) continue;
-        const existing = existingHooks?.[event] as HookCallbackMatcher[] | undefined;
-        if (existing) {
-          (options.hooks as Record<string, HookCallbackMatcher[]>)[event] = [
-            ...(matchers as HookCallbackMatcher[]),
-            ...existing,
-          ];
-        } else {
-          (options.hooks as Record<string, HookCallbackMatcher[]>)[event] =
-            matchers as HookCallbackMatcher[];
-        }
-      }
-    }
   }
+  options.agents = {
+    ...options.agents,
+    ...(nodeConfig.agents as NonNullable<Options['agents']>),
+  };
+  getLog().info({ agentIds: Object.keys(nodeConfig.agents) }, 'claude.inline_agents_registered');
+}
 
-  // mcp → load config and set mcpServers + allowedTools wildcards
-  if (nodeConfig.mcp) {
-    const mcpPath = nodeConfig.mcp;
-    const { servers, serverNames, missingVars } = await loadMcpConfig(mcpPath, cwd);
-    options.mcpServers = servers as Options['mcpServers'];
-    const mcpWildcards = serverNames.map(name => `mcp__${name}__*`);
-    options.allowedTools = [...(options.allowedTools ?? []), ...mcpWildcards];
-    getLog().info({ serverNames, mcpPath }, 'claude.mcp_config_loaded');
-    if (missingVars.length > 0) {
-      const uniqueVars = [...new Set(missingVars)];
-      getLog().warn({ missingVars: uniqueVars }, 'claude.mcp_env_vars_missing');
-      warnings.push({
-        code: 'mcp_env_vars_missing',
-        message: `MCP config references undefined env vars: ${uniqueVars.join(', ')}. These will be empty strings — MCP servers may fail to authenticate.`,
-      });
-    }
-    // Haiku models don't support tool search (lazy loading for many tools)
-    if (options.model?.toLowerCase().includes('haiku')) {
-      getLog().warn({ model: options.model }, 'claude.mcp_haiku_tool_search_unsupported');
-      warnings.push({
-        code: 'mcp_haiku_tool_search',
-        message:
-          'Using Haiku model with MCP servers — tool search (lazy loading for many tools) is not supported on Haiku. Consider using Sonnet or Opus.',
-      });
-    }
-  }
-
-  // skills → AgentDefinition wrapping
-  if (nodeConfig.skills) {
-    const skills = nodeConfig.skills;
-    const agentId = 'dag-node-skills';
-    const agentDef: {
-      description: string;
-      prompt: string;
-      skills: string[];
-      tools?: string[];
-      model?: string;
-    } = {
-      description: 'DAG node with skills',
-      prompt: `You have preloaded skills: ${skills.join(', ')}. Use them when relevant.`,
-      skills,
-    };
-    if (options.tools) {
-      agentDef.tools = [...(options.tools as string[]), 'Skill'];
-    }
-    if (options.model) agentDef.model = options.model;
-    options.agents = { [agentId]: agentDef };
-    options.agent = agentId;
-    if (!options.allowedTools?.includes('Skill')) {
-      options.allowedTools = [...(options.allowedTools ?? []), 'Skill'];
-    }
-    getLog().info({ skills, agentId }, 'claude.skills_agent_created');
-  }
-
-  // agents → inline AgentDefinition pass-through.
-  // Runs AFTER skills: so user-defined agents win on ID collision with
-  // the internal 'dag-node-skills' wrapper.
-  // options.agent is intentionally left alone — inline agents are sub-agents
-  // invokable via the Task tool, not the primary agent for the query.
-  if (nodeConfig.agents) {
-    // Warn loudly when a user-defined agent overrides the internal
-    // 'dag-node-skills' wrapper set by the skills: block above. The
-    // merge is by design (user wins) but silent capability removal
-    // is the exact failure mode we want to avoid.
-    if (
-      Object.hasOwn(nodeConfig.agents, 'dag-node-skills') &&
-      options.agents?.['dag-node-skills'] !== undefined
-    ) {
-      getLog().warn(
-        { nodeSkills: nodeConfig.skills ?? [] },
-        'claude.inline_agents_override_skills_wrapper'
-      );
-    }
-    options.agents = {
-      ...(options.agents ?? {}),
-      ...(nodeConfig.agents as NonNullable<Options['agents']>),
-    };
-    getLog().info({ agentIds: Object.keys(nodeConfig.agents) }, 'claude.inline_agents_registered');
-  }
-
-  // effort
-  if (nodeConfig.effort !== undefined) {
-    options.effort = nodeConfig.effort as Options['effort'];
-  }
-
-  // thinking
-  if (nodeConfig.thinking !== undefined) {
+function applyScalarNodeConfig(options: Options, nodeConfig: NodeConfig): void {
+  if (nodeConfig.effort !== undefined) options.effort = nodeConfig.effort as Options['effort'];
+  if (nodeConfig.thinking !== undefined)
     options.thinking = nodeConfig.thinking as Options['thinking'];
-  }
-
-  // sandbox
-  if (nodeConfig.sandbox !== undefined) {
-    options.sandbox = nodeConfig.sandbox as Options['sandbox'];
-  }
-
-  // betas
-  if (nodeConfig.betas !== undefined) {
-    options.betas = nodeConfig.betas as Options['betas'];
-  }
-
-  // output_format (from nodeConfig, overrides base outputFormat if present)
+  if (nodeConfig.sandbox !== undefined) options.sandbox = nodeConfig.sandbox as Options['sandbox'];
+  if (nodeConfig.betas !== undefined) options.betas = nodeConfig.betas as Options['betas'];
   if (nodeConfig.output_format) {
     options.outputFormat = {
       type: 'json_schema',
       schema: nodeConfig.output_format,
     } as Options['outputFormat'];
   }
+  if (nodeConfig.maxBudgetUsd !== undefined) options.maxBudgetUsd = nodeConfig.maxBudgetUsd;
+  if (nodeConfig.systemPrompt !== undefined) options.systemPrompt = nodeConfig.systemPrompt;
+  if (nodeConfig.fallbackModel !== undefined) options.fallbackModel = nodeConfig.fallbackModel;
+}
 
-  // maxBudgetUsd from nodeConfig
-  if (nodeConfig.maxBudgetUsd !== undefined) {
-    options.maxBudgetUsd = nodeConfig.maxBudgetUsd;
-  }
+function applyAgentProgressSummaries(options: Options, nodeConfig: NodeConfig): void {
+  options.agentProgressSummaries = nodeConfig.agentProgressSummaries ?? true;
+}
 
-  // systemPrompt from nodeConfig
-  if (nodeConfig.systemPrompt !== undefined) {
-    options.systemPrompt = nodeConfig.systemPrompt;
-  }
-
-  // fallbackModel from nodeConfig
-  if (nodeConfig.fallbackModel !== undefined) {
-    options.fallbackModel = nodeConfig.fallbackModel;
-  }
-
-  // Phase 4 of #975 — enable AI-generated progress summaries for subagents
-  // spawned by workflow nodes. Without this, `task_progress` events arrive
-  // every ~30s with just `description` + `last_tool_name`; with it, the SDK
-  // forks the subagent's session every ~30s to produce a short present-tense
-  // `summary` (e.g. "Analyzing auth module"). The fork reuses the subagent's
-  // model + prompt cache, so cost stays minimal. Only workflow nodes opt in —
-  // direct chat calls (no nodeConfig) skip this to keep the chat surface
-  // unchanged. Authors can still override per-node by setting
-  // `agentProgressSummaries: false` in nodeConfig (see below).
-  if (nodeConfig.agentProgressSummaries !== undefined) {
-    options.agentProgressSummaries = nodeConfig.agentProgressSummaries;
-  } else {
-    options.agentProgressSummaries = true;
-  }
-
+/**
+ * Translate nodeConfig into Claude SDK-specific options.
+ * Called inside sendQuery when nodeConfig is present (workflow path).
+ * Returns structured warnings that the caller should yield as system chunks.
+ */
+async function applyNodeConfig(
+  options: Options,
+  nodeConfig: NodeConfig,
+  cwd: string
+): Promise<ProviderWarning[]> {
+  applyToolRestrictions(options, nodeConfig);
+  applyHookConfig(options, nodeConfig);
+  const warnings = await applyMcpConfig(options, nodeConfig, cwd);
+  applySkillsConfig(options, nodeConfig);
+  applyInlineAgentsConfig(options, nodeConfig);
+  applyScalarNodeConfig(options, nodeConfig);
+  applyAgentProgressSummaries(options, nodeConfig);
   return warnings;
 }
 
@@ -685,6 +771,80 @@ export function shouldPassNoEnvFile(cliPath: string | undefined): boolean {
  * Build base Claude SDK options from cwd, request options, and assistant defaults.
  * Does not include nodeConfig translation — that is handled by applyNodeConfig.
  */
+function buildStderrHandler(stderrLines: string[]): (data: string) => void {
+  return (data: string): void => {
+    const output = data.trim();
+    if (!output) return;
+    stderrLines.push(output);
+    if (shouldLogClaudeStderrAsError(output))
+      getLog().error({ stderr: output }, 'subprocess_error');
+  };
+}
+
+function shouldLogClaudeStderrAsError(output: string): boolean {
+  const lower = output.toLowerCase();
+  const hasErrorSignal =
+    lower.includes('error') ||
+    lower.includes('fatal') ||
+    lower.includes('failed') ||
+    lower.includes('exception') ||
+    output.includes('at ') ||
+    output.includes('Error:');
+  const isInfoMessage =
+    output.includes('Spawning Claude Code') ||
+    output.includes('--output-format') ||
+    output.includes('--permission-mode');
+  return hasErrorSignal && !isInfoMessage;
+}
+
+function resolveContainerExecContext(
+  requestOptions: SendQueryOptions | undefined
+): Extract<NonNullable<SendQueryOptions['execContext']>, { kind: 'container' }> | undefined {
+  return requestOptions?.execContext?.kind === 'container' ? requestOptions.execContext : undefined;
+}
+
+function resolveSettingSources(
+  requestOptions: SendQueryOptions | undefined,
+  assistantDefaults: ReturnType<typeof parseClaudeConfig>,
+  hasContainerExecContext: boolean
+): Options['settingSources'] {
+  if (hasContainerExecContext) return [];
+  return (
+    requestOptions?.nodeConfig?.settingSources ??
+    assistantDefaults.settingSources ?? ['project', 'user']
+  );
+}
+
+function addHostExecutableOptions(
+  options: Options,
+  cliPath: string | undefined,
+  isJsExecutable: boolean,
+  hasContainerExecContext: boolean
+): void {
+  if (hasContainerExecContext) return;
+  if (cliPath !== undefined) options.pathToClaudeCodeExecutable = cliPath;
+  if (isJsExecutable) options.executableArgs = ['--no-env-file'];
+}
+
+function addOptionalRequestOptions(
+  options: Options,
+  requestOptions: SendQueryOptions | undefined
+): void {
+  if (requestOptions?.outputFormat !== undefined)
+    options.outputFormat = requestOptions.outputFormat;
+  if (requestOptions?.maxBudgetUsd !== undefined)
+    options.maxBudgetUsd = requestOptions.maxBudgetUsd;
+  if (requestOptions?.fallbackModel !== undefined)
+    options.fallbackModel = requestOptions.fallbackModel;
+  if (requestOptions?.persistSession !== undefined)
+    options.persistSession = requestOptions.persistSession;
+  if (requestOptions?.forkSession !== undefined) options.forkSession = requestOptions.forkSession;
+}
+
+/**
+ * Build base Claude SDK options from cwd, request options, and assistant defaults.
+ * Does not include nodeConfig translation — that is handled by applyNodeConfig.
+ */
 function buildBaseClaudeOptions(
   cwd: string,
   requestOptions: SendQueryOptions | undefined,
@@ -697,79 +857,58 @@ function buildBaseClaudeOptions(
 ): Options {
   const isJsExecutable = shouldPassNoEnvFile(cliPath);
   getLog().debug({ cliPath: cliPath ?? null, isJsExecutable }, 'claude.subprocess_env_file_flag');
-
-  // Container execution: the SDK runs Claude via our `docker exec` spawn hook
-  // instead of a local process. When the hook is set the SDK bypasses ALL disk
-  // resolution, so `pathToClaudeCodeExecutable` and the host-only
-  // `--no-env-file` executableArg are intentionally omitted — the in-container
-  // binary is resolved from the runner image's PATH.
-  const containerExecContext =
-    requestOptions?.execContext?.kind === 'container' ? requestOptions.execContext : undefined;
-  const spawnOverride = containerExecContext
-    ? { spawnClaudeCodeProcess: buildContainerSpawn(containerExecContext) }
-    : {};
-
-  return {
+  const containerExecContext = resolveContainerExecContext(requestOptions);
+  const hasContainerExecContext = containerExecContext !== undefined;
+  const options: Options = {
     cwd,
-    // In compiled binaries, the resolver supplies an absolute executable path;
-    // in dev mode it returns undefined and the SDK resolves from node_modules.
-    // Both are skipped for container runs (spawn hook bypasses disk resolution).
-    ...(cliPath !== undefined && containerExecContext === undefined
-      ? { pathToClaudeCodeExecutable: cliPath }
-      : {}),
-    ...(isJsExecutable && containerExecContext === undefined
-      ? { executableArgs: ['--no-env-file'] }
-      : {}),
-    ...spawnOverride,
     env,
     model: requestOptions?.model ?? assistantDefaults.model,
     abortController: controller,
-    ...(requestOptions?.outputFormat !== undefined
-      ? { outputFormat: requestOptions.outputFormat }
-      : {}),
-    ...(requestOptions?.maxBudgetUsd !== undefined
-      ? { maxBudgetUsd: requestOptions.maxBudgetUsd }
-      : {}),
-    ...(requestOptions?.fallbackModel !== undefined
-      ? { fallbackModel: requestOptions.fallbackModel }
-      : {}),
-    ...(requestOptions?.persistSession !== undefined
-      ? { persistSession: requestOptions.persistSession }
-      : {}),
-    ...(requestOptions?.forkSession !== undefined
-      ? { forkSession: requestOptions.forkSession }
-      : {}),
     permissionMode: 'bypassPermissions',
     allowDangerouslySkipPermissions: true,
     systemPrompt: requestOptions?.systemPrompt ?? { type: 'preset', preset: 'claude_code' },
-    // Per-node override wins over the assistant-level default; the final
-    // fallback stays ['project', 'user'] (the SDK-loading default Archon ships).
-    settingSources: requestOptions?.nodeConfig?.settingSources ??
-      assistantDefaults.settingSources ?? ['project', 'user'],
+    settingSources: resolveSettingSources(
+      requestOptions,
+      assistantDefaults,
+      hasContainerExecContext
+    ),
     hooks: buildToolCaptureHooks(toolResultQueue),
-    stderr: (data: string): void => {
-      const output = data.trim();
-      if (!output) return;
-      stderrLines.push(output);
-
-      const isError =
-        output.toLowerCase().includes('error') ||
-        output.toLowerCase().includes('fatal') ||
-        output.toLowerCase().includes('failed') ||
-        output.toLowerCase().includes('exception') ||
-        output.includes('at ') ||
-        output.includes('Error:');
-
-      const isInfoMessage =
-        output.includes('Spawning Claude Code') ||
-        output.includes('--output-format') ||
-        output.includes('--permission-mode');
-
-      if (isError && !isInfoMessage) {
-        getLog().error({ stderr: output }, 'subprocess_error');
-      }
-    },
+    stderr: buildStderrHandler(stderrLines),
   };
+  if (containerExecContext)
+    options.spawnClaudeCodeProcess = buildContainerSpawn(containerExecContext, env);
+  addHostExecutableOptions(options, cliPath, isJsExecutable, hasContainerExecContext);
+  addOptionalRequestOptions(options, requestOptions);
+  return options;
+}
+
+function assertClaudeContainerRequestSupported(
+  requestOptions: SendQueryOptions | undefined,
+  assistantDefaults: ReturnType<typeof parseClaudeConfig>
+): void {
+  if (requestOptions?.execContext?.kind !== 'container') return;
+  if (requestOptions.nodeConfig?.mcp) {
+    throw new Error(
+      'Claude container execution does not support MCP config until controller-pinned MCP settings are implemented.'
+    );
+  }
+  if (requestOptions.nativeTools && requestOptions.nativeTools.length > 0) {
+    throw new Error(
+      'Claude container execution does not support native tools until controller-pinned MCP settings are implemented.'
+    );
+  }
+  if (requestOptions.nodeConfig?.hooks) {
+    throw new Error(
+      'Claude container execution does not support node hooks until controller-pinned hooks are implemented.'
+    );
+  }
+  const settingSources =
+    requestOptions.nodeConfig?.settingSources ?? assistantDefaults.settingSources;
+  if (settingSources && settingSources.length > 0) {
+    throw new Error(
+      'Claude container execution does not support settingSources until controller-pinned settings bundles are implemented.'
+    );
+  }
 }
 
 // ─── Tool Capture Hooks ──────────────────────────────────────────────────
@@ -844,295 +983,328 @@ function buildToolCaptureHooks(toolResultQueue: ToolResultEntry[]): Options['hoo
  * Normalize raw Claude SDK events into Archon MessageChunks.
  * Drains the tool result queue between events (populated by SDK hooks).
  */
+interface PendingSdkError {
+  code: SDKAssistantMessageError;
+  text: string;
+}
+
+interface ClaudeSystemMessage {
+  subtype?: string;
+  mcp_servers?: { name: string; status: string }[];
+  task_id?: string;
+  tool_use_id?: string;
+  description?: string;
+  task_type?: string;
+  prompt?: string;
+  summary?: string;
+  usage?: { total_tokens: number; tool_uses: number; duration_ms: number };
+  last_tool_name?: string;
+  status?: string;
+  output_file?: string;
+  skip_transcript?: boolean;
+  tasks?: { task_id: string; task_type: string; description: string }[];
+  hook_id?: string;
+  hook_name?: string;
+  hook_event?: string;
+  outcome?: 'success' | 'error' | 'cancelled';
+  exit_code?: number;
+}
+
+function* drainToolResultQueue(toolResultQueue: ToolResultEntry[]): Generator<MessageChunk> {
+  while (toolResultQueue.length > 0) {
+    const tr = toolResultQueue.shift();
+    if (!tr) continue;
+    yield {
+      type: 'tool_result',
+      toolName: tr.toolName,
+      toolOutput: tr.toolOutput,
+      ...(tr.toolCallId !== undefined ? { toolCallId: tr.toolCallId } : {}),
+      toolOutcome: tr.toolOutcome,
+    };
+  }
+}
+
+function extractSyntheticSdkError(msg: unknown): PendingSdkError | undefined {
+  const message = msg as {
+    message: { content: ContentBlock[]; model?: string };
+    error?: SDKAssistantMessageError;
+  };
+  if (message.error === undefined || message.message.model !== '<synthetic>') return undefined;
+  const text = message.message.content
+    .filter(b => b.type === 'text' && b.text)
+    .map(b => b.text)
+    .join('\n');
+  getLog().warn({ errorCode: message.error, text }, 'claude.synthetic_error_message');
+  return { code: message.error, text };
+}
+
+function* normalizeAssistantMessage(msg: unknown): Generator<MessageChunk> {
+  const message = msg as { message: { content: ContentBlock[] } };
+  for (const block of message.message.content) {
+    if (block.type === 'text' && block.text) {
+      yield { type: 'assistant', content: block.text };
+    } else if (block.type === 'tool_use' && block.name) {
+      yield {
+        type: 'tool',
+        toolName: block.name,
+        toolInput: block.input ?? {},
+        ...(block.id !== undefined ? { toolCallId: block.id } : {}),
+      };
+    }
+  }
+}
+
+function* normalizeSystemInit(sysMsg: ClaudeSystemMessage): Generator<MessageChunk> {
+  const failed = sysMsg.mcp_servers?.filter(s => s.status !== 'connected') ?? [];
+  if (failed.length === 0) return;
+  const names = failed.map(s => `${s.name} (${s.status})`).join(', ');
+  yield { type: 'system', content: `MCP server connection failed: ${names}` };
+}
+
+function* normalizeTaskStarted(sysMsg: ClaudeSystemMessage): Generator<MessageChunk> {
+  if (!sysMsg.task_id) return;
+  if (sysMsg.skip_transcript === true) {
+    getLog().debug(
+      { taskId: sysMsg.task_id, taskType: sysMsg.task_type },
+      'claude.task_started_housekeeping_suppressed'
+    );
+    return;
+  }
+  yield {
+    type: 'task_started',
+    taskId: sysMsg.task_id,
+    description: sysMsg.description ?? '',
+    ...(sysMsg.task_type !== undefined ? { taskType: sysMsg.task_type } : {}),
+    ...(sysMsg.prompt !== undefined ? { prompt: sysMsg.prompt } : {}),
+    ...(sysMsg.tool_use_id !== undefined ? { toolUseId: sysMsg.tool_use_id } : {}),
+  };
+}
+
+function* normalizeTaskProgress(sysMsg: ClaudeSystemMessage): Generator<MessageChunk> {
+  if (!sysMsg.task_id) return;
+  yield {
+    type: 'task_progress',
+    taskId: sysMsg.task_id,
+    description: sysMsg.description ?? '',
+    ...(sysMsg.summary !== undefined ? { summary: sysMsg.summary } : {}),
+    ...(sysMsg.usage !== undefined ? { usage: sysMsg.usage } : {}),
+    ...(sysMsg.last_tool_name !== undefined ? { lastToolName: sysMsg.last_tool_name } : {}),
+    ...(sysMsg.tool_use_id !== undefined ? { toolUseId: sysMsg.tool_use_id } : {}),
+  };
+}
+
+function normalizeTaskNotificationStatus(
+  status: string | undefined
+): 'completed' | 'failed' | 'stopped' {
+  if (status === 'completed' || status === 'failed' || status === 'stopped') return status;
+  return 'stopped';
+}
+
+function* normalizeTaskNotification(sysMsg: ClaudeSystemMessage): Generator<MessageChunk> {
+  if (!sysMsg.task_id) return;
+  const status = sysMsg.status;
+  if (status !== 'completed' && status !== 'failed' && status !== 'stopped') {
+    getLog().warn({ taskId: sysMsg.task_id, status }, 'claude.task_notification_unknown_status');
+  }
+  yield {
+    type: 'task_notification',
+    taskId: sysMsg.task_id,
+    status: normalizeTaskNotificationStatus(status),
+    summary: sysMsg.summary ?? '',
+    outputFile: sysMsg.output_file ?? '',
+    ...(sysMsg.usage !== undefined ? { usage: sysMsg.usage } : {}),
+    ...(sysMsg.tool_use_id !== undefined ? { toolUseId: sysMsg.tool_use_id } : {}),
+  };
+}
+
+function* normalizeBackgroundTasks(sysMsg: ClaudeSystemMessage): Generator<MessageChunk> {
+  const tasks = Array.isArray(sysMsg.tasks) ? sysMsg.tasks : [];
+  yield {
+    type: 'background_tasks',
+    tasks: tasks.map(t => ({
+      taskId: t.task_id,
+      taskType: t.task_type,
+      description: t.description,
+    })),
+  };
+}
+
+function* normalizeHookStarted(sysMsg: ClaudeSystemMessage): Generator<MessageChunk> {
+  if (!sysMsg.hook_id) return;
+  yield {
+    type: 'hook_started',
+    hookId: sysMsg.hook_id,
+    hookName: sysMsg.hook_name ?? '',
+    hookEvent: sysMsg.hook_event ?? '',
+  };
+}
+
+function normalizeHookOutcome(
+  outcome: ClaudeSystemMessage['outcome']
+): 'success' | 'error' | 'cancelled' {
+  if (outcome === 'success' || outcome === 'error' || outcome === 'cancelled') return outcome;
+  return 'error';
+}
+
+function* normalizeHookResponse(sysMsg: ClaudeSystemMessage): Generator<MessageChunk> {
+  if (!sysMsg.hook_id) return;
+  yield {
+    type: 'hook_response',
+    hookId: sysMsg.hook_id,
+    hookName: sysMsg.hook_name ?? '',
+    hookEvent: sysMsg.hook_event ?? '',
+    outcome: normalizeHookOutcome(sysMsg.outcome),
+    ...(sysMsg.exit_code !== undefined ? { exitCode: sysMsg.exit_code } : {}),
+  };
+}
+
+function* normalizeSystemMessage(msg: unknown): Generator<MessageChunk> {
+  const sysMsg = msg as ClaudeSystemMessage;
+  switch (sysMsg.subtype) {
+    case 'init':
+      yield* normalizeSystemInit(sysMsg);
+      return;
+    case 'task_started':
+      yield* normalizeTaskStarted(sysMsg);
+      return;
+    case 'task_progress':
+      yield* normalizeTaskProgress(sysMsg);
+      return;
+    case 'task_notification':
+      yield* normalizeTaskNotification(sysMsg);
+      return;
+    case 'background_tasks_changed':
+      yield* normalizeBackgroundTasks(sysMsg);
+      return;
+    case 'hook_started':
+      yield* normalizeHookStarted(sysMsg);
+      return;
+    case 'hook_response':
+      yield* normalizeHookResponse(sysMsg);
+      return;
+    default:
+      getLog().debug({ subtype: sysMsg.subtype }, 'claude.system_message_unhandled');
+  }
+}
+
+function throwConfirmedSyntheticError(
+  resultMsg: SDKResultMessage,
+  syntheticError: PendingSdkError | undefined,
+  sdkErrors: string[] | undefined
+): void {
+  const code = syntheticError?.code ?? 'unknown';
+  const resultText = 'result' in resultMsg ? resultMsg.result : undefined;
+  const text =
+    syntheticError?.text ||
+    resultText ||
+    sdkErrors?.join('; ') ||
+    'API error result with no error text';
+  getLog().error(
+    {
+      sessionId: resultMsg.session_id,
+      errorCode: code,
+      terminalReason: resultMsg.terminal_reason,
+      apiErrorStatus: 'api_error_status' in resultMsg ? resultMsg.api_error_status : undefined,
+      text,
+    },
+    'claude.result_api_error'
+  );
+  throw new ClaudeApiResultError(code, text);
+}
+
+function logResultStatus(resultMsg: SDKResultMessage, isSuccessWithErrorFlag: boolean): void {
+  const sdkErrors = 'errors' in resultMsg ? resultMsg.errors : undefined;
+  const isRealError = resultMsg.is_error && !isSuccessWithErrorFlag;
+  if (isRealError) {
+    getLog().error(
+      {
+        sessionId: resultMsg.session_id,
+        errorSubtype: resultMsg.subtype,
+        stopReason: resultMsg.stop_reason,
+        errors: sdkErrors,
+      },
+      'claude.result_is_error'
+    );
+  } else if (isSuccessWithErrorFlag) {
+    getLog().debug(
+      { sessionId: resultMsg.session_id, stopReason: resultMsg.stop_reason },
+      'claude.result_success_validated'
+    );
+  }
+}
+
+function* normalizeResultMessage(
+  msg: unknown,
+  syntheticError: PendingSdkError | undefined
+): Generator<MessageChunk> {
+  const resultMsg = msg as SDKResultMessage;
+  const resolvedModelId = selectResolvedModelId(resultMsg.modelUsage);
+  const tokens = normalizeClaudeUsage(resultMsg.usage);
+  const sdkErrors = 'errors' in resultMsg ? resultMsg.errors : undefined;
+  const isSuccessWithErrorFlag = resultMsg.is_error && resultMsg.subtype === 'success';
+  if (isSuccessWithErrorFlag && (syntheticError || resultMsg.terminal_reason === 'api_error')) {
+    throwConfirmedSyntheticError(resultMsg, syntheticError, sdkErrors);
+  }
+  if (syntheticError !== undefined && !resultMsg.is_error) {
+    getLog().warn(
+      { sessionId: resultMsg.session_id, errorCode: syntheticError.code },
+      'claude.synthetic_error_not_confirmed'
+    );
+    yield { type: 'assistant', content: syntheticError.text };
+  }
+  const isRealError = resultMsg.is_error && !isSuccessWithErrorFlag;
+  logResultStatus(resultMsg, isSuccessWithErrorFlag);
+  yield {
+    type: 'result',
+    sessionId: resultMsg.session_id,
+    ...(tokens ? { tokens } : {}),
+    ...('structured_output' in resultMsg && resultMsg.structured_output !== undefined
+      ? { structuredOutput: resultMsg.structured_output }
+      : {}),
+    ...(isRealError ? { isError: true, errorSubtype: resultMsg.subtype } : {}),
+    ...(isRealError && sdkErrors?.length ? { errors: sdkErrors } : {}),
+    ...(resultMsg.total_cost_usd !== undefined ? { cost: resultMsg.total_cost_usd } : {}),
+    ...(resultMsg.stop_reason != null ? { stopReason: resultMsg.stop_reason } : {}),
+    ...(resultMsg.num_turns !== undefined ? { numTurns: resultMsg.num_turns } : {}),
+    ...(resolvedModelId ? { resolvedModel: { id: resolvedModelId } } : {}),
+  };
+}
+
+function* normalizeRateLimitMessage(msg: unknown): Generator<MessageChunk> {
+  const rateLimitMsg = msg as { rate_limit_info?: Record<string, unknown> };
+  getLog().warn({ rateLimitInfo: rateLimitMsg.rate_limit_info }, 'claude.rate_limit_event');
+  yield { type: 'rate_limit', rateLimitInfo: rateLimitMsg.rate_limit_info ?? {} };
+}
+
+/**
+ * Normalize raw Claude SDK events into Archon MessageChunks.
+ * Drains the tool result queue between events (populated by SDK hooks).
+ */
 async function* streamClaudeMessages(
   events: AsyncGenerator,
   toolResultQueue: ToolResultEntry[]
 ): AsyncGenerator<MessageChunk> {
-  // Synthetic error message recorded while waiting for the terminal result to
-  // confirm it (#1797). Detection is two-signal: the typed wrapper `error`
-  // field on a '<synthetic>' assistant message, then `is_error: true` on the
-  // result. See ClaudeApiResultError.
-  let pendingSdkError: { code: SDKAssistantMessageError; text: string } | undefined;
-
+  let pendingSdkError: PendingSdkError | undefined;
   for await (const msg of events) {
-    // Drain tool results captured by hooks before processing the next event
-    while (toolResultQueue.length > 0) {
-      const tr = toolResultQueue.shift();
-      if (tr) {
-        yield {
-          type: 'tool_result',
-          toolName: tr.toolName,
-          toolOutput: tr.toolOutput,
-          ...(tr.toolCallId !== undefined ? { toolCallId: tr.toolCallId } : {}),
-          toolOutcome: tr.toolOutcome,
-        };
-      }
-    }
-
+    yield* drainToolResultQueue(toolResultQueue);
     const event = msg as { type: string };
-
     if (event.type === 'assistant') {
-      const message = msg as {
-        message: { content: ContentBlock[]; model?: string };
-        error?: SDKAssistantMessageError;
-      };
-      const content = message.message.content;
-
-      // API-level failure surfaced as text (#1797): the SDK writes the error
-      // prose into a synthesized assistant message instead of throwing. Both
-      // signals are required — a REAL model message can carry an error code
-      // too (e.g. 'max_output_tokens' on truncated output) and its content
-      // must flow through untouched; only '<synthetic>' content is
-      // SDK-generated error prose, never model output.
-      if (message.error !== undefined && message.message.model === '<synthetic>') {
-        const text = content
-          .filter(b => b.type === 'text' && b.text)
-          .map(b => b.text)
-          .join('\n');
-        pendingSdkError = { code: message.error, text };
-        getLog().warn({ errorCode: message.error, text }, 'claude.synthetic_error_message');
-        // Withhold the error prose from the output stream — yielding it is
-        // what poisons downstream $node.output. If the terminal result
-        // contradicts (no is_error), the text is yielded late as a fail-safe.
+      const syntheticError = extractSyntheticSdkError(msg);
+      if (syntheticError) {
+        pendingSdkError = syntheticError;
         continue;
       }
-
-      for (const block of content) {
-        if (block.type === 'text' && block.text) {
-          yield { type: 'assistant', content: block.text };
-        } else if (block.type === 'tool_use' && block.name) {
-          yield {
-            type: 'tool',
-            toolName: block.name,
-            toolInput: block.input ?? {},
-            ...(block.id !== undefined ? { toolCallId: block.id } : {}),
-          };
-        }
-      }
+      yield* normalizeAssistantMessage(msg);
     } else if (event.type === 'system') {
-      const sysMsg = msg as {
-        subtype?: string;
-        mcp_servers?: { name: string; status: string }[];
-        // Subagent task lifecycle (Claude SDK v0.2.89+)
-        task_id?: string;
-        tool_use_id?: string;
-        description?: string;
-        task_type?: string;
-        prompt?: string;
-        summary?: string;
-        usage?: { total_tokens: number; tool_uses: number; duration_ms: number };
-        last_tool_name?: string;
-        status?: string;
-        output_file?: string;
-        skip_transcript?: boolean;
-        // Background-task set (Claude SDK v0.3.209+ `background_tasks_changed`)
-        tasks?: { task_id: string; task_type: string; description: string }[];
-        // Hook lifecycle (Claude SDK v0.2.89+)
-        hook_id?: string;
-        hook_name?: string;
-        hook_event?: string;
-        outcome?: 'success' | 'error' | 'cancelled';
-        exit_code?: number;
-      };
-      const subtype = sysMsg.subtype;
-      if (subtype === 'init' && sysMsg.mcp_servers) {
-        const failed = sysMsg.mcp_servers.filter(s => s.status !== 'connected');
-        if (failed.length > 0) {
-          const names = failed.map(s => `${s.name} (${s.status})`).join(', ');
-          yield { type: 'system', content: `MCP server connection failed: ${names}` };
-        }
-      } else if (subtype === 'task_started' && sysMsg.task_id) {
-        // Ambient / housekeeping tasks (SDK signals via skip_transcript) are
-        // SDK-internal — they bloat the Web UI's tasks panel without telling
-        // the user anything actionable. Drop them at the provider boundary;
-        // the workflow executor and SSE bridge never see them.
-        if (sysMsg.skip_transcript === true) {
-          getLog().debug(
-            { taskId: sysMsg.task_id, taskType: sysMsg.task_type },
-            'claude.task_started_housekeeping_suppressed'
-          );
-        } else {
-          yield {
-            type: 'task_started',
-            taskId: sysMsg.task_id,
-            description: sysMsg.description ?? '',
-            ...(sysMsg.task_type !== undefined ? { taskType: sysMsg.task_type } : {}),
-            ...(sysMsg.prompt !== undefined ? { prompt: sysMsg.prompt } : {}),
-            ...(sysMsg.tool_use_id !== undefined ? { toolUseId: sysMsg.tool_use_id } : {}),
-          };
-        }
-      } else if (subtype === 'task_progress' && sysMsg.task_id) {
-        yield {
-          type: 'task_progress',
-          taskId: sysMsg.task_id,
-          description: sysMsg.description ?? '',
-          ...(sysMsg.summary !== undefined ? { summary: sysMsg.summary } : {}),
-          ...(sysMsg.usage !== undefined ? { usage: sysMsg.usage } : {}),
-          ...(sysMsg.last_tool_name !== undefined ? { lastToolName: sysMsg.last_tool_name } : {}),
-          ...(sysMsg.tool_use_id !== undefined ? { toolUseId: sysMsg.tool_use_id } : {}),
-        };
-      } else if (subtype === 'task_notification' && sysMsg.task_id) {
-        const status = sysMsg.status;
-        if (status !== 'completed' && status !== 'failed' && status !== 'stopped') {
-          getLog().warn(
-            { taskId: sysMsg.task_id, status },
-            'claude.task_notification_unknown_status'
-          );
-          // Fall through with raw status to avoid dropping the event entirely
-        }
-        yield {
-          type: 'task_notification',
-          taskId: sysMsg.task_id,
-          status:
-            status === 'completed' || status === 'failed' || status === 'stopped'
-              ? status
-              : 'stopped',
-          summary: sysMsg.summary ?? '',
-          outputFile: sysMsg.output_file ?? '',
-          ...(sysMsg.usage !== undefined ? { usage: sysMsg.usage } : {}),
-          ...(sysMsg.tool_use_id !== undefined ? { toolUseId: sysMsg.tool_use_id } : {}),
-        };
-      } else if (subtype === 'background_tasks_changed') {
-        // Level signal: the FULL set of live background tasks after a membership
-        // change (REPLACE semantics — see the MessageChunk variant docs). An
-        // empty `tasks` array is meaningful ("all drained") and MUST be
-        // forwarded, so no `&& sysMsg.tasks` guard here.
-        const tasks = Array.isArray(sysMsg.tasks) ? sysMsg.tasks : [];
-        yield {
-          type: 'background_tasks',
-          tasks: tasks.map(t => ({
-            taskId: t.task_id,
-            taskType: t.task_type,
-            description: t.description,
-          })),
-        };
-      } else if (subtype === 'hook_started' && sysMsg.hook_id) {
-        yield {
-          type: 'hook_started',
-          hookId: sysMsg.hook_id,
-          hookName: sysMsg.hook_name ?? '',
-          hookEvent: sysMsg.hook_event ?? '',
-        };
-      } else if (subtype === 'hook_response' && sysMsg.hook_id) {
-        const outcome = sysMsg.outcome;
-        yield {
-          type: 'hook_response',
-          hookId: sysMsg.hook_id,
-          hookName: sysMsg.hook_name ?? '',
-          hookEvent: sysMsg.hook_event ?? '',
-          outcome:
-            outcome === 'success' || outcome === 'error' || outcome === 'cancelled'
-              ? outcome
-              : 'error',
-          ...(sysMsg.exit_code !== undefined ? { exitCode: sysMsg.exit_code } : {}),
-        };
-      } else {
-        getLog().debug({ subtype: sysMsg.subtype }, 'claude.system_message_unhandled');
-      }
+      yield* normalizeSystemMessage(msg);
     } else if (event.type === 'rate_limit_event') {
-      const rateLimitMsg = msg as { rate_limit_info?: Record<string, unknown> };
-      getLog().warn({ rateLimitInfo: rateLimitMsg.rate_limit_info }, 'claude.rate_limit_event');
-      yield { type: 'rate_limit', rateLimitInfo: rateLimitMsg.rate_limit_info ?? {} };
+      yield* normalizeRateLimitMessage(msg);
     } else if (event.type === 'result') {
-      const resultMsg = msg as SDKResultMessage;
-      const resolvedModelId = selectResolvedModelId(resultMsg.modelUsage);
-      // The terminal result resolves any recorded synthetic error message.
       const syntheticError = pendingSdkError;
       pendingSdkError = undefined;
-      const tokens = normalizeClaudeUsage(resultMsg.usage);
-      const sdkErrors = 'errors' in resultMsg ? resultMsg.errors : undefined;
-
-      // `is_error: true` + `subtype: 'success'` is ambiguous: it is BOTH the
-      // SDK's stop-sequence termination encoding (#1425, a legitimate success)
-      // AND its API-failure-as-text encoding (#1797 — auth/billing/rate-limit
-      // errors that even set stop_reason: 'stop_sequence').
-      const isSuccessWithErrorFlag = resultMsg.is_error && resultMsg.subtype === 'success';
-
-      // Disambiguate structurally: a preceding synthetic error message
-      // (primary, typed signal), or the typed terminal_reason 'api_error'
-      // (secondary — catches an error result with no preceding synthetic
-      // message), marks a real failure. Throw so callers fail the node/turn
-      // instead of consuming error prose as successful output.
-      if (
-        isSuccessWithErrorFlag &&
-        (syntheticError !== undefined || resultMsg.terminal_reason === 'api_error')
-      ) {
-        const code = syntheticError?.code ?? 'unknown';
-        const text =
-          syntheticError?.text ||
-          resultMsg.result ||
-          sdkErrors?.join('; ') ||
-          'API error result with no error text';
-        getLog().error(
-          {
-            sessionId: resultMsg.session_id,
-            errorCode: code,
-            terminalReason: resultMsg.terminal_reason,
-            apiErrorStatus: resultMsg.api_error_status,
-            text,
-          },
-          'claude.result_api_error'
-        );
-        throw new ClaudeApiResultError(code, text);
-      }
-
-      // Fail-safe (never observed in practice): a synthetic error message
-      // followed by a non-error result. Yield the withheld text late rather
-      // than silently swallowing content.
-      if (syntheticError !== undefined && !resultMsg.is_error) {
-        getLog().warn(
-          { sessionId: resultMsg.session_id, errorCode: syntheticError.code },
-          'claude.synthetic_error_not_confirmed'
-        );
-        yield { type: 'assistant', content: syntheticError.text };
-      }
-
-      // SDKResultSuccess declares `is_error: boolean` (not literal false). When a
-      // model terminates via a configured stop sequence (stop_reason ===
-      // 'stop_sequence') the SDK can set is_error: true while keeping
-      // subtype: 'success' — its encoding of "non-default termination, not a
-      // failure". Treat that pair as a clean success so downstream consumers
-      // (which gate failure on isError) don't misclassify it.
-      const isRealError = resultMsg.is_error && !isSuccessWithErrorFlag;
-      if (isRealError) {
-        getLog().error(
-          {
-            sessionId: resultMsg.session_id,
-            errorSubtype: resultMsg.subtype,
-            stopReason: resultMsg.stop_reason,
-            errors: sdkErrors,
-          },
-          'claude.result_is_error'
-        );
-      } else if (isSuccessWithErrorFlag) {
-        getLog().debug(
-          {
-            sessionId: resultMsg.session_id,
-            stopReason: resultMsg.stop_reason,
-          },
-          'claude.result_success_validated'
-        );
-      }
-      yield {
-        type: 'result',
-        sessionId: resultMsg.session_id,
-        ...(tokens ? { tokens } : {}),
-        ...('structured_output' in resultMsg && resultMsg.structured_output !== undefined
-          ? { structuredOutput: resultMsg.structured_output }
-          : {}),
-        ...(isRealError ? { isError: true, errorSubtype: resultMsg.subtype } : {}),
-        ...(isRealError && sdkErrors?.length ? { errors: sdkErrors } : {}),
-        ...(resultMsg.total_cost_usd !== undefined ? { cost: resultMsg.total_cost_usd } : {}),
-        ...(resultMsg.stop_reason != null ? { stopReason: resultMsg.stop_reason } : {}),
-        ...(resultMsg.num_turns !== undefined ? { numTurns: resultMsg.num_turns } : {}),
-        ...(resolvedModelId ? { resolvedModel: { id: resolvedModelId } } : {}),
-      };
+      yield* normalizeResultMessage(msg, syntheticError);
     }
   }
-
-  // Stream ended after a synthetic error message with no terminal result to
-  // confirm or contradict it. A dangling synthetic error is a failure — the
-  // SDK ends every turn with a result, so this is an abnormal end (#1797).
   if (pendingSdkError !== undefined) {
     getLog().error(
       { errorCode: pendingSdkError.code, text: pendingSdkError.text },
@@ -1140,20 +1312,7 @@ async function* streamClaudeMessages(
     );
     throw new ClaudeApiResultError(pendingSdkError.code, pendingSdkError.text);
   }
-
-  // Drain any remaining tool results after the stream ends
-  while (toolResultQueue.length > 0) {
-    const tr = toolResultQueue.shift();
-    if (tr) {
-      yield {
-        type: 'tool_result',
-        toolName: tr.toolName,
-        toolOutput: tr.toolOutput,
-        ...(tr.toolCallId !== undefined ? { toolCallId: tr.toolCallId } : {}),
-        toolOutcome: tr.toolOutcome,
-      };
-    }
-  }
+  yield* drainToolResultQueue(toolResultQueue);
 }
 
 // ─── Error Classification & Retry ────────────────────────────────────────
@@ -1227,6 +1386,247 @@ function classifyAndEnrichError(
 
 // ─── Claude Provider ───────────────────────────────────────────────────────
 
+interface PreparedClaudeSendQuery {
+  assistantDefaults: ReturnType<typeof parseClaudeConfig>;
+  resolvedCliPath: string | undefined;
+  env: NodeJS.ProcessEnv;
+  nodeConfigWarnings: ProviderWarning[];
+  containerExecContext?: Extract<
+    NonNullable<SendQueryOptions['execContext']>,
+    { kind: 'container' }
+  >;
+}
+
+class RetryableClaudeAttemptError extends Error {
+  constructor(readonly original: Error) {
+    super(original.message);
+    this.name = 'RetryableClaudeAttemptError';
+  }
+}
+
+interface PreparedAttemptFailure {
+  error: Error;
+  retry: boolean;
+}
+
+interface ClaudeAttemptParams {
+  prompt: string;
+  cwd: string;
+  resumeSessionId: string | undefined;
+  requestOptions: SendQueryOptions | undefined;
+  prepared: PreparedClaudeSendQuery;
+  retryBaseDelayMs: number;
+  stopContainer: (reason: 'abort' | 'deadline') => Promise<void> | undefined;
+  setCurrentController: (controller: AbortController | undefined) => void;
+}
+
+async function prepareClaudeSendQuery(
+  cwd: string,
+  requestOptions: SendQueryOptions | undefined
+): Promise<PreparedClaudeSendQuery> {
+  const assistantDefaults = parseClaudeConfig(requestOptions?.assistantConfig ?? {});
+  assertClaudeContainerRequestSupported(requestOptions, assistantDefaults);
+  const containerExecContext = resolveContainerExecContext(requestOptions);
+  const resolvedCliPath = containerExecContext
+    ? undefined
+    : await resolveClaudeBinaryPath(assistantDefaults.claudeBinaryPath);
+  const env = buildRequestSubprocessEnv(requestOptions);
+  const nodeConfigWarnings = requestOptions?.nodeConfig
+    ? await applyNodeConfig({} as Options, requestOptions.nodeConfig, cwd)
+    : [];
+  return { assistantDefaults, resolvedCliPath, env, nodeConfigWarnings, containerExecContext };
+}
+
+function createContainerStopper(
+  containerExecContext: PreparedClaudeSendQuery['containerExecContext'],
+  stopContainerOnAbort: typeof defaultStopContainerOnAbort
+): (reason: 'abort' | 'deadline') => Promise<void> | undefined {
+  let containerStopPromise: Promise<void> | undefined;
+  return (reason: 'abort' | 'deadline'): Promise<void> | undefined => {
+    if (!containerExecContext) return undefined;
+    if (!containerStopPromise) {
+      containerStopPromise = stopContainerOnAbort(containerExecContext, reason);
+      void containerStopPromise.catch(() => undefined);
+    }
+    return containerStopPromise;
+  };
+}
+
+function createAttemptOptions(
+  params: ClaudeAttemptParams,
+  controller: AbortController,
+  stderrLines: string[],
+  toolResultQueue: ToolResultEntry[]
+): Options {
+  return buildBaseClaudeOptions(
+    params.cwd,
+    params.requestOptions,
+    params.prepared.assistantDefaults,
+    controller,
+    stderrLines,
+    toolResultQueue,
+    params.prepared.env,
+    params.prepared.resolvedCliPath
+  );
+}
+
+async function applyPerAttemptOptions(
+  options: Options,
+  params: ClaudeAttemptParams,
+  attempt: number
+): Promise<void> {
+  if (params.requestOptions?.nodeConfig) {
+    await applyNodeConfig(options, params.requestOptions.nodeConfig, params.cwd);
+  }
+  registerNativeTools(options, params.requestOptions);
+  applyResumeOptions(options, params.resumeSessionId, params.requestOptions, params.cwd, attempt);
+}
+
+function registerNativeTools(options: Options, requestOptions: SendQueryOptions | undefined): void {
+  if (!requestOptions?.nativeTools || requestOptions.nativeTools.length === 0) return;
+  const server = buildArchonMcpServer(requestOptions.nativeTools);
+  options.mcpServers = { ...options.mcpServers, [ARCHON_TOOL_SERVER]: server };
+  options.allowedTools = [...(options.allowedTools ?? []), `mcp__${ARCHON_TOOL_SERVER}__*`];
+  getLog().info({ count: requestOptions.nativeTools.length }, 'claude.native_tools_registered');
+}
+
+function applyResumeOptions(
+  options: Options,
+  resumeSessionId: string | undefined,
+  requestOptions: SendQueryOptions | undefined,
+  cwd: string,
+  attempt: number
+): void {
+  if (resumeSessionId) {
+    options.resume = resumeSessionId;
+    getLog().debug(
+      { sessionId: resumeSessionId, forkSession: requestOptions?.forkSession },
+      'resuming_session'
+    );
+    return;
+  }
+  getLog().debug({ cwd, attempt }, 'starting_new_session');
+}
+
+async function* runClaudeAttempt(
+  params: ClaudeAttemptParams,
+  attempt: number
+): AsyncGenerator<MessageChunk> {
+  const stderrLines: string[] = [];
+  const toolResultQueue: ToolResultEntry[] = [];
+  const controller = new AbortController();
+  params.setCurrentController(controller);
+  const options = createAttemptOptions(params, controller, stderrLines, toolResultQueue);
+  await applyPerAttemptOptions(options, params, attempt);
+  try {
+    const rawEvents = query({ prompt: params.prompt, options });
+    const timeoutMs = getFirstEventTimeoutMs();
+    const diagnostics = buildFirstEventHangDiagnostics(
+      options.env as Record<string, string>,
+      options.model
+    );
+    const events = withFirstMessageTimeout(rawEvents, controller, timeoutMs, diagnostics);
+    yield* withResumedOutcome(
+      streamClaudeMessages(events, toolResultQueue),
+      resumedOutcome(params.resumeSessionId, true)
+    );
+  } catch (error) {
+    const failure = await prepareAttemptError(
+      error as Error,
+      stderrLines,
+      controller,
+      params,
+      attempt
+    );
+    throw failure.retry ? new RetryableClaudeAttemptError(failure.error) : failure.error;
+  }
+}
+
+async function prepareAttemptError(
+  err: Error,
+  stderrLines: string[],
+  controller: AbortController,
+  params: ClaudeAttemptParams,
+  attempt: number
+): Promise<PreparedAttemptFailure> {
+  const stopPromise = controller.signal.aborted
+    ? params.stopContainer(err.message.includes('produced no output within') ? 'deadline' : 'abort')
+    : undefined;
+  const { enrichedError, errorClass, shouldRetry } = classifyAndEnrichError(
+    err,
+    stderrLines,
+    controller
+  );
+  if (stopPromise) await stopPromise;
+  getLog().error(
+    {
+      err,
+      stderrContext: stderrLines.join('\n'),
+      errorClass,
+      attempt,
+      maxRetries: MAX_SUBPROCESS_RETRIES,
+    },
+    'query_error'
+  );
+  if (!shouldRetry || attempt >= MAX_SUBPROCESS_RETRIES) {
+    return { error: enrichedError, retry: false };
+  }
+  const delayMs = params.retryBaseDelayMs * Math.pow(2, attempt);
+  getLog().info({ attempt, delayMs, errorClass }, 'retrying_subprocess');
+  await new Promise(resolve => setTimeout(resolve, delayMs));
+  return { error: enrichedError, retry: true };
+}
+
+async function* runClaudeAttempts(params: ClaudeAttemptParams): AsyncGenerator<MessageChunk> {
+  let lastError: Error | undefined;
+  for (let attempt = 0; attempt <= MAX_SUBPROCESS_RETRIES; attempt++) {
+    if (params.requestOptions?.abortSignal?.aborted) throw new Error('Query aborted');
+    try {
+      yield* runClaudeAttempt(params, attempt);
+      return;
+    } catch (error) {
+      if (!(error instanceof RetryableClaudeAttemptError)) throw error;
+      lastError = error.original;
+    }
+  }
+  throw lastError ?? new Error('Claude Code query failed after retries');
+}
+
+async function* runPreparedClaudeQuery(params: ClaudeAttemptParams): AsyncGenerator<MessageChunk> {
+  for (const warning of params.prepared.nodeConfigWarnings) {
+    yield { type: 'system' as const, content: `⚠️ ${warning.message}` };
+  }
+  yield* runClaudeAttempts(params);
+}
+
+async function* runClaudeQueryWithAbortHandling(
+  params: Omit<ClaudeAttemptParams, 'stopContainer' | 'setCurrentController'>,
+  stopContainerOnAbort: typeof defaultStopContainerOnAbort
+): AsyncGenerator<MessageChunk> {
+  let currentController: AbortController | undefined;
+  const stopContainer = createContainerStopper(
+    params.prepared.containerExecContext,
+    stopContainerOnAbort
+  );
+  const onAbort = (): void => {
+    currentController?.abort();
+    void stopContainer('abort');
+  };
+  params.requestOptions?.abortSignal?.addEventListener('abort', onAbort, { once: true });
+  try {
+    yield* runPreparedClaudeQuery({
+      ...params,
+      stopContainer,
+      setCurrentController: controller => {
+        currentController = controller;
+      },
+    });
+  } finally {
+    params.requestOptions?.abortSignal?.removeEventListener('abort', onAbort);
+    currentController = undefined;
+  }
+}
+
 /**
  * Claude AI agent provider.
  * Implements IAgentProvider with full SDK integration.
@@ -1239,8 +1639,12 @@ function classifyAndEnrichError(
  */
 export class ClaudeProvider implements IAgentProvider {
   private readonly retryBaseDelayMs: number;
+  private readonly stopContainerOnAbort: typeof defaultStopContainerOnAbort;
 
-  constructor(options?: { retryBaseDelayMs?: number }) {
+  constructor(options?: {
+    retryBaseDelayMs?: number;
+    stopContainerOnAbort?: typeof defaultStopContainerOnAbort;
+  }) {
     if (getProcessUid() === 0 && process.env.IS_SANDBOX !== '1') {
       throw new Error(
         'Claude Code SDK does not support bypassPermissions when running as root (UID 0). ' +
@@ -1248,6 +1652,7 @@ export class ClaudeProvider implements IAgentProvider {
       );
     }
     this.retryBaseDelayMs = options?.retryBaseDelayMs ?? RETRY_BASE_DELAY_MS;
+    this.stopContainerOnAbort = options?.stopContainerOnAbort ?? defaultStopContainerOnAbort;
   }
 
   getCapabilities(): ProviderCapabilities {
@@ -1258,164 +1663,27 @@ export class ClaudeProvider implements IAgentProvider {
    * Send a query to Claude and stream responses.
    * Orchestrates option building, nodeConfig translation, streaming, and retry.
    */
-  // TODO(#1135): Pre-spawn env-leak gate was removed during provider extraction.
-  // Caller-side enforcement (orchestrator, dag-executor) is tracked in #1135.
-  // Providers must NOT implement security gates — the platform guarantees safety
-  // before a provider runs.
+  // Host requests preserve existing provider behavior. Container requests fail
+  // closed here before SDK option construction can load project/user settings,
+  // MCP files, hooks, or native in-process tools.
   async *sendQuery(
     prompt: string,
     cwd: string,
     resumeSessionId?: string,
     requestOptions?: SendQueryOptions
   ): AsyncGenerator<MessageChunk> {
-    let lastError: Error | undefined;
-    const assistantDefaults = parseClaudeConfig(requestOptions?.assistantConfig ?? {});
-
-    // Resolve Claude CLI path once before the retry loop. In binary mode this
-    // throws immediately if neither env nor config supplies a valid path, so
-    // the user gets a clean error rather than N retries of "Module not found".
-    // SKIP entirely for container runs: the SDK bypasses disk resolution when
-    // `spawnClaudeCodeProcess` is set (buildBaseClaudeOptions omits
-    // pathToClaudeCodeExecutable), and Claude is baked into the runner image — a
-    // compiled Archon binary has no host Claude, so resolving it here would throw
-    // and kill an otherwise-valid container run.
-    const isContainerRun = requestOptions?.execContext?.kind === 'container';
-    const resolvedCliPath = isContainerRun
-      ? undefined
-      : await resolveClaudeBinaryPath(assistantDefaults.claudeBinaryPath);
-
-    // Build subprocess env once (avoids re-logging auth mode per retry). A
-    // container run gets ONLY the Archon-managed bag + a minimal base — host
-    // process.env never crosses the boundary (the isolation invariant); the host
-    // path inherits the (already-cleaned) process env exactly as before.
-    const env = buildRequestSubprocessEnv(requestOptions);
-
-    // Apply nodeConfig translation once (deterministic, not retry-dependent)
-    // We need a throwaway Options to extract warnings from applyNodeConfig,
-    // then re-apply per attempt. But nodeConfig warnings are deterministic,
-    // so we compute them once and yield them before the first attempt.
-    let nodeConfigWarnings: ProviderWarning[] = [];
-    if (requestOptions?.nodeConfig) {
-      const tempOptions: Options = {} as Options;
-      nodeConfigWarnings = await applyNodeConfig(tempOptions, requestOptions.nodeConfig, cwd);
-    }
-
-    // Yield provider warnings once before retries
-    for (const warning of nodeConfigWarnings) {
-      yield { type: 'system' as const, content: `⚠️ ${warning.message}` };
-    }
-
-    // Track the current attempt's controller so a single abort listener
-    // can forward cancellation without accumulating per-retry listeners.
-    let currentController: AbortController | undefined;
-    const onAbort = (): void => {
-      currentController?.abort();
-    };
-    if (requestOptions?.abortSignal) {
-      requestOptions.abortSignal.addEventListener('abort', onAbort, { once: true });
-    }
-
-    for (let attempt = 0; attempt <= MAX_SUBPROCESS_RETRIES; attempt++) {
-      if (requestOptions?.abortSignal?.aborted) {
-        throw new Error('Query aborted');
-      }
-
-      const stderrLines: string[] = [];
-      const toolResultQueue: ToolResultEntry[] = [];
-      const controller = new AbortController();
-      currentController = controller;
-
-      // 1. Build SDK options (env and cliPath pre-computed above)
-      const options = buildBaseClaudeOptions(
+    const prepared = await prepareClaudeSendQuery(cwd, requestOptions);
+    yield* runClaudeQueryWithAbortHandling(
+      {
+        prompt,
         cwd,
+        resumeSessionId,
         requestOptions,
-        assistantDefaults,
-        controller,
-        stderrLines,
-        toolResultQueue,
-        env,
-        resolvedCliPath
-      );
-
-      // 2. Apply nodeConfig translation (re-applied per attempt since options are fresh)
-      if (requestOptions?.nodeConfig) {
-        await applyNodeConfig(options, requestOptions.nodeConfig, cwd);
-      }
-
-      // 2b. Register in-process native tools (e.g. manage_run) as an archon MCP
-      //     server, mirroring the file-based mcp branch. Merge so a nodeConfig
-      //     mcp config and native tools can coexist.
-      if (requestOptions?.nativeTools && requestOptions.nativeTools.length > 0) {
-        const server = buildArchonMcpServer(requestOptions.nativeTools);
-        options.mcpServers = { ...(options.mcpServers ?? {}), [ARCHON_TOOL_SERVER]: server };
-        options.allowedTools = [...(options.allowedTools ?? []), `mcp__${ARCHON_TOOL_SERVER}__*`];
-        getLog().info(
-          { count: requestOptions.nativeTools.length },
-          'claude.native_tools_registered'
-        );
-      }
-
-      // 3. Set session resume
-      if (resumeSessionId) {
-        options.resume = resumeSessionId;
-        getLog().debug(
-          { sessionId: resumeSessionId, forkSession: requestOptions?.forkSession },
-          'resuming_session'
-        );
-      } else {
-        getLog().debug({ cwd, attempt }, 'starting_new_session');
-      }
-
-      try {
-        // 4. Run query with first-event timeout protection
-        const rawEvents = query({ prompt, options });
-        const timeoutMs = getFirstEventTimeoutMs();
-        const diagnostics = buildFirstEventHangDiagnostics(
-          options.env as Record<string, string>,
-          options.model
-        );
-        const events = withFirstMessageTimeout(rawEvents, controller, timeoutMs, diagnostics);
-
-        // 5. Stream normalized events
-        // Claude resumes-or-errors: an invalid resume id throws (and is
-        // retried/surfaced), so reaching the result stream means the prior
-        // session was restored. Hence `true` whenever a resume was requested.
-        yield* withResumedOutcome(
-          streamClaudeMessages(events, toolResultQueue),
-          resumedOutcome(resumeSessionId, true)
-        );
-        return;
-      } catch (error) {
-        const err = error as Error;
-        const { enrichedError, errorClass, shouldRetry } = classifyAndEnrichError(
-          err,
-          stderrLines,
-          controller
-        );
-
-        getLog().error(
-          {
-            err,
-            stderrContext: stderrLines.join('\n'),
-            errorClass,
-            attempt,
-            maxRetries: MAX_SUBPROCESS_RETRIES,
-          },
-          'query_error'
-        );
-
-        if (!shouldRetry || attempt >= MAX_SUBPROCESS_RETRIES) {
-          throw enrichedError;
-        }
-
-        const delayMs = this.retryBaseDelayMs * Math.pow(2, attempt);
-        getLog().info({ attempt, delayMs, errorClass }, 'retrying_subprocess');
-        await new Promise(resolve => setTimeout(resolve, delayMs));
-        lastError = enrichedError;
-      }
-    }
-
-    throw lastError ?? new Error('Claude Code query failed after retries');
+        prepared,
+        retryBaseDelayMs: this.retryBaseDelayMs,
+      },
+      this.stopContainerOnAbort
+    );
   }
 
   getType(): string {

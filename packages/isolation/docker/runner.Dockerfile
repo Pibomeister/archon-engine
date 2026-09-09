@@ -1,10 +1,9 @@
-# Archon container-isolation runner image.
+# Archon hardened container-isolation runner image.
 #
-# Runs a folder-project workflow inside an isolated container over a read-only
-# bind of the project root (/mnt/lower) + a writable overlayfs upper layer on a
-# per-run named volume (/mnt/upper), merged by entrypoint.sh at the host's
-# absolute cwd. Ships the Claude Code native binary plus git/bash/bun/uv so
-# Claude, bash: nodes, and script: nodes all execute in here.
+# Runs a folder-project workflow from controller-seeded per-run named volumes.
+# The agent-facing container never mounts the live worktree, live .git, host
+# home, credential files, or Docker socket. Claude, bash: nodes, and script:
+# nodes all execute in here as the non-root archon user.
 #
 # Build (tag with the Archon version, e.g. archon-runner:0.5.0):
 #   docker build -t archon-runner:<version> \
@@ -25,20 +24,20 @@ ENV DEBIAN_FRONTEND=noninteractive
 # maintainer validated). CLAUDE_VERSION 'stable' / 'latest' / 'X.Y.Z' accepted.
 ARG CLAUDE_VERSION=2.1.211
 ARG BUN_VERSION=1.3.14
+ARG CODEX_VERSION=0.144.5
 ARG UV_VERSION=0.11.29
 
 # Runtime deps: git/bash/rsync for workflow work, ca-certificates+curl for the
-# installers, fuse-overlayfs as the overlay fallback, procps for in-container
-# process signalling (the Claude spawn kills by pid across `docker exec`),
-# unzip/xz for the bun/claude installers.
+# installers, procps for in-container process signalling, nodejs for Codex CLI (the Claude spawn kills
+# by pid across `docker exec`), unzip/xz for the bun/claude installers.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     git \
     bash \
     rsync \
-    fuse-overlayfs \
     procps \
+    nodejs \
     unzip \
     xz-utils \
     && rm -rf /var/lib/apt/lists/*
@@ -53,42 +52,47 @@ RUN curl -fsSL https://bun.sh/install | bash -s "bun-v${BUN_VERSION}" \
     && test -x /root/.bun/bin/bun \
     || (echo "FATAL: bun not found after install" >&2 && exit 1)
 
+# Codex CLI for Codex provider container transport.
+RUN /root/.bun/bin/bun add --global "@openai/codex@${CODEX_VERSION}" \
+    && test -x /root/.bun/bin/codex \
+    || (echo "FATAL: codex not found after install" >&2 && exit 1)
+
 # uv (script: nodes with runtime: uv) → /root/.local/bin/uv, pinned via the
 # versioned installer URL (https://astral.sh/uv/<version>/install.sh).
 RUN curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh \
     && test -x /root/.local/bin/uv \
     || (echo "FATAL: uv not found after install" >&2 && exit 1)
 
-ENV PATH="/root/.local/bin:/root/.bun/bin:${PATH}"
+# Move installed tools out of /root so the non-root runtime user can execute them.
+# Codex is ESM and needs its package.json/type + native package, so preserve the
+# global node_modules tree rather than copying only the generated bin shim.
+RUN mkdir -p /opt/codex \
+    && cp -a /root/.bun/install/global/node_modules /opt/codex/node_modules \
+    && printf '%s\n' '#!/bin/sh' 'exec node /opt/codex/node_modules/@openai/codex/bin/codex.js "$@"' > /usr/local/bin/codex \
+    && cp /root/.local/bin/claude /usr/local/bin/claude \
+    && cp /root/.local/bin/uv /usr/local/bin/uv \
+    && cp /root/.bun/bin/bun /usr/local/bin/bun \
+    && chmod 0755 /usr/local/bin/claude /usr/local/bin/uv /usr/local/bin/bun /usr/local/bin/codex
 
-# The merged overlay is mounted at the host's absolute cwd, whose files git would
-# otherwise flag as dubious-ownership. Trust every path (the container is
-# single-purpose and isolated).
+RUN useradd --create-home --uid 1000 --shell /bin/bash archon \
+    && mkdir -p /home/archon/.claude /home/archon/.cache /home/archon/.local/state \
+    && chown -R archon:archon /home/archon
+
+# The controller mounts the seeded workspace at the host's absolute cwd inside
+# the container. Trust every workspace path (single-purpose run container).
 RUN git config --system --add safe.directory '*'
 
-# Claude Code refuses --dangerously-skip-permissions as root UNLESS IS_SANDBOX=1.
-# We run in-container work as root under this flag deliberately: writing across
-# the host-owned read-only lower layer needs root, and the container is the
-# isolation-hardening boundary (read-only lower bind + overlay upper on a VM-local
-# volume + Archon-managed env only + approval-gated write-back, Phase C).
-#
-# SECURITY (read packages/isolation/docker/SECURITY.md): this is NOT a sandbox
-# against a hostile / prompt-injected agent when the container runs in `native`
-# overlay mode. Native mode grants CAP_SYS_ADMIN, so in-container root can
-# `mount -o remount,rw /mnt/lower` and write straight through the :ro bind to the
-# live host root — defeating the advertised isolation. The `fuse` mode (preferred,
-# no CAP_SYS_ADMIN) closes that escape but only mounts on rootless/userns daemons.
-# Non-root exec over overlay-on-bind is also fragile across storage drivers;
-# hardening to a uid-matched non-root user is follow-up.
 ENV IS_SANDBOX=1
+ENV HOME=/home/archon
+ENV CLAUDE_CONFIG_DIR=/home/archon/.claude
+ENV PATH="/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-# Claude session/config live on the upper VOLUME but OUTSIDE the overlay diff
-# (/mnt/upper/claude-home is a sibling of the overlay's data/work dirs), so they
-# survive a stop/start of the same run (Phase C) and never pollute the
-# write-back file diff.
-ENV CLAUDE_CONFIG_DIR=/mnt/upper/claude-home
-
-COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY src/egress /usr/local/lib/archon/egress
+RUN bun build /usr/local/lib/archon/egress/strict-https-proxy-cli.ts \
+      --target=node --outfile /usr/local/lib/archon/egress/strict-https-proxy-cli.mjs \
+    && test -f /usr/local/lib/archon/egress/proxy-budget-ledger-cli.ts \
+    && /usr/local/bin/bun --version \
+    && chmod +x /usr/local/bin/entrypoint.sh
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

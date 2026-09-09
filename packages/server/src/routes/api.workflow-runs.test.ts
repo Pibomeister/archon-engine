@@ -1502,6 +1502,181 @@ const MOCK_PAUSED_RUN: MockWorkflowRun = {
   },
 };
 
+const ORIGINAL_WEB_UI_ORIGIN = process.env.WEB_UI_ORIGIN;
+
+afterEach(() => {
+  if (ORIGINAL_WEB_UI_ORIGIN === undefined) {
+    delete process.env.WEB_UI_ORIGIN;
+  } else {
+    process.env.WEB_UI_ORIGIN = ORIGINAL_WEB_UI_ORIGIN;
+  }
+});
+
+function mockPausedApprovalRun(): void {
+  mockGetWorkflowRun.mockResolvedValue(MOCK_PAUSED_RUN);
+}
+
+async function postApproveWithHeaders(
+  headers: Record<string, string>,
+  url = 'http://localhost/api/workflows/runs/run-paused-1/approve'
+): Promise<Response> {
+  const { app } = makeApp();
+  return app.request(url, {
+    method: 'POST',
+    body: JSON.stringify({}),
+    headers: { 'Content-Type': 'application/json', ...headers },
+  });
+}
+
+describe('unsafe API method browser origin guard', () => {
+  beforeEach(() => {
+    delete process.env.WEB_UI_ORIGIN;
+    mockGetWorkflowRun.mockReset();
+    mockResolveApprovalGate.mockClear();
+    mockResolveAndCancelApprovalGate.mockClear();
+  });
+
+  test('rejects null, malformed, and cross-origin browser POSTs before approval mutation', async () => {
+    for (const origin of [
+      '',
+      'null',
+      '::::',
+      'http://evil.example',
+      'http://user@localhost',
+      'http://localhost/',
+      'http://localhost:3090',
+      'http://localhost, http://localhost',
+      'http://localhost http://evil.example',
+    ]) {
+      mockPausedApprovalRun();
+      const response = await postApproveWithHeaders({ Origin: origin });
+      expect(response.status).toBe(403);
+    }
+    expect(mockGetWorkflowRun).not.toHaveBeenCalled();
+    expect(mockResolveApprovalGate).not.toHaveBeenCalled();
+  });
+
+  test('rejects text/plain browser POSTs before approval mutation', async () => {
+    mockPausedApprovalRun();
+    const { app } = makeApp();
+    const response = await app.request('http://localhost/api/workflows/runs/run-paused-1/approve', {
+      method: 'POST',
+      body: '{}',
+      headers: { 'Content-Type': 'text/plain', Origin: 'http://evil.example' },
+    });
+
+    expect(response.status).toBe(403);
+    expect(mockGetWorkflowRun).not.toHaveBeenCalled();
+    expect(mockResolveApprovalGate).not.toHaveBeenCalled();
+  });
+
+  test('rejects absent-Origin browser fetches that claim cross-site or same-site context', async () => {
+    for (const fetchSite of ['cross-site', 'same-site', 'invalid', '']) {
+      mockPausedApprovalRun();
+      const response = await postApproveWithHeaders({ 'Sec-Fetch-Site': fetchSite });
+      expect(response.status).toBe(403);
+    }
+    expect(mockGetWorkflowRun).not.toHaveBeenCalled();
+    expect(mockResolveApprovalGate).not.toHaveBeenCalled();
+  });
+
+  test('preserves Origin-less native CLI compatibility', async () => {
+    mockPausedApprovalRun();
+    const response = await postApproveWithHeaders({});
+
+    expect(response.status).toBe(200);
+    expect(mockResolveApprovalGate).toHaveBeenCalled();
+  });
+
+  test('does not derive browser trust from forwarded headers or contradictory fetch metadata', async () => {
+    for (const headers of [
+      {
+        Origin: 'https://evil.example',
+        Forwarded: 'host=evil.example;proto=https',
+        'X-Forwarded-Host': 'evil.example',
+        'X-Forwarded-Proto': 'https',
+      },
+      { Origin: 'null', 'Sec-Fetch-Site': 'same-origin' },
+    ]) {
+      mockPausedApprovalRun();
+      const response = await postApproveWithHeaders(headers);
+      expect(response.status).toBe(403);
+    }
+    expect(mockGetWorkflowRun).not.toHaveBeenCalled();
+    expect(mockResolveApprovalGate).not.toHaveBeenCalled();
+  });
+
+  test('allows default same-origin localhost browser UI and configured web UI origin', async () => {
+    mockPausedApprovalRun();
+    let response = await postApproveWithHeaders({ Origin: 'http://localhost' });
+    expect(response.status).toBe(200);
+
+    mockResolveApprovalGate.mockClear();
+    process.env.WEB_UI_ORIGIN = 'https://ui.example.test';
+    mockPausedApprovalRun();
+    response = await postApproveWithHeaders(
+      { Origin: 'https://ui.example.test' },
+      'http://controller.internal/api/workflows/runs/run-paused-1/approve'
+    );
+    expect(response.status).toBe(200);
+    expect(mockResolveApprovalGate).toHaveBeenCalled();
+    response = await postApproveWithHeaders({ Origin: 'http://localhost' });
+    expect(response.status).toBe(200);
+  });
+
+  test('allows same-origin literal IPv4 and IPv6 browser UI', async () => {
+    for (const origin of ['http://127.0.0.1:3090', 'http://[::1]:3090']) {
+      mockPausedApprovalRun();
+      const response = await postApproveWithHeaders(
+        { Origin: origin },
+        origin + '/api/workflows/runs/run-paused-1/approve'
+      );
+      expect(response.status).toBe(200);
+    }
+  });
+
+  test('does not trust arbitrary same host-origin when default host is not localhost or literal IP', async () => {
+    mockPausedApprovalRun();
+    const response = await postApproveWithHeaders(
+      { Origin: 'http://archon.local' },
+      'http://archon.local/api/workflows/runs/run-paused-1/approve'
+    );
+
+    expect(response.status).toBe(403);
+    expect(mockGetWorkflowRun).not.toHaveBeenCalled();
+    expect(mockResolveApprovalGate).not.toHaveBeenCalled();
+  });
+
+  test('rejects wildcard or invalid configured web UI origins as untrusted', async () => {
+    for (const configured of [
+      '*',
+      'not a url',
+      'https://ui.example.test/path',
+      'https://ui.example.test?x=1',
+    ]) {
+      process.env.WEB_UI_ORIGIN = configured;
+      mockPausedApprovalRun();
+      const response = await postApproveWithHeaders({ Origin: 'http://localhost' });
+      expect(response.status).toBe(403);
+    }
+    expect(mockGetWorkflowRun).not.toHaveBeenCalled();
+    expect(mockResolveApprovalGate).not.toHaveBeenCalled();
+  });
+
+  test('narrows CORS read access to trusted origins', async () => {
+    const { app } = makeApp();
+    let response = await app.request('http://localhost/api/workflows/runs', {
+      headers: { Origin: 'http://evil.example' },
+    });
+    expect(response.headers.get('Access-Control-Allow-Origin')).toBeNull();
+
+    response = await app.request('http://localhost/api/workflows/runs', {
+      headers: { Origin: 'http://localhost' },
+    });
+    expect(response.headers.get('Access-Control-Allow-Origin')).toBe('http://localhost');
+  });
+});
+
 describe('POST /api/workflows/runs/:runId/approve', () => {
   beforeEach(() => {
     mockGetWorkflowRun.mockReset();
@@ -2370,6 +2545,41 @@ describe('GET /api/artifacts/:runId/* storage-key resolution', () => {
     expect(response.status).toBe(404);
     const body = (await response.json()) as { error: string };
     expect(body.error).toContain('could not resolve');
+  });
+
+  test('serves agent HTML and SVG as inert plaintext without MIME sniffing', async () => {
+    const runId = 'run-inert-artifacts';
+    const dir = join(wsRoot(), '_folder', 'my-ops-folder', 'artifacts', 'runs', runId);
+    await mkdir(dir, { recursive: true });
+    mockGetWorkflowRun.mockResolvedValue({
+      ...MOCK_RUNNING_RUN,
+      id: runId,
+      codebase_id: 'cb-folder',
+    });
+    mockGetCodebase.mockResolvedValue({
+      name: 'My Ops Folder',
+      kind: 'folder',
+      default_cwd: '/srv/ops',
+    });
+    const { app } = makeApp();
+    for (const [name, payload] of [
+      [
+        'plan-review.html',
+        '<script>fetch("/api/workflows/runs/run-inert-artifacts/approve", {method:"POST"})</script>',
+      ],
+      ['run-report.html', '<img src=x onerror="window.__agentExecuted=true">'],
+      [
+        'evidence.svg',
+        '<svg xmlns="http://www.w3.org/2000/svg" onload="window.__agentExecuted=true"/>',
+      ],
+    ]) {
+      await writeFile(join(dir, name), payload);
+      const response = await app.request(`/api/artifacts/${runId}/${name}`);
+      expect(response.status).toBe(200);
+      expect(response.headers.get('Content-Type')).toBe('text/plain; charset=utf-8');
+      expect(response.headers.get('X-Content-Type-Options')).toBe('nosniff');
+      expect(await response.text()).toBe(payload);
+    }
   });
 
   test('serves a folder project’s artifact (404 before #2200)', async () => {

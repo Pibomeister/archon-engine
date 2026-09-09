@@ -24,6 +24,42 @@ Archon is a workflow engine for AI coding agents. Define your development proces
 
 Like what Dockerfiles did for infrastructure and GitHub Actions did for CI/CD - Archon does for AI coding workflows. Think n8n, but for software development.
 
+## Goodword hardening checkpoint (2026-09-09)
+
+This branch is a Goodword hardening checkpoint, not a turnkey released SDLC. It captures the controller-boundary/runtime work needed by the matching Goodword workflow and API checkpoints so another machine can build and test the same work. It does not certify installation, publication, or production backfill execution.
+
+Cloneable sources after the checkpoint pushes:
+
+| Part | Source branch |
+|------|---------------|
+| Runtime | `git@github.com:Pibomeister/archon-engine.git` branch `hardening/controller-boundary` |
+| Workflow layer | `git@github.com:GoodwordTeam/archon.git` branch `checkpoint/archon-hardening-20260909` |
+| API counterpart | `git@github.com:GoodwordTeam/api.git` branch `checkpoint/archon-backfill-ledger-20260909` |
+
+Minimal runtime bootstrap from any checkout path:
+
+```bash
+git clone --branch hardening/controller-boundary git@github.com:Pibomeister/archon-engine.git archon-engine
+cd archon-engine
+bun install --frozen-lockfile
+bun run check:bundled
+bun run check:bundled-schema
+bun run check:capability-matrix
+bun run type-check
+bun run test
+```
+
+Build the runner image separately on each machine before exercising container isolation; pin the image tag in config for reproducible runs:
+
+```bash
+bun run build:runner-image
+# or: ARCHON_RUNNER_TAG=archon-runner:checkpoint-20260909 bun run build:runner-image
+```
+
+Checkpoint proof recorded outside this README includes native runtime/controller tests, API unit gates, and the owned-DB matrix. Treat counts as historical evidence, not a contract; rerun the commands above on the exact pushed branch before trusting a new checkout. Credentials, private controller state, `.omx` evidence, screenshots/images, and locally built runner images are not synced by Git.
+
+Known incomplete areas: install/publication paths and production-backfill apply paths remain intentionally disabled; strict subscription token-cap proof and full API/SPA/production wiring are still incomplete. Do not remove those guards or present this checkpoint as fully hardened.
+
 ## Why Archon?
 
 When you ask an AI agent to "fix this bug", what happens depends on the model's mood. It might skip planning. It might forget to run tests. It might write a PR description that ignores your template. Every run is different.
@@ -226,6 +262,14 @@ Register a project by clicking **+** next to "Project" in the chat sidebar - ent
 - **Workflow Execution** - Step-by-step progress view for any running or completed workflow
 
 **Monitoring hub:** The sidebar shows conversations from **all platforms** - not just the web. Workflows kicked off from the CLI, messages from Slack or Telegram, GitHub issue interactions - everything appears in one place.
+
+Browser API access is origin-restricted. Same-origin UI on `localhost` or a literal
+IP works by default. For a domain-hosted UI or a separate development UI, set
+`WEB_UI_ORIGIN` to its exact canonical HTTP(S) origin, such as
+`https://archon.example.com` or `http://localhost:5173` (no path or trailing slash).
+`*` is not accepted as a trusted origin. Origin-less native CLI requests remain
+supported. This prevents locally opened agent HTML from submitting controller
+mutations; it does not replace authentication for an exposed server.
 
 See the [Web UI Guide](https://archon.diy/adapters/web/) for full documentation.
 

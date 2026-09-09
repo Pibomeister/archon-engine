@@ -2072,6 +2072,31 @@ describe('natural-language approval routing', () => {
     );
   });
 
+  test('ordinary messages cannot approve a guarded workflow gate', async () => {
+    mockGetOrCreateConversation.mockReturnValueOnce(
+      Promise.resolve(makeConversation({ codebase_id: 'codebase-1' }))
+    );
+    mockGetPausedWorkflowRun.mockReturnValueOnce(
+      Promise.resolve(
+        makePausedRun({
+          metadata: {
+            isolation: 'container',
+            hardened_workflow_pin: { hardenedRequired: true },
+            approval: { type: 'approval', nodeId: 'gate-1', message: 'Review the frozen plan' },
+          },
+        })
+      )
+    );
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-1', "I don't know");
+    expect(mockResolveApprovalGate).not.toHaveBeenCalled();
+    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+    expect(platform.sendMessage).toHaveBeenCalledWith(
+      'conv-1',
+      expect.stringContaining('explicit human decision')
+    );
+  });
+
   test('natural language message with paused workflow intercepts and dispatches resume', async () => {
     const conversation = makeConversation({ codebase_id: 'codebase-1', cwd: '/repos/test-repo' });
     const codebase = makeApprovalCodebase();

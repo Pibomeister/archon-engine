@@ -11,8 +11,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DOCKER_DIR="${ROOT_DIR}/packages/isolation/docker"
-DOCKERFILE="${DOCKER_DIR}/runner.Dockerfile"
+DOCKER_CONTEXT="${ROOT_DIR}/packages/isolation"
+DOCKERFILE="${DOCKER_CONTEXT}/docker/runner.Dockerfile"
 
 VERSION="$(node -p "require('${ROOT_DIR}/package.json').version" 2>/dev/null || \
   bun -e "console.log(require('${ROOT_DIR}/package.json').version)")"
@@ -20,7 +20,7 @@ VERSION="$(node -p "require('${ROOT_DIR}/package.json').version" 2>/dev/null || 
 PRIMARY_TAG="${ARCHON_RUNNER_TAG:-archon-runner:${VERSION}}"
 
 echo "Building ${PRIMARY_TAG} from ${DOCKERFILE}"
-docker build -t "${PRIMARY_TAG}" -f "${DOCKERFILE}" "${DOCKER_DIR}"
+docker build -t "${PRIMARY_TAG}" -f "${DOCKERFILE}" "${DOCKER_CONTEXT}"
 
 # Also tag :latest for convenience (config can pin an explicit version tag).
 if [ -z "${ARCHON_RUNNER_TAG:-}" ]; then

@@ -446,6 +446,36 @@ export type CancelNode = z.infer<typeof cancelNodeSchema> & {
   script?: never;
 };
 
+export const controllerActionKindSchema = z.enum([
+  'verify-approval',
+  'finalize-evidence',
+  'publish',
+  'backfill',
+]);
+export const CONTROLLER_ACTION_KINDS = controllerActionKindSchema.options;
+export type ControllerActionKind = z.infer<typeof controllerActionKindSchema>;
+
+/**
+ * Controller action node schema — fixed enum privileged actions dispatched only
+ * through controller-private handlers. YAML supplies no executable body or endpoint.
+ */
+export const controllerActionNodeSchema = dagNodeBaseSchema.extend({
+  controller_action: controllerActionKindSchema,
+  phase: z.string().min(1, "'phase' must be a non-empty string").optional(),
+});
+
+/** DAG node that asks the trusted controller to perform a fixed privileged action */
+export type ControllerActionNode = z.infer<typeof controllerActionNodeSchema> & {
+  command?: never;
+  prompt?: never;
+  bash?: never;
+  loop?: never;
+  loop_group?: never;
+  approval?: never;
+  cancel?: never;
+  script?: never;
+};
+
 /**
  * Identifier grammar for an include input name.
  *
@@ -572,7 +602,7 @@ export type WorkflowNode = z.infer<typeof workflowNodeSchema> & {
   script?: never;
 };
 
-/** A single node in a DAG workflow. command, prompt, bash, loop, loop_group, approval, cancel, script, include, and workflow are mutually exclusive. */
+/** A single node in a DAG workflow. Mode fields are mutually exclusive. */
 export type DagNode =
   | CommandNode
   | PromptNode
@@ -581,6 +611,7 @@ export type DagNode =
   | LoopGroupNode
   | ApprovalNode
   | CancelNode
+  | ControllerActionNode
   | ScriptNode
   | IncludeNode
   | WorkflowNode;
@@ -683,6 +714,8 @@ export const dagNodeFlatSchema = dagNodeBaseSchema.extend({
   loop_group: loopGroupNodeConfigSchema.optional(),
   approval: approvalConfigSchema.optional(),
   cancel: z.string().optional(),
+  controller_action: controllerActionKindSchema.optional(),
+  phase: z.string().optional(),
   // Load-time inlining directive — the target workflow name.
   include: z.string().min(1, "'include' must be a non-empty workflow name").optional(),
   // Runtime sub-run directive (#2121 Phase 2) — the child workflow name.
@@ -777,6 +810,7 @@ export const dagNodeSchema = dagNodeFlatSchema
     const hasLoopGroup = data.loop_group !== undefined;
     const hasApproval = data.approval !== undefined;
     const hasCancel = typeof data.cancel === 'string' && data.cancel.trim().length > 0;
+    const hasControllerAction = data.controller_action !== undefined;
     const hasScript = typeof data.script === 'string' && data.script.trim().length > 0;
     const hasInclude = typeof data.include === 'string' && data.include.trim().length > 0;
     const hasWorkflow = typeof data.workflow === 'string' && data.workflow.trim().length > 0;
@@ -789,6 +823,7 @@ export const dagNodeSchema = dagNodeFlatSchema
       hasLoopGroup,
       hasApproval,
       hasCancel,
+      hasControllerAction,
       hasScript,
       hasInclude,
       hasWorkflow,
@@ -798,7 +833,7 @@ export const dagNodeSchema = dagNodeFlatSchema
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         message:
-          "'command', 'prompt', 'bash', 'loop', 'loop_group', 'approval', 'cancel', 'script', 'include', and 'workflow' are mutually exclusive",
+          "'command', 'prompt', 'bash', 'loop', 'loop_group', 'approval', 'cancel', 'controller_action', 'script', 'include', and 'workflow' are mutually exclusive",
       });
       return z.NEVER;
     }
@@ -945,7 +980,7 @@ export const dagNodeSchema = dagNodeFlatSchema
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         message:
-          "must have either 'command', 'prompt', 'bash', 'loop', 'loop_group', 'approval', 'cancel', 'script', 'include', or 'workflow'",
+          "must have either 'command', 'prompt', 'bash', 'loop', 'loop_group', 'approval', 'cancel', 'controller_action', 'script', 'include', or 'workflow'",
       });
       return z.NEVER;
     }
@@ -970,6 +1005,18 @@ export const dagNodeSchema = dagNodeFlatSchema
       }
     }
 
+    if (
+      (hasCommand || hasPrompt || hasLoop) &&
+      data.timeout !== undefined &&
+      (data.timeout <= 0 || !isFinite(data.timeout))
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "'timeout' must be a positive number (ms)",
+        path: ['timeout'],
+      });
+    }
+
     // Script node validations
     if (hasScript) {
       if (data.runtime === undefined) {
@@ -986,6 +1033,22 @@ export const dagNodeSchema = dagNodeFlatSchema
           path: ['timeout'],
         });
       }
+    }
+
+    if (hasControllerAction && (data.phase === undefined || data.phase.trim().length === 0)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "'phase' is required for controller_action nodes.",
+        path: ['phase'],
+      });
+    }
+
+    if (!hasControllerAction && data.phase !== undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "'phase' is only supported on controller_action nodes.",
+        path: ['phase'],
+      });
     }
 
     // Loop node: retry not supported
@@ -1040,6 +1103,7 @@ export const dagNodeSchema = dagNodeFlatSchema
     const base = {
       ...structuralBase,
       ...(data.idle_timeout !== undefined ? { idle_timeout: data.idle_timeout } : {}),
+      ...(data.timeout !== undefined ? { timeout: data.timeout } : {}),
       ...(data.always_run !== undefined ? { always_run: data.always_run } : {}),
       ...(data.output_type !== undefined ? { output_type: data.output_type } : {}),
     };
@@ -1104,6 +1168,14 @@ export const dagNodeSchema = dagNodeFlatSchema
     }
     if (data.cancel !== undefined && data.cancel.trim().length > 0) {
       return { ...base, ...shared, cancel: data.cancel.trim() } as CancelNode;
+    }
+    if (data.controller_action !== undefined) {
+      return {
+        ...base,
+        ...shared,
+        controller_action: data.controller_action,
+        ...(data.phase !== undefined ? { phase: data.phase.trim() } : {}),
+      } as ControllerActionNode;
     }
     if (data.include !== undefined && data.include.trim().length > 0) {
       // An include node is a load-time directive, not an executable node. It carries the
@@ -1198,6 +1270,11 @@ export function isCancelNode(node: DagNode): node is CancelNode {
   return 'cancel' in node && typeof node.cancel === 'string';
 }
 
+/** Type guard: check if a DAG node is a controller action node */
+export function isControllerActionNode(node: DagNode): node is ControllerActionNode {
+  return 'controller_action' in node && typeof node.controller_action === 'string';
+}
+
 /** Type guard: check if a DAG node is a script node */
 export function isScriptNode(node: DagNode): node is ScriptNode {
   return 'script' in node && typeof node.script === 'string';
@@ -1232,6 +1309,7 @@ export function isPersistableNode(node: DagNode): boolean {
     !isLoopGroupNode(node) &&
     !isApprovalNode(node) &&
     !isCancelNode(node) &&
+    !isControllerActionNode(node) &&
     !isScriptNode(node) &&
     !isBashNode(node) &&
     !isIncludeNode(node) &&

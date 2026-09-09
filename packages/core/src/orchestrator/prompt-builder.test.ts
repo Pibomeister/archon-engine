@@ -156,8 +156,6 @@ describe('buildRunManagementSection', () => {
       'archon workflow get',
       'archon workflow status',
       'archon workflow run',
-      'archon workflow approve',
-      'archon workflow reject',
       'archon workflow resume',
       'archon workflow abandon',
     ]) {
@@ -165,5 +163,8 @@ describe('buildRunManagementSection', () => {
     }
     expect(section).toContain('--json');
     expect(section).toContain('--detach');
+    expect(section).toContain('human-only');
+    expect(section).not.toContain('archon workflow approve');
+    expect(section).not.toContain('archon workflow reject');
   });
 });

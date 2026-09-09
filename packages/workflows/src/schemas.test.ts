@@ -6,8 +6,10 @@ import {
   isLoopNode,
   isLoopGroupNode,
   isIncludeNode,
+  isControllerActionNode,
   isTriggerRule,
   TRIGGER_RULES,
+  CONTROLLER_ACTION_KINDS,
   SCRIPT_NODE_AI_FIELDS,
   LOOP_NODE_AI_FIELDS,
   LOOP_GROUP_NODE_AI_FIELDS,
@@ -25,6 +27,7 @@ import type {
   CancelNode,
   ScriptNode,
   IncludeNode,
+  ControllerActionNode,
   TriggerRule,
 } from './schemas';
 
@@ -106,6 +109,69 @@ describe('isCancelNode', () => {
   test('returns false when cancel is not a string (malformed node)', () => {
     const malformed = { id: 'x', cancel: 42 } as unknown as DagNode;
     expect(isCancelNode(malformed)).toBe(false);
+  });
+});
+
+describe('isControllerActionNode', () => {
+  test('returns true for a controller action node', () => {
+    const actionNode: ControllerActionNode = {
+      id: 'publish',
+      controller_action: 'publish',
+      phase: 'release',
+    };
+    expect(isControllerActionNode(actionNode)).toBe(true);
+  });
+
+  test('parses the fixed controller action enum', () => {
+    for (const action of CONTROLLER_ACTION_KINDS) {
+      const result = dagNodeSchema.safeParse({
+        id: `act-${action}`,
+        controller_action: action,
+        phase: 'test-phase',
+      });
+      expect(result.success).toBe(true);
+      if (result.success)
+        expect(result.data).toEqual({
+          id: `act-${action}`,
+          controller_action: action,
+          phase: 'test-phase',
+        });
+    }
+  });
+
+  test('rejects unknown controller action names', () => {
+    const result = dagNodeSchema.safeParse({ id: 'act', controller_action: 'shell' });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.map(issue => issue.message).join('\n')).toContain(
+        'verify-approval'
+      );
+    }
+  });
+
+  test('requires an explicit phase for controller action nodes', () => {
+    const result = dagNodeSchema.safeParse({ id: 'act', controller_action: 'publish' });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.map(issue => issue.message).join('\n')).toContain(
+        "'phase' is required"
+      );
+    }
+  });
+
+  test('controller_action is mutually exclusive with script and bash', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'bad',
+      controller_action: 'publish',
+      script: 'console.log("publish")',
+      runtime: 'bun',
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.map(issue => issue.message).join('\n')).toContain(
+        'controller_action'
+      );
+    }
   });
 });
 

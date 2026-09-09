@@ -16,18 +16,27 @@ mock.module('@archon/paths', () => ({
 }));
 
 const mockQuery = mock(() => Promise.resolve(createQueryResult([])));
+const mockTxQuery = mock(() => Promise.resolve(createQueryResult([])));
+const mockWithTransaction = mock(
+  <T>(fn: (query: typeof mockTxQuery) => Promise<T>): Promise<T> => fn(mockTxQuery)
+);
 
 // Mock the connection module before importing the module under test
 mock.module('./connection', () => ({
   pool: {
     query: mockQuery,
   },
+  getDatabase: () => ({
+    withTransaction: mockWithTransaction,
+  }),
   getDialect: () => mockPostgresDialect,
   getDatabaseType: () => 'postgresql',
 }));
 
 import {
   createWorkflowEvent,
+  createWorkflowEventStrict,
+  createControllerCompletionEvent,
   listWorkflowEvents,
   listRecentEvents,
   getDagResumeSnapshot,
@@ -36,6 +45,9 @@ import {
 describe('workflow-events', () => {
   beforeEach(() => {
     mockQuery.mockClear();
+    mockTxQuery.mockReset();
+    mockTxQuery.mockImplementation(() => Promise.resolve(createQueryResult([])));
+    mockWithTransaction.mockClear();
     mockLogger.warn.mockClear();
   });
 
@@ -48,6 +60,138 @@ describe('workflow-events', () => {
     data: {},
     created_at: '2025-01-01T00:00:00.000Z',
   };
+
+  test('authority-bearing event writes propagate database failures', async () => {
+    mockQuery.mockRejectedValueOnce(new Error('audit database offline'));
+    await expect(
+      createWorkflowEventStrict({
+        workflow_run_id: 'run-authority',
+        event_type: 'node_completed',
+        step_name: 'freeze',
+        data: { type: 'controller_action' },
+      })
+    ).rejects.toThrow('audit database offline');
+  });
+
+  describe('createControllerCompletionEvent', () => {
+    const controllerEvent = {
+      workflow_run_id: 'run-controller',
+      event_type: 'node_completed',
+      step_name: 'publish',
+      data: { type: 'controller_action', action: 'publish' },
+    };
+
+    test('locks a running run and inserts the completion event atomically', async () => {
+      mockTxQuery.mockResolvedValueOnce(createQueryResult([{ id: 'run-controller' }]));
+      mockTxQuery.mockResolvedValueOnce(createQueryResult([]));
+
+      await createControllerCompletionEvent(controllerEvent, Date.now() + 10_000);
+
+      expect(mockWithTransaction).toHaveBeenCalledTimes(1);
+      expect(mockTxQuery).toHaveBeenNthCalledWith(
+        1,
+        expect.stringContaining("WHERE id = $1 AND status = 'running'"),
+        ['run-controller']
+      );
+      expect(mockTxQuery).toHaveBeenNthCalledWith(
+        2,
+        expect.stringContaining('INSERT INTO remote_agent_workflow_events'),
+        [
+          expect.any(String),
+          'run-controller',
+          'node_completed',
+          null,
+          'publish',
+          JSON.stringify({ type: 'controller_action', action: 'publish' }),
+        ]
+      );
+    });
+
+    test('rejects non-controller node completions before any database query', async () => {
+      await expect(
+        createControllerCompletionEvent(
+          { ...controllerEvent, data: { type: 'agent' } },
+          Date.now() + 10_000
+        )
+      ).rejects.toThrow('data.type must be controller_action');
+
+      expect(mockWithTransaction).not.toHaveBeenCalled();
+      expect(mockTxQuery).not.toHaveBeenCalled();
+    });
+
+    test('rejects non-node-completed events before any database query', async () => {
+      await expect(
+        createControllerCompletionEvent(
+          { ...controllerEvent, event_type: 'tool_completed' },
+          Date.now() + 10_000
+        )
+      ).rejects.toThrow('must be node_completed');
+
+      expect(mockWithTransaction).not.toHaveBeenCalled();
+      expect(mockTxQuery).not.toHaveBeenCalled();
+    });
+
+    test('rejects invalid deadlines before any database query', async () => {
+      await expect(createControllerCompletionEvent(controllerEvent, Infinity)).rejects.toThrow(
+        'deadline must be finite'
+      );
+
+      expect(mockWithTransaction).not.toHaveBeenCalled();
+      expect(mockTxQuery).not.toHaveBeenCalled();
+    });
+
+    test('writes no completion event when the run is missing or not running', async () => {
+      mockTxQuery.mockResolvedValueOnce(createQueryResult([]));
+
+      await expect(
+        createControllerCompletionEvent(controllerEvent, Date.now() + 10_000)
+      ).rejects.toThrow('requires a running workflow run');
+
+      expect(mockTxQuery).toHaveBeenCalledTimes(1);
+    });
+
+    test('writes no completion event when the deadline expires after locking', async () => {
+      mockTxQuery.mockResolvedValueOnce(createQueryResult([{ id: 'run-controller' }]));
+
+      await expect(
+        createControllerCompletionEvent(controllerEvent, Date.now() - 1)
+      ).rejects.toThrow('deadline expired');
+
+      expect(mockTxQuery).toHaveBeenCalledTimes(1);
+    });
+
+    test('propagates insert failure so the transaction rolls back', async () => {
+      mockTxQuery.mockResolvedValueOnce(createQueryResult([{ id: 'run-controller' }]));
+      mockTxQuery.mockRejectedValueOnce(new Error('event insert failed'));
+
+      await expect(
+        createControllerCompletionEvent(controllerEvent, Date.now() + 10_000)
+      ).rejects.toThrow('event insert failed');
+
+      expect(mockTxQuery).toHaveBeenCalledTimes(2);
+    });
+
+    test('rejects when the deadline expires after event insertion but before commit', async () => {
+      const originalNow = Date.now;
+      let checks = 0;
+      Date.now = () => {
+        checks += 1;
+        return checks === 1 ? 1_000 : 3_000;
+      };
+      mockTxQuery.mockResolvedValueOnce(createQueryResult([{ id: 'run-controller' }]));
+      mockTxQuery.mockResolvedValueOnce(createQueryResult([]));
+
+      try {
+        await expect(createControllerCompletionEvent(controllerEvent, 2_000)).rejects.toThrow(
+          'deadline expired'
+        );
+      } finally {
+        Date.now = originalNow;
+      }
+
+      expect(mockTxQuery).toHaveBeenCalledTimes(2);
+    });
+  });
 
   describe('createWorkflowEvent', () => {
     test('calls pool.query with correct SQL and parameters', async () => {
@@ -105,6 +249,19 @@ describe('workflow-events', () => {
   });
 
   describe('listWorkflowEvents', () => {
+    test('normalizes exact PostgreSQL BIGINT event orders without time/index fallback', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([{ ...mockEvent, event_order: '42' }]));
+      const result = await listWorkflowEvents('run-456');
+      expect(result[0]?.event_order).toBe(42);
+    });
+
+    test('rejects malformed or precision-losing database event orders', async () => {
+      for (const event_order of ['01', '1.0', '9007199254740993', '', -1, NaN, false]) {
+        mockQuery.mockResolvedValueOnce(createQueryResult([{ ...mockEvent, event_order }]));
+        await expect(listWorkflowEvents('run-456')).rejects.toThrow(/event order/);
+      }
+    });
+
     test('returns rows from query result', async () => {
       const events: WorkflowEventRow[] = [
         mockEvent,

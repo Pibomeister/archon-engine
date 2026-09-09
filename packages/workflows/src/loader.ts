@@ -40,11 +40,18 @@ import {
   webSearchModeSchema,
   workflowRequirementSchema,
   workflowEvidencePolicySchema,
+  workflowHardenedPolicySchema,
+  workflowBudgetPolicySchema,
   KNOWN_WORKFLOW_KEYS,
   KNOWN_WORKFLOW_NESTED_KEYS,
   WORKFLOW_ONLY_KEYS,
 } from './schemas/workflow';
-import type { WorkflowRequirement, WorkflowEvidencePolicy } from './schemas/workflow';
+import type {
+  WorkflowRequirement,
+  WorkflowEvidencePolicy,
+  WorkflowHardenedPolicy,
+  WorkflowBudgetPolicy,
+} from './schemas/workflow';
 import { workflowNodeHooksSchema } from './schemas/hooks';
 import { z } from '@hono/zod-openapi';
 
@@ -839,6 +846,40 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
       evidencePolicy = parsedEvidence.data;
     }
 
+    let hardenedPolicy: WorkflowHardenedPolicy | undefined;
+    if (raw.hardened !== undefined) {
+      const parsedHardened = workflowHardenedPolicySchema.safeParse(raw.hardened);
+      if (!parsedHardened.success) {
+        return {
+          workflow: null,
+          error: {
+            filename,
+            error:
+              'Invalid hardened policy: expected exactly { required: boolean }. Unsupported hardened fields are rejected so security settings cannot be silently dropped.',
+            errorType: 'validation_error',
+          },
+        };
+      }
+      hardenedPolicy = parsedHardened.data;
+    }
+
+    let budgetPolicy: WorkflowBudgetPolicy | undefined;
+    if (raw.budget !== undefined) {
+      const parsedBudget = workflowBudgetPolicySchema.safeParse(raw.budget);
+      if (!parsedBudget.success) {
+        return {
+          workflow: null,
+          error: {
+            filename,
+            error:
+              'Invalid budget policy: expected exactly { required: boolean }. Unsupported budget fields are rejected so durable budget requirements cannot be silently dropped.',
+            errorType: 'validation_error',
+          },
+        };
+      }
+      budgetPolicy = parsedBudget.data;
+    }
+
     // Parse mutates_checkout — boolean, omitted means true (run the path-lock guard).
     // Same parse/warn pattern as `interactive` (invalid non-boolean values are dropped).
     // When false, the executor skips the path-lock guard and allows concurrent runs on the same checkout.
@@ -1008,6 +1049,8 @@ export function parseWorkflow(content: string, filename: string): ParseResult {
         ...(worktreePolicy ? { worktree: worktreePolicy } : {}),
         ...(containerPolicy ? { container: containerPolicy } : {}),
         ...(evidencePolicy !== undefined ? { evidence_policy: evidencePolicy } : {}),
+        ...(hardenedPolicy !== undefined ? { hardened: hardenedPolicy } : {}),
+        ...(budgetPolicy !== undefined ? { budget: budgetPolicy } : {}),
         ...(tags !== undefined ? { tags } : {}),
         ...(requires !== undefined ? { requires } : {}),
       },

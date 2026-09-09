@@ -50,7 +50,7 @@ per-node YAML field for that provider; a ❌ means the field is accepted but ign
 | Sandbox (`sandbox`) | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Setting sources (`settingSources`) | ✅ | ❌ | ❌ | ❌ | ❌ |
 | In-process native tools | ✅ | ❌ | ❌ | ✅ | ❌ |
-| Container exec (folder-project container backend) | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Container exec (folder-project container backend) | ✅ | ✅ | ❌ | ❌ | ❌ |
 
 ## Caveats
 

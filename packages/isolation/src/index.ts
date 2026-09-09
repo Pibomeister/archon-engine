@@ -33,8 +33,12 @@ export type {
   WriteBackApplySummary,
   BackendPrepareRequest,
   PreparedEnv,
+  TrustedContainerArtifactSnapshot,
   IIsolationBackend,
   ContainerBackendConfig,
+  HardenedProxyBudgetSeed,
+  RestrictedEgressPolicyConfig,
+  VerifiedProxyBudgetStatus,
 } from './types';
 
 export { isPRIsolationRequest, CONTAINER_LABELS } from './types';
@@ -48,7 +52,30 @@ export type { ContainerBackendDeps } from './backends/container';
 
 // --- Container backend primitives (docker CLI wrapper) ---
 export { dockerCli, dockerPreflight, extractDockerError } from './container/docker-exec';
+export { snapshotContainerArtifacts } from './container/artifact-snapshot';
+export { normalizeEgressPolicy, encodeEgressPolicy, assertPublicAddress } from './egress/policy';
+export type { RestrictedEgressPolicy, RestrictedEgressTarget } from './egress/policy';
+export { encodeStrictEgressPolicy, decodeStrictEgressPolicy } from './egress/strict-policy';
+export { assertTrustedProviderBudgetPolicy } from './egress/provider-budget-contract';
+export type { TrustedProviderBudgetPolicy } from './egress/provider-budget-contract';
+export type { ProxyBudgetGrant } from './egress/proxy-budget-ledger';
 export type { DockerRunner, DockerExecOptions, DockerExecResult } from './container/docker-exec';
+export type {
+  ArtifactSnapshotFile,
+  ArtifactSnapshotOptions,
+  ArtifactSnapshotResult,
+  TrustedArtifactVolumeMetadata,
+} from './container/artifact-snapshot';
+export { BrowserObservationService } from './browser/browser-observation';
+export type {
+  ApplicationDescriptor,
+  BrowserObservationRequest,
+  BrowserObservationResult,
+  BrowserObservationServiceOptions,
+  BrowserPolicy,
+  CandidateSourceDescriptor,
+  CandidateSourceFile,
+} from './browser/browser-observation';
 
 // --- Store ---
 export type { IIsolationStore } from './store';

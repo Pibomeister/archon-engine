@@ -2,6 +2,11 @@
  * Codex SDK wrapper
  * Provides async generator interface for streaming Codex responses
  */
+import { mkdtemp, writeFile, chmod, rm } from 'fs/promises';
+import { randomBytes } from 'crypto';
+import { tmpdir } from 'os';
+import { dirname, join } from 'path';
+import { isIP } from 'node:net';
 import {
   Codex,
   type CodexOptions,
@@ -16,6 +21,7 @@ import type {
   MessageChunk,
   TokenUsage,
   ProviderCapabilities,
+  ExecutionContext,
 } from '../types';
 import { parseCodexConfig } from './config';
 import { CODEX_CAPABILITIES } from './capabilities';
@@ -37,10 +43,255 @@ function getLog(): ReturnType<typeof createLogger> {
 
 type CodexConfigOverrides = NonNullable<CodexOptions['config']>;
 type CodexConfigValue = CodexConfigOverrides[string];
+type CodexThread = ReturnType<Codex['startThread']>;
 
 interface ProviderWarning {
   code: string;
   message: string;
+}
+
+interface CodexAttemptInput {
+  codex: Codex;
+  thread: CodexThread;
+  threadOptions: ThreadOptions;
+  turnOptions: TurnOptions;
+  hasOutputFormat: boolean;
+  effectivePrompt: string;
+  cwd: string;
+  resumeSessionId: string | undefined;
+  sessionResumeFailed: boolean;
+  requestOptions: SendQueryOptions | undefined;
+}
+
+interface CodexAttempt {
+  index: number;
+  controller: AbortController;
+  dispose: () => void;
+}
+
+const CODEX_CONTAINER_ENV_ALLOWLIST = [
+  'CODEX_API_KEY',
+  'OPENAI_API_KEY',
+  'OPENAI_BASE_URL',
+  'CODEX_INTERNAL_ORIGINATOR_OVERRIDE',
+] as const;
+
+const CODEX_OPENAI_PROVIDER_NAMES = new Set(['openai', 'codex']);
+
+function normalizeSealedOpenAiBaseUrl(rawBaseUrl: string): string {
+  let url: URL;
+  try {
+    url = new URL(rawBaseUrl);
+  } catch {
+    throw new Error('Codex hardened provider origin is malformed.');
+  }
+  if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash) {
+    throw new Error('Codex hardened provider origin must be an exact HTTPS API root.');
+  }
+  if (url.pathname.replace(/\/$/, '') !== '/v1') {
+    throw new Error('Codex hardened provider origin must use the fixed /v1 API path.');
+  }
+  assertPublicHostname(url.hostname, 'Codex hardened provider origin');
+  return url.toString().replace(/\/$/, '');
+}
+
+function assertPublicHostname(hostname: string, label: string): void {
+  const normalized = hostname.toLowerCase().replace(/^\[(.*)]$/, '$1');
+  if (normalized === 'localhost' || normalized.endsWith('.localhost')) {
+    throw new Error(`${label} cannot target localhost.`);
+  }
+  if (isIP(normalized) !== 0) {
+    throw new Error(`${label} cannot target an IP literal.`);
+  }
+  if (!isDnsHostname(normalized)) {
+    throw new Error(`${label} must use an exact DNS hostname.`);
+  }
+}
+
+function isDnsHostname(hostname: string): boolean {
+  if (hostname.length < 1 || hostname.length > 253) return false;
+  const withoutRootDot = hostname.endsWith('.') ? hostname.slice(0, -1) : hostname;
+  if (withoutRootDot.length < 1) return false;
+  return withoutRootDot.split('.').every(isDnsLabel);
+}
+
+function isDnsLabel(label: string): boolean {
+  return /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label);
+}
+
+function sealedOpenAiBaseUrl(execContext: ExecutionContext | undefined): string | undefined {
+  if (execContext?.kind !== 'container') return undefined;
+  if (execContext.profile !== 'hardened') return undefined;
+  const matches = (execContext.providerOrigins ?? []).filter(origin =>
+    CODEX_OPENAI_PROVIDER_NAMES.has(origin.provider.toLowerCase())
+  );
+  if (matches.length !== 1) {
+    throw new Error(
+      'Codex hardened container execution requires exactly one controller-sealed OpenAI origin.'
+    );
+  }
+  return normalizeSealedOpenAiBaseUrl(matches[0].baseUrl);
+}
+
+function buildSealedCodexOptions(
+  requestEnv: Record<string, string> | undefined,
+  codexConfigOverrides: CodexConfigOverrides | undefined,
+  execContext: ExecutionContext | undefined
+): { env?: Record<string, string>; baseUrl?: string; config?: CodexConfigOverrides } {
+  const sealedBaseUrl = sealedOpenAiBaseUrl(execContext);
+  if (!sealedBaseUrl) {
+    return {
+      ...(requestEnv && Object.keys(requestEnv).length > 0 ? { env: requestEnv } : {}),
+      ...(codexConfigOverrides ? { config: codexConfigOverrides } : {}),
+    };
+  }
+  const requestedBaseUrl = requestEnv?.OPENAI_BASE_URL;
+  if (
+    requestedBaseUrl !== undefined &&
+    normalizeSealedOpenAiBaseUrl(requestedBaseUrl) !== sealedBaseUrl
+  ) {
+    throw new Error(
+      'Codex hardened provider origin override does not match controller-sealed origin.'
+    );
+  }
+  const env = requestEnv
+    ? { ...requestEnv, OPENAI_BASE_URL: sealedBaseUrl }
+    : { OPENAI_BASE_URL: sealedBaseUrl };
+  const config = {
+    ...codexConfigOverrides,
+    ...sealedOpenAiConfig(sealedBaseUrl),
+  };
+  return {
+    env,
+    baseUrl: sealedBaseUrl,
+    config,
+  };
+}
+
+function sealedOpenAiConfig(sealedBaseUrl: string): CodexConfigOverrides {
+  return {
+    model_provider: 'archon-openai',
+    openai_base_url: sealedBaseUrl,
+    model_providers: {
+      'archon-openai': {
+        name: 'OpenAI',
+        base_url: sealedBaseUrl,
+        env_key: 'OPENAI_API_KEY',
+        wire_api: 'responses',
+        supports_websockets: false,
+      },
+    },
+  };
+}
+
+function validateDockerToken(kind: string, value: string): void {
+  if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(value)) {
+    throw new Error(`Invalid Codex container ${kind}: '${value}'.`);
+  }
+}
+
+function shQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+export function buildCodexContainerWrapperScript(
+  execContext: Extract<ExecutionContext, { kind: 'container' }>,
+  executionToken = 'manual'
+): string {
+  if (execContext.profile !== 'hardened') {
+    throw new Error('Codex container execution requires execContext.profile=hardened.');
+  }
+  validateDockerToken('id', execContext.containerId);
+  validateDockerToken('execution token', executionToken);
+  const execUser = execContext.execUser ?? 'archon';
+  validateDockerToken('user', execUser);
+  const envArgs = CODEX_CONTAINER_ENV_ALLOWLIST.map(name => `  --env ${name} \\`).join('\n');
+  return [
+    '#!/bin/sh',
+    'set -eu',
+    'exec docker exec -i \\',
+    `  --user ${shQuote(execUser)} \\`,
+    envArgs,
+    `  --env ARCHON_CODEX_EXEC_TOKEN=${shQuote(executionToken)} \\`,
+    `  ${shQuote(execContext.containerId)} codex "$@"`,
+    '',
+  ].join('\n');
+}
+
+async function createCodexContainerWrapper(
+  execContext: Extract<ExecutionContext, { kind: 'container' }>
+): Promise<string> {
+  const dir = await mkdtemp(join(tmpdir(), 'archon-codex-container-'));
+  const wrapperPath = join(dir, 'codex');
+  await writeFile(
+    wrapperPath,
+    buildCodexContainerWrapperScript(execContext, randomBytes(8).toString('hex')),
+    { mode: 0o700 }
+  );
+  await chmod(wrapperPath, 0o700);
+  return wrapperPath;
+}
+
+function buildCodexContainerEnv(requestEnv?: Record<string, string>): Record<string, string> {
+  const env: Record<string, string> = {
+    PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin',
+  };
+  for (const key of CODEX_CONTAINER_ENV_ALLOWLIST) {
+    const value = requestEnv?.[key];
+    if (value !== undefined) env[key] = value;
+  }
+  return env;
+}
+
+interface ContainerAbortStopper {
+  dispose: () => void;
+  wait: () => Promise<void>;
+}
+
+async function stopContainer(containerId: string): Promise<void> {
+  validateDockerToken('id', containerId);
+  const proc = Bun.spawn(['docker', 'stop', containerId], {
+    stdout: 'ignore',
+    stderr: 'pipe',
+  });
+  const exitCode = await proc.exited;
+  if (exitCode !== 0) {
+    const stderr = await new Response(proc.stderr).text();
+    throw new Error(
+      `Codex container cancellation failed: docker stop ${containerId} exited ${exitCode}.${stderr ? ` ${stderr.trim()}` : ''}`
+    );
+  }
+}
+
+// Codex SDK cancellation does not expose the in-container child PID. Hardened
+// container cancellation is therefore per-run-container fail-stop: stop the owned
+// container, preserve named volumes, and let runtime resume recreate it from volume
+// state instead of trusting an agent-writable PID file.
+function stopCodexContainerOnAbort(
+  execContext: ExecutionContext | undefined,
+  abortSignal: AbortSignal | undefined
+): ContainerAbortStopper | undefined {
+  if (execContext?.kind !== 'container' || !abortSignal) return undefined;
+  if (execContext.profile !== 'hardened') {
+    throw new Error('Codex container cancellation requires execContext.profile=hardened.');
+  }
+  let stopPromise: Promise<void> | undefined;
+  const requestStop = (): void => {
+    stopPromise ??= stopContainer(execContext.containerId);
+  };
+  if (abortSignal.aborted) {
+    requestStop();
+  } else {
+    abortSignal.addEventListener('abort', requestStop, { once: true });
+  }
+  return {
+    dispose: (): void => {
+      abortSignal.removeEventListener('abort', requestStop);
+    },
+    wait: async (): Promise<void> => {
+      if (stopPromise) await stopPromise;
+    },
+  };
 }
 
 // Singleton Codex instance (async because binary path resolution is async)
@@ -107,6 +358,35 @@ function buildMcpEnvSource(
   requestEnv?: Record<string, string>
 ): Record<string, string | undefined> {
   return requestEnv ? { ...process.env, ...requestEnv } : process.env;
+}
+
+function assertCodexContainerRequestSupported(requestOptions?: SendQueryOptions): void {
+  if (requestOptions?.execContext?.kind !== 'container') return;
+  if (requestOptions.nodeConfig?.mcp) {
+    throw new Error(
+      'Codex container execution does not support MCP config until controller-pinned MCP settings are implemented.'
+    );
+  }
+  if (requestOptions.nativeTools && requestOptions.nativeTools.length > 0) {
+    throw new Error(
+      'Codex container execution does not support native tools until controller-pinned MCP settings are implemented.'
+    );
+  }
+}
+
+function createCodexAttempt(index: number, abortSignal: AbortSignal | undefined): CodexAttempt {
+  const controller = new AbortController();
+  const onCallerAbort = (): void => {
+    controller.abort();
+  };
+  if (abortSignal) abortSignal.addEventListener('abort', onCallerAbort, { once: true });
+  return {
+    index,
+    controller,
+    dispose: (): void => {
+      if (abortSignal) abortSignal.removeEventListener('abort', onCallerAbort);
+    },
+  };
 }
 
 const CODEX_MCP_PASSTHROUGH_KEYS = [
@@ -266,15 +546,28 @@ function classifyCodexError(
   return 'unknown';
 }
 
-function extractUsageFromCodexEvent(event: TurnCompletedEvent): TokenUsage {
+function extractUsageFromCodexEvent(event: TurnCompletedEvent): TokenUsage | undefined {
   if (!event.usage) {
-    getLog().warn({ eventType: event.type }, 'codex.usage_null_on_turn_completed');
-    return { input: 0, output: 0 };
+    getLog().warn({ eventType: event.type }, 'codex.usage_missing_on_turn_completed');
+    return undefined;
   }
+  const input = readCodexUsageCount(event.usage, 'input_tokens');
+  const output = readCodexUsageCount(event.usage, 'output_tokens');
   return {
-    input: event.usage.input_tokens,
-    output: event.usage.output_tokens,
+    input,
+    output,
   };
+}
+
+function readCodexUsageCount(
+  usage: TurnCompletedEvent['usage'],
+  key: 'input_tokens' | 'output_tokens'
+): number {
+  const value = usage[key];
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`Codex turn.completed usage ${key} is malformed.`);
+  }
+  return value;
 }
 
 // ─── Turn Options Builder ────────────────────────────────────────────────
@@ -372,6 +665,9 @@ interface CodexStreamState {
   lastTodoListSignature?: string;
   startedToolItemIds: Set<string>;
   completedToolItemIds: Set<string>;
+  accumulatedText: string;
+  resolvedThreadId: string | null | undefined;
+  lastNonMcpError?: string;
 }
 
 function getMcpToolName(item: Record<string, unknown>): string {
@@ -395,27 +691,14 @@ async function* streamCodexEvents(
   const state: CodexStreamState = {
     startedToolItemIds: new Set<string>(),
     completedToolItemIds: new Set<string>(),
+    accumulatedText: '',
+    resolvedThreadId: threadId,
   };
-  let accumulatedText = '';
-
-  // A new thread's id is assigned during the run via the `thread.started` event
-  // (the SDK emits it only for new threads), not synchronously on startThread().
-  // Capture it so the terminal result chunk surfaces a resumable sessionId —
-  // persist_session and suspend/resume depend on it. A resumed thread keeps the
-  // snapshot id (no thread.started fires), so the seeded value stays correct.
-  let resolvedThreadId: string | null | undefined = threadId;
 
   if (abortSignal?.aborted) {
     getLog().info('query_aborted_before_stream');
     throw new Error('Query aborted');
   }
-
-  // If the iterator closes without a terminal event (e.g. the model was
-  // rejected before the turn even started), we synthesize a fail-stop result
-  // after the loop so the dag-executor's `msg.isError` branch catches it
-  // — matching Claude's contract. Both terminal branches below `return`,
-  // so reaching the post-loop block can only mean no terminal fired.
-  let lastNonMcpError: string | undefined;
 
   for await (const event of events) {
     if (abortSignal?.aborted) {
@@ -423,326 +706,11 @@ async function* streamCodexEvents(
       throw new Error('Query aborted');
     }
 
-    if (event.type === 'thread.started') {
-      // Capture the new thread's id. Its SDK doc comment reads: "The identifier
-      // of the new thread. Can be used to resume the thread later." This is the
-      // only place a new thread's id surfaces. `continue` — the event carries no
-      // user-facing content, only this metadata.
-      const startedThreadId = (event as ThreadStartedEvent).thread_id;
-      if (startedThreadId) {
-        resolvedThreadId = startedThreadId;
-        getLog().info({ threadId: startedThreadId }, 'codex.thread_started');
-      } else {
-        // The SDK types thread_id as a non-empty string, so this should never
-        // fire. If it does, a new thread would surface sessionId: undefined and
-        // the dag-executor would treat the run as session-less — silently
-        // dropping any persist_session continuity. Warn rather than degrade
-        // quietly (CLAUDE.md: Fail Fast + Explicit Errors).
-        getLog().warn({ snapshotThreadId: resolvedThreadId }, 'codex.thread_started_missing_id');
-      }
-      continue;
-    }
-
-    if (event.type === 'item.started') {
-      const item = event.item as Record<string, unknown>;
-      const itemType = item.type as string;
-      const itemId = item.id as string;
-      getLog().debug({ eventType: event.type, itemType, itemId }, 'item_started');
-
-      let toolName: string | undefined;
-      if (itemType === 'command_execution') {
-        if (typeof item.command === 'string' && item.command.length > 0) {
-          toolName = item.command;
-        } else {
-          getLog().warn({ itemId }, 'command_execution_missing_command');
-        }
-      } else if (itemType === 'web_search') {
-        if (typeof item.query === 'string' && item.query.length > 0) {
-          toolName = `🔍 Searching: ${item.query}`;
-        } else {
-          getLog().debug({ itemId }, 'web_search_missing_query');
-        }
-      } else if (itemType === 'mcp_tool_call') {
-        toolName = getMcpToolName(item);
-      }
-
-      if (toolName && itemId && !state.startedToolItemIds.has(itemId)) {
-        state.startedToolItemIds.add(itemId);
-        yield { type: 'tool', toolName, toolCallId: itemId };
-      }
-      continue;
-    }
-
-    if (event.type === 'error') {
-      const errorEvent = event as { message: string };
-      getLog().error({ message: errorEvent.message }, 'stream_error');
-      // MCP client errors are non-fatal — Codex retries internally and may
-      // still reach turn.completed. Other errors are captured; whether they
-      // are fatal is decided when the stream terminates: turn.completed
-      // means the SDK recovered, so the captured error is dropped; loop
-      // closure without a terminal means the captured error caused the
-      // stream to abort and is surfaced as the failure cause.
-      const isMcpClientError = errorEvent.message.toLowerCase().includes('mcp client');
-      if (!isMcpClientError) {
-        lastNonMcpError = errorEvent.message;
-      } else if (surfaceMcpClientErrors) {
-        // MCP was explicitly configured for this node — surface MCP client
-        // errors as system warnings so the workflow author can diagnose.
-        yield { type: 'system', content: `⚠️ ${errorEvent.message}` };
-      }
-      continue;
-    }
-
-    if (event.type === 'turn.failed') {
-      const errorObj = (event as { error?: { message?: string } }).error;
-      const errorMessage = errorObj?.message ?? 'Unknown error';
-      getLog().error({ errorMessage }, 'turn_failed');
-      yield {
-        type: 'result',
-        sessionId: resolvedThreadId ?? undefined,
-        isError: true,
-        errorSubtype: 'codex_turn_failed',
-        errors: [errorMessage],
-      };
-      return;
-    }
-
-    if (event.type === 'item.completed') {
-      const item = event.item as Record<string, unknown>;
-      const itemType = item.type as string;
-
-      const logContext: Record<string, unknown> = {
-        eventType: event.type,
-        itemType,
-        itemId: item.id,
-      };
-      if (itemType === 'command_execution' && item.command) {
-        logContext.command = item.command;
-      }
-      getLog().debug(logContext, 'item_completed');
-
-      const itemId = item.id as string;
-      const isToolItem =
-        itemType === 'command_execution' ||
-        itemType === 'web_search' ||
-        itemType === 'mcp_tool_call';
-      if (isToolItem) {
-        if (state.completedToolItemIds.has(itemId)) {
-          getLog().warn({ itemId, itemType }, 'tool_item_duplicate_completion');
-          continue;
-        }
-        state.completedToolItemIds.add(itemId);
-        if (!state.startedToolItemIds.has(itemId)) {
-          getLog().warn({ itemId, itemType }, 'tool_item_completed_without_start');
-        }
-      }
-
-      switch (itemType) {
-        case 'agent_message':
-          if (item.text) {
-            // Multiple agent_message items can arrive in one turn (preamble + answer);
-            // keep only the last — it's the authoritative structured-output candidate.
-            if (hasOutputFormat) accumulatedText = item.text as string;
-            yield { type: 'assistant', content: item.text as string };
-          }
-          break;
-
-        case 'command_execution':
-          if (item.command) {
-            const cmd = item.command as string;
-            const exitCode = item.exit_code as number | null | undefined;
-            const exitSuffix =
-              exitCode != null && exitCode !== 0 ? `\n[exit code: ${String(exitCode)}]` : '';
-            let toolOutcome: 'success' | 'error' | 'unknown';
-            if (exitCode === 0) {
-              toolOutcome = 'success';
-            } else if (exitCode == null) {
-              toolOutcome = 'unknown';
-            } else {
-              toolOutcome = 'error';
-            }
-            yield {
-              type: 'tool_result',
-              toolName: cmd,
-              toolOutput: ((item.aggregated_output as string) ?? '') + exitSuffix,
-              toolCallId: itemId,
-              toolOutcome,
-              ...(exitCode != null ? { exitCode } : {}),
-            };
-          } else {
-            getLog().warn({ itemId: item.id }, 'command_execution_missing_command');
-          }
-          break;
-
-        case 'reasoning':
-          if (item.text) {
-            yield { type: 'thinking', content: item.text as string };
-          }
-          break;
-
-        case 'web_search':
-          if (item.query) {
-            const searchToolName = `🔍 Searching: ${item.query as string}`;
-            yield {
-              type: 'tool_result',
-              toolName: searchToolName,
-              toolOutput: '',
-              toolCallId: itemId,
-              toolOutcome: 'unknown',
-            };
-          } else {
-            getLog().debug({ itemId: item.id }, 'web_search_missing_query');
-          }
-          break;
-
-        case 'todo_list': {
-          const items = item.items as { text?: string; completed?: boolean }[] | undefined;
-          if (Array.isArray(items) && items.length > 0) {
-            const normalizedItems = items.map(t => ({
-              text: typeof t.text === 'string' ? t.text : '(unnamed task)',
-              completed: t.completed ?? false,
-            }));
-            const signature = JSON.stringify(normalizedItems);
-            if (signature !== state.lastTodoListSignature) {
-              state.lastTodoListSignature = signature;
-              const taskList = normalizedItems
-                .map(t => `${t.completed ? '✅' : '⬜'} ${t.text}`)
-                .join('\n');
-              yield { type: 'system', content: `📋 Tasks:\n${taskList}` };
-            }
-          } else {
-            getLog().debug({ itemId: item.id }, 'todo_list_empty_or_invalid');
-          }
-          break;
-        }
-
-        case 'file_change': {
-          const statusIcon = (item.status as string) === 'failed' ? '❌' : '✅';
-          const rawError = 'error' in item ? (item as { error?: unknown }).error : undefined;
-          const fileErrorMessage =
-            typeof rawError === 'string'
-              ? rawError
-              : typeof rawError === 'object' && rawError !== null && 'message' in rawError
-                ? String((rawError as { message: unknown }).message)
-                : undefined;
-
-          const changes = item.changes as { kind: string; path?: string }[] | undefined;
-          if (Array.isArray(changes) && changes.length > 0) {
-            const changeList = changes
-              .map(c => {
-                const icon = c.kind === 'add' ? '➕' : c.kind === 'delete' ? '➖' : '📝';
-                return `${icon} ${c.path ?? '(unknown file)'}`;
-              })
-              .join('\n');
-            const errorSuffix =
-              (item.status as string) === 'failed' && fileErrorMessage
-                ? `\n${fileErrorMessage}`
-                : '';
-            yield {
-              type: 'system',
-              content: `${statusIcon} File changes:\n${changeList}${errorSuffix}`,
-            };
-          } else if ((item.status as string) === 'failed') {
-            getLog().warn(
-              { itemId: item.id, status: item.status },
-              'file_change_failed_no_changes'
-            );
-            const failMsg = fileErrorMessage
-              ? `❌ File change failed: ${fileErrorMessage}`
-              : '❌ File change failed';
-            yield { type: 'system', content: failMsg };
-          } else {
-            getLog().debug({ itemId: item.id, status: item.status }, 'file_change_no_changes');
-          }
-          break;
-        }
-
-        case 'mcp_tool_call': {
-          const server = item.server as string | undefined;
-          const tool = item.tool as string | undefined;
-          const mcpToolName = getMcpToolName(item);
-
-          if ((item.status as string) === 'failed') {
-            getLog().warn(
-              { server, tool, error: item.error, itemId: item.id },
-              'mcp_tool_call_failed'
-            );
-            const mcpError = item.error as { message?: string } | undefined;
-            const errMsg = mcpError?.message
-              ? `❌ Error: ${mcpError.message}`
-              : '❌ Error: MCP tool failed';
-            yield {
-              type: 'tool_result',
-              toolName: mcpToolName,
-              toolOutput: errMsg,
-              toolCallId: itemId,
-              toolOutcome: 'error',
-            };
-          } else {
-            let toolOutput = '';
-            const mcpResult = item.result as { content?: unknown } | undefined;
-            if (mcpResult?.content) {
-              if (Array.isArray(mcpResult.content)) {
-                toolOutput = JSON.stringify(mcpResult.content);
-              } else {
-                getLog().warn(
-                  {
-                    itemId: item.id,
-                    server,
-                    tool,
-                    resultType: typeof mcpResult.content,
-                  },
-                  'mcp_tool_call_unexpected_result_shape'
-                );
-              }
-            }
-            yield {
-              type: 'tool_result',
-              toolName: mcpToolName,
-              toolOutput,
-              toolCallId: itemId,
-              toolOutcome: 'success',
-            };
-          }
-          break;
-        }
-      }
-    }
-
-    if (event.type === 'turn.completed') {
-      getLog().debug('turn_completed');
-      const usage = extractUsageFromCodexEvent(event as TurnCompletedEvent);
-
-      // Codex returns structured output inline in agent_message text.
-      // Normalize: parse as JSON and put on structuredOutput so the
-      // dag-executor can handle all providers uniformly.
-      let structuredOutput: unknown;
-      if (hasOutputFormat && accumulatedText) {
-        try {
-          structuredOutput = JSON.parse(accumulatedText);
-          getLog().debug('codex.structured_output_parsed');
-        } catch {
-          getLog().warn(
-            { outputPreview: accumulatedText.slice(0, 200) },
-            'codex.structured_output_not_json'
-          );
-          yield {
-            type: 'system',
-            content:
-              '⚠️ Structured output requested but Codex returned non-JSON text. ' +
-              'Downstream $nodeId.output.field references may not evaluate correctly.',
-          };
-        }
-      }
-
-      yield {
-        type: 'result',
-        sessionId: resolvedThreadId ?? undefined,
-        tokens: usage,
-        ...(structuredOutput !== undefined ? { structuredOutput } : {}),
-      };
-      return;
-    }
+    const terminal = yield* handleCodexStreamEvent(event, state, {
+      hasOutputFormat,
+      surfaceMcpClientErrors,
+    });
+    if (terminal) return;
   }
 
   // Reaching here means the iterator closed without yielding turn.completed
@@ -753,15 +721,430 @@ async function* streamCodexEvents(
   // turns this into a thrown node failure — distinct from the empty-output
   // guard further down, which returns `{ state: 'failed' }` for AI nodes
   // that streamed nothing but never raised an isError.
-  const message = lastNonMcpError ?? 'Codex stream closed without turn.completed or turn.failed';
+  const message =
+    state.lastNonMcpError ?? 'Codex stream closed without turn.completed or turn.failed';
   getLog().error({ message }, 'stream_incomplete');
   yield {
     type: 'result',
-    sessionId: resolvedThreadId ?? undefined,
+    sessionId: state.resolvedThreadId ?? undefined,
     isError: true,
     errorSubtype: 'codex_stream_incomplete',
     errors: [message],
   };
+}
+
+interface CodexStreamOptions {
+  hasOutputFormat: boolean;
+  surfaceMcpClientErrors: boolean;
+}
+
+async function* handleCodexStreamEvent(
+  event: Record<string, unknown>,
+  state: CodexStreamState,
+  options: CodexStreamOptions
+): AsyncGenerator<MessageChunk, boolean> {
+  switch (event.type) {
+    case 'thread.started':
+      handleThreadStarted(event as unknown as ThreadStartedEvent, state);
+      return false;
+    case 'item.started':
+      yield* handleItemStarted(event, state);
+      return false;
+    case 'error':
+      yield* handleStreamError(event, state, options.surfaceMcpClientErrors);
+      return false;
+    case 'turn.failed':
+      yield turnFailedResult(event, state.resolvedThreadId);
+      return true;
+    case 'item.completed':
+      yield* handleItemCompleted(event, state, options.hasOutputFormat);
+      return false;
+    case 'turn.completed':
+      yield* handleTurnCompleted(event as TurnCompletedEvent, state, options.hasOutputFormat);
+      return true;
+    default:
+      return false;
+  }
+}
+
+function handleThreadStarted(event: ThreadStartedEvent, state: CodexStreamState): void {
+  const startedThreadId = event.thread_id;
+  if (startedThreadId) {
+    state.resolvedThreadId = startedThreadId;
+    getLog().info({ threadId: startedThreadId }, 'codex.thread_started');
+    return;
+  }
+  getLog().warn({ snapshotThreadId: state.resolvedThreadId }, 'codex.thread_started_missing_id');
+}
+
+async function* handleItemStarted(
+  event: Record<string, unknown>,
+  state: CodexStreamState
+): AsyncGenerator<MessageChunk> {
+  const item = event.item as Record<string, unknown>;
+  const itemType = item.type as string;
+  const itemId = item.id as string;
+  getLog().debug({ eventType: event.type, itemType, itemId }, 'item_started');
+  const toolName = startedToolName(item, itemType, itemId);
+  if (toolName && itemId && !state.startedToolItemIds.has(itemId)) {
+    state.startedToolItemIds.add(itemId);
+    yield { type: 'tool', toolName, toolCallId: itemId };
+  }
+}
+
+function startedToolName(
+  item: Record<string, unknown>,
+  itemType: string,
+  itemId: string
+): string | undefined {
+  if (itemType === 'command_execution') return commandToolName(item, itemId);
+  if (itemType === 'web_search') return webSearchToolName(item, itemId);
+  if (itemType === 'mcp_tool_call') return getMcpToolName(item);
+  return undefined;
+}
+
+function commandToolName(item: Record<string, unknown>, itemId: string): string | undefined {
+  if (typeof item.command === 'string' && item.command.length > 0) return item.command;
+  getLog().warn({ itemId }, 'command_execution_missing_command');
+  return undefined;
+}
+
+function webSearchToolName(item: Record<string, unknown>, itemId: string): string | undefined {
+  if (typeof item.query === 'string' && item.query.length > 0) return `🔍 Searching: ${item.query}`;
+  getLog().debug({ itemId }, 'web_search_missing_query');
+  return undefined;
+}
+
+async function* handleStreamError(
+  event: Record<string, unknown>,
+  state: CodexStreamState,
+  surfaceMcpClientErrors: boolean
+): AsyncGenerator<MessageChunk> {
+  const errorEvent = event as { message: string };
+  getLog().error({ message: errorEvent.message }, 'stream_error');
+  const isMcpClientError = errorEvent.message.toLowerCase().includes('mcp client');
+  if (!isMcpClientError) {
+    state.lastNonMcpError = errorEvent.message;
+  } else if (surfaceMcpClientErrors) {
+    yield { type: 'system', content: `⚠️ ${errorEvent.message}` };
+  }
+}
+
+function turnFailedResult(
+  event: Record<string, unknown>,
+  threadId: string | null | undefined
+): MessageChunk {
+  const errorObj = (event as { error?: { message?: string } }).error;
+  const errorMessage = errorObj?.message ?? 'Unknown error';
+  getLog().error({ errorMessage }, 'turn_failed');
+  return {
+    type: 'result',
+    sessionId: threadId ?? undefined,
+    isError: true,
+    errorSubtype: 'codex_turn_failed',
+    errors: [errorMessage],
+  };
+}
+
+async function* handleItemCompleted(
+  event: Record<string, unknown>,
+  state: CodexStreamState,
+  hasOutputFormat: boolean
+): AsyncGenerator<MessageChunk> {
+  const item = event.item as Record<string, unknown>;
+  const itemType = item.type as string;
+  const itemId = item.id as string;
+  logCompletedItem(event, item, itemType);
+  if (isDuplicateToolCompletion(itemType, itemId, state)) return;
+
+  yield* completedItemChunks(item, itemType, itemId, state, hasOutputFormat);
+}
+
+function logCompletedItem(
+  event: Record<string, unknown>,
+  item: Record<string, unknown>,
+  itemType: string
+): void {
+  const logContext: Record<string, unknown> = { eventType: event.type, itemType, itemId: item.id };
+  if (itemType === 'command_execution' && item.command) logContext.command = item.command;
+  getLog().debug(logContext, 'item_completed');
+}
+
+function isDuplicateToolCompletion(
+  itemType: string,
+  itemId: string,
+  state: CodexStreamState
+): boolean {
+  const isToolItem =
+    itemType === 'command_execution' || itemType === 'web_search' || itemType === 'mcp_tool_call';
+  if (!isToolItem) return false;
+  if (state.completedToolItemIds.has(itemId)) {
+    getLog().warn({ itemId, itemType }, 'tool_item_duplicate_completion');
+    return true;
+  }
+  state.completedToolItemIds.add(itemId);
+  if (!state.startedToolItemIds.has(itemId)) {
+    getLog().warn({ itemId, itemType }, 'tool_item_completed_without_start');
+  }
+  return false;
+}
+
+async function* completedItemChunks(
+  item: Record<string, unknown>,
+  itemType: string,
+  itemId: string,
+  state: CodexStreamState,
+  hasOutputFormat: boolean
+): AsyncGenerator<MessageChunk> {
+  switch (itemType) {
+    case 'agent_message':
+      yield* completedAgentMessage(item, state, hasOutputFormat);
+      break;
+    case 'command_execution':
+      yield* completedCommandExecution(item, itemId);
+      break;
+    case 'reasoning':
+      yield* completedReasoning(item);
+      break;
+    case 'web_search':
+      yield* completedWebSearch(item, itemId);
+      break;
+    case 'todo_list':
+      yield* completedTodoList(item, state);
+      break;
+    case 'file_change':
+      yield* completedFileChange(item);
+      break;
+    case 'mcp_tool_call':
+      yield* completedMcpToolCall(item, itemId);
+      break;
+  }
+}
+
+async function* completedAgentMessage(
+  item: Record<string, unknown>,
+  state: CodexStreamState,
+  hasOutputFormat: boolean
+): AsyncGenerator<MessageChunk> {
+  if (!item.text) return;
+  if (hasOutputFormat) state.accumulatedText = item.text as string;
+  yield { type: 'assistant', content: item.text as string };
+}
+
+async function* completedCommandExecution(
+  item: Record<string, unknown>,
+  itemId: string
+): AsyncGenerator<MessageChunk> {
+  if (!item.command) {
+    getLog().warn({ itemId: item.id }, 'command_execution_missing_command');
+    return;
+  }
+  const cmd = item.command as string;
+  const exitCode = item.exit_code as number | null | undefined;
+  const exitSuffix = exitCode != null && exitCode !== 0 ? `\n[exit code: ${String(exitCode)}]` : '';
+  yield {
+    type: 'tool_result',
+    toolName: cmd,
+    toolOutput: ((item.aggregated_output as string) ?? '') + exitSuffix,
+    toolCallId: itemId,
+    toolOutcome: commandToolOutcome(exitCode),
+    ...(exitCode != null ? { exitCode } : {}),
+  };
+}
+
+function commandToolOutcome(exitCode: number | null | undefined): 'success' | 'error' | 'unknown' {
+  if (exitCode === 0) return 'success';
+  if (exitCode == null) return 'unknown';
+  return 'error';
+}
+
+async function* completedReasoning(item: Record<string, unknown>): AsyncGenerator<MessageChunk> {
+  if (item.text) yield { type: 'thinking', content: item.text as string };
+}
+
+async function* completedWebSearch(
+  item: Record<string, unknown>,
+  itemId: string
+): AsyncGenerator<MessageChunk> {
+  if (!item.query) {
+    getLog().debug({ itemId: item.id }, 'web_search_missing_query');
+    return;
+  }
+  yield {
+    type: 'tool_result',
+    toolName: `🔍 Searching: ${item.query as string}`,
+    toolOutput: '',
+    toolCallId: itemId,
+    toolOutcome: 'unknown',
+  };
+}
+
+async function* completedTodoList(
+  item: Record<string, unknown>,
+  state: CodexStreamState
+): AsyncGenerator<MessageChunk> {
+  const items = item.items as { text?: string; completed?: boolean }[] | undefined;
+  if (!Array.isArray(items) || items.length === 0) {
+    getLog().debug({ itemId: item.id }, 'todo_list_empty_or_invalid');
+    return;
+  }
+  const normalizedItems = items.map(t => ({
+    text: typeof t.text === 'string' ? t.text : '(unnamed task)',
+    completed: t.completed ?? false,
+  }));
+  const signature = JSON.stringify(normalizedItems);
+  if (signature === state.lastTodoListSignature) return;
+  state.lastTodoListSignature = signature;
+  const taskList = normalizedItems.map(t => `${t.completed ? '✅' : '⬜'} ${t.text}`).join('\n');
+  yield { type: 'system', content: `📋 Tasks:\n${taskList}` };
+}
+
+async function* completedFileChange(item: Record<string, unknown>): AsyncGenerator<MessageChunk> {
+  const fileErrorMessage = fileChangeErrorMessage(item);
+  const changes = item.changes as { kind: string; path?: string }[] | undefined;
+  if (Array.isArray(changes) && changes.length > 0) {
+    yield fileChangeSummary(item, changes, fileErrorMessage);
+    return;
+  }
+  if ((item.status as string) === 'failed') {
+    getLog().warn({ itemId: item.id, status: item.status }, 'file_change_failed_no_changes');
+    const failMsg = fileErrorMessage
+      ? `❌ File change failed: ${fileErrorMessage}`
+      : '❌ File change failed';
+    yield { type: 'system', content: failMsg };
+    return;
+  }
+  getLog().debug({ itemId: item.id, status: item.status }, 'file_change_no_changes');
+}
+
+function fileChangeErrorMessage(item: Record<string, unknown>): string | undefined {
+  const rawError = 'error' in item ? (item as { error?: unknown }).error : undefined;
+  if (typeof rawError === 'string') return rawError;
+  if (typeof rawError === 'object' && rawError !== null && 'message' in rawError) {
+    return String((rawError as { message: unknown }).message);
+  }
+  return undefined;
+}
+
+function fileChangeSummary(
+  item: Record<string, unknown>,
+  changes: { kind: string; path?: string }[],
+  fileErrorMessage: string | undefined
+): MessageChunk {
+  const statusIcon = (item.status as string) === 'failed' ? '❌' : '✅';
+  const changeList = changes.map(fileChangeLine).join('\n');
+  const errorSuffix =
+    (item.status as string) === 'failed' && fileErrorMessage ? `\n${fileErrorMessage}` : '';
+  return { type: 'system', content: `${statusIcon} File changes:\n${changeList}${errorSuffix}` };
+}
+
+function fileChangeLine(change: { kind: string; path?: string }): string {
+  const icon = change.kind === 'add' ? '➕' : change.kind === 'delete' ? '➖' : '📝';
+  return `${icon} ${change.path ?? '(unknown file)'}`;
+}
+
+async function* completedMcpToolCall(
+  item: Record<string, unknown>,
+  itemId: string
+): AsyncGenerator<MessageChunk> {
+  const server = item.server as string | undefined;
+  const tool = item.tool as string | undefined;
+  const mcpToolName = getMcpToolName(item);
+  if ((item.status as string) === 'failed') {
+    yield failedMcpToolCall(item, itemId, mcpToolName, server, tool);
+    return;
+  }
+  yield successfulMcpToolCall(item, itemId, mcpToolName, server, tool);
+}
+
+function failedMcpToolCall(
+  item: Record<string, unknown>,
+  itemId: string,
+  mcpToolName: string,
+  server: string | undefined,
+  tool: string | undefined
+): MessageChunk {
+  getLog().warn({ server, tool, error: item.error, itemId: item.id }, 'mcp_tool_call_failed');
+  const mcpError = item.error as { message?: string } | undefined;
+  return {
+    type: 'tool_result',
+    toolName: mcpToolName,
+    toolOutput: mcpError?.message ? `❌ Error: ${mcpError.message}` : '❌ Error: MCP tool failed',
+    toolCallId: itemId,
+    toolOutcome: 'error',
+  };
+}
+
+function successfulMcpToolCall(
+  item: Record<string, unknown>,
+  itemId: string,
+  mcpToolName: string,
+  server: string | undefined,
+  tool: string | undefined
+): MessageChunk {
+  return {
+    type: 'tool_result',
+    toolName: mcpToolName,
+    toolOutput: mcpToolOutput(item, itemId, server, tool),
+    toolCallId: itemId,
+    toolOutcome: 'success',
+  };
+}
+
+function mcpToolOutput(
+  item: Record<string, unknown>,
+  itemId: string,
+  server: string | undefined,
+  tool: string | undefined
+): string {
+  const mcpResult = item.result as { content?: unknown } | undefined;
+  if (!mcpResult?.content) return '';
+  if (Array.isArray(mcpResult.content)) return JSON.stringify(mcpResult.content);
+  getLog().warn(
+    { itemId, server, tool, resultType: typeof mcpResult.content },
+    'mcp_tool_call_unexpected_result_shape'
+  );
+  return '';
+}
+
+async function* handleTurnCompleted(
+  event: TurnCompletedEvent,
+  state: CodexStreamState,
+  hasOutputFormat: boolean
+): AsyncGenerator<MessageChunk> {
+  getLog().debug('turn_completed');
+  const usage = extractUsageFromCodexEvent(event);
+  const structuredOutput = yield* parseStructuredOutput(state.accumulatedText, hasOutputFormat);
+  yield {
+    type: 'result',
+    sessionId: state.resolvedThreadId ?? undefined,
+    ...(usage ? { tokens: usage } : {}),
+    ...(structuredOutput !== undefined ? { structuredOutput } : {}),
+  };
+}
+
+async function* parseStructuredOutput(
+  accumulatedText: string,
+  hasOutputFormat: boolean
+): AsyncGenerator<MessageChunk, unknown> {
+  if (!hasOutputFormat || !accumulatedText) return undefined;
+  try {
+    const structuredOutput = JSON.parse(accumulatedText) as unknown;
+    getLog().debug('codex.structured_output_parsed');
+    return structuredOutput;
+  } catch {
+    getLog().warn(
+      { outputPreview: accumulatedText.slice(0, 200) },
+      'codex.structured_output_not_json'
+    );
+    yield {
+      type: 'system',
+      content:
+        '⚠️ Structured output requested but Codex returned non-JSON text. ' +
+        'Downstream $nodeId.output.field references may not evaluate correctly.',
+    };
+    return undefined;
+  }
 }
 
 // ─── Error Classification & Retry ────────────────────────────────────────
@@ -818,21 +1201,40 @@ export class CodexProvider implements IAgentProvider {
   private async createCodexClient(
     configCodexBinaryPath: string | undefined,
     requestEnv?: Record<string, string>,
-    codexConfigOverrides?: CodexConfigOverrides
-  ): Promise<Codex> {
-    if ((!requestEnv || Object.keys(requestEnv).length === 0) && !codexConfigOverrides) {
-      return getCodex(configCodexBinaryPath);
+    codexConfigOverrides?: CodexConfigOverrides,
+    execContext?: ExecutionContext
+  ): Promise<{ codex: Codex; cleanup?: () => Promise<void> }> {
+    if (execContext?.kind === 'container') {
+      const sealed = buildSealedCodexOptions(
+        buildCodexContainerEnv(requestEnv),
+        codexConfigOverrides,
+        execContext
+      );
+      const codexPathOverride = await createCodexContainerWrapper(execContext);
+      return {
+        codex: new Codex({
+          codexPathOverride,
+          ...sealed,
+        }),
+        cleanup: () => rm(dirname(codexPathOverride), { recursive: true, force: true }),
+      };
+    }
+
+    const sealed = buildSealedCodexOptions(
+      requestEnv ? buildCodexEnv(requestEnv) : undefined,
+      codexConfigOverrides,
+      execContext
+    );
+    if (!sealed.env && !sealed.config && !sealed.baseUrl) {
+      return { codex: await getCodex(configCodexBinaryPath) };
     }
 
     try {
       const codexOptions: CodexOptions = {
         codexPathOverride: await resolveCodexBinaryPath(configCodexBinaryPath),
-        ...(requestEnv && Object.keys(requestEnv).length > 0
-          ? { env: buildCodexEnv(requestEnv) }
-          : {}),
-        ...(codexConfigOverrides ? { config: codexConfigOverrides } : {}),
+        ...sealed,
       };
-      return new Codex(codexOptions);
+      return { codex: new Codex(codexOptions) };
     } catch (error) {
       const err = error as Error;
       if (isModelAccessError(err.message)) {
@@ -856,6 +1258,8 @@ export class CodexProvider implements IAgentProvider {
     const codexConfig = parseCodexConfig(assistantConfig);
     const providerWarnings: ProviderWarning[] = [];
     let codexConfigOverrides: CodexConfigOverrides | undefined;
+
+    assertCodexContainerRequestSupported(requestOptions);
 
     if (requestOptions?.nodeConfig?.mcp) {
       const mcpPath = requestOptions.nodeConfig.mcp;
@@ -881,161 +1285,199 @@ export class CodexProvider implements IAgentProvider {
     }
 
     // 1. Initialize SDK and build thread options
-    const codex = await this.createCodexClient(
+    const codexClient = await this.createCodexClient(
       codexConfig.codexBinaryPath,
       requestOptions?.env,
-      codexConfigOverrides
+      codexConfigOverrides,
+      requestOptions?.execContext
     );
+    const codex = codexClient.codex;
+    const containerAbortStopper = stopCodexContainerOnAbort(
+      requestOptions?.execContext,
+      requestOptions?.abortSignal
+    );
+    try {
+      yield* this.runQueryWithCodex(
+        codex,
+        prompt,
+        cwd,
+        resumeSessionId,
+        requestOptions,
+        assistantConfig
+      );
+    } finally {
+      containerAbortStopper?.dispose();
+      await containerAbortStopper?.wait();
+      await codexClient.cleanup?.();
+    }
+  }
+
+  private async *runQueryWithCodex(
+    codex: Codex,
+    prompt: string,
+    cwd: string,
+    resumeSessionId: string | undefined,
+    requestOptions: SendQueryOptions | undefined,
+    assistantConfig: Record<string, unknown>
+  ): AsyncGenerator<MessageChunk> {
     const threadOptions = buildThreadOptions(cwd, requestOptions?.model, assistantConfig);
+    if (requestOptions?.abortSignal?.aborted) throw new Error('Query aborted');
 
-    if (requestOptions?.abortSignal?.aborted) {
-      throw new Error('Query aborted');
-    }
-
-    // 2. Create or resume thread
-    let sessionResumeFailed = false;
-    let thread;
-    if (resumeSessionId) {
-      getLog().debug({ sessionId: resumeSessionId }, 'resuming_thread');
-      try {
-        thread = codex.resumeThread(resumeSessionId, threadOptions);
-      } catch (error) {
-        getLog().error({ err: error, sessionId: resumeSessionId }, 'resume_thread_failed');
-        try {
-          thread = codex.startThread(threadOptions);
-        } catch (startError) {
-          const err = startError as Error;
-          if (isModelAccessError(err.message)) {
-            throw new Error(buildModelAccessMessage(requestOptions?.model));
-          }
-          throw new Error(`Codex query failed: ${err.message}`);
-        }
-        sessionResumeFailed = true;
-      }
-    } else {
-      getLog().debug({ cwd }, 'starting_new_thread');
-      try {
-        thread = codex.startThread(threadOptions);
-      } catch (error) {
-        const err = error as Error;
-        if (isModelAccessError(err.message)) {
-          throw new Error(buildModelAccessMessage(requestOptions?.model));
-        }
-        throw new Error(`Codex query failed: ${err.message}`);
-      }
-    }
-
-    if (sessionResumeFailed) {
+    const initial = this.createInitialThread(
+      codex,
+      cwd,
+      resumeSessionId,
+      threadOptions,
+      requestOptions
+    );
+    if (initial.sessionResumeFailed) {
       yield {
         type: 'system',
         content: '⚠️ Could not resume previous session. Starting fresh conversation.',
       };
     }
 
-    // 3. Build turn options and the effective prompt (systemPrompt prepend).
-    // Computed once before the retry loop so cold retry attempts, which start
-    // fresh threads, also carry the system instructions.
     const { turnOptions, hasOutputFormat } = buildTurnOptions(requestOptions);
-    const effectivePrompt = buildEffectivePrompt(prompt, requestOptions);
-    let lastError: Error | undefined;
+    yield* this.runCodexAttempts({
+      codex,
+      thread: initial.thread,
+      threadOptions,
+      turnOptions,
+      hasOutputFormat,
+      effectivePrompt: buildEffectivePrompt(prompt, requestOptions),
+      cwd,
+      resumeSessionId,
+      sessionResumeFailed: initial.sessionResumeFailed,
+      requestOptions,
+    });
+  }
 
-    for (let attempt = 0; attempt <= MAX_SUBPROCESS_RETRIES; attempt++) {
-      if (requestOptions?.abortSignal?.aborted) {
-        throw new Error('Query aborted');
-      }
-
-      // Fresh AbortController per attempt. Caller's abortSignal, if any, is
-      // chained in via a once-listener so cancellation still propagates.
-      // Without this, a signal aborted during attempt N (e.g. when the
-      // Codex subprocess crashes and Node.js reacts to the `spawn({ signal })`
-      // linkage) would wire an already-aborted signal into attempt N+1's
-      // `spawn`, SIGTERMing the freshly spawned child before it reads any
-      // input. The "Reading prompt from stdin..." in the resulting error is
-      // Codex CLI's startup banner, not an indicator of crash location.
-      // See issue #1266.
-      const attemptController = new AbortController();
-      const onCallerAbort = (): void => {
-        attemptController.abort();
+  private createInitialThread(
+    codex: Codex,
+    cwd: string,
+    resumeSessionId: string | undefined,
+    threadOptions: ThreadOptions,
+    requestOptions: SendQueryOptions | undefined
+  ): { thread: CodexThread; sessionResumeFailed: boolean } {
+    if (!resumeSessionId) {
+      getLog().debug({ cwd }, 'starting_new_thread');
+      return {
+        thread: this.startThreadOrThrow(codex, threadOptions, requestOptions?.model),
+        sessionResumeFailed: false,
       };
-      if (requestOptions?.abortSignal) {
-        requestOptions.abortSignal.addEventListener('abort', onCallerAbort, { once: true });
-      }
-      turnOptions.signal = attemptController.signal;
+    }
+    getLog().debug({ sessionId: resumeSessionId }, 'resuming_thread');
+    try {
+      return {
+        thread: codex.resumeThread(resumeSessionId, threadOptions),
+        sessionResumeFailed: false,
+      };
+    } catch (error) {
+      getLog().error({ err: error, sessionId: resumeSessionId }, 'resume_thread_failed');
+      return {
+        thread: this.startThreadOrThrow(codex, threadOptions, requestOptions?.model),
+        sessionResumeFailed: true,
+      };
+    }
+  }
 
+  private startThreadOrThrow(
+    codex: Codex,
+    threadOptions: ThreadOptions,
+    model: string | undefined
+  ): CodexThread {
+    try {
+      return codex.startThread(threadOptions);
+    } catch (error) {
+      const err = error as Error;
+      if (isModelAccessError(err.message)) throw new Error(buildModelAccessMessage(model));
+      throw new Error(`Codex query failed: ${err.message}`);
+    }
+  }
+
+  private async *runCodexAttempts(input: CodexAttemptInput): AsyncGenerator<MessageChunk> {
+    let lastError: Error | undefined;
+    let thread = input.thread;
+    for (let attemptIndex = 0; attemptIndex <= MAX_SUBPROCESS_RETRIES; attemptIndex++) {
+      if (input.requestOptions?.abortSignal?.aborted) throw new Error('Query aborted');
+      const attempt = createCodexAttempt(attemptIndex, input.requestOptions?.abortSignal);
+      input.turnOptions.signal = attempt.controller.signal;
       try {
-        if (attempt > 0) {
-          getLog().debug({ cwd, attempt }, 'starting_new_thread');
-          try {
-            thread = codex.startThread(threadOptions);
-          } catch (startError) {
-            const err = startError as Error;
-            if (isModelAccessError(err.message)) {
-              getLog().debug({ attempt, errorClass: 'model_access' }, 'query_error_pre_retry');
-              throw new Error(buildModelAccessMessage(requestOptions?.model));
-            }
-            throw new Error(`Codex query failed: ${err.message}`);
-          }
+        if (attempt.index > 0) {
+          thread = this.startRetryThread(
+            input.codex,
+            input.threadOptions,
+            input.cwd,
+            attempt.index,
+            input.requestOptions?.model
+          );
         }
-
-        try {
-          // 4. Run streamed turn
-          const result = await thread.runStreamed(effectivePrompt, turnOptions);
-
-          // 5. Stream normalized events (fresh state per attempt to avoid dedup leaks)
-          yield* withResumedOutcome(
-            streamCodexEvents(
-              result.events as AsyncIterable<Record<string, unknown>>,
-              hasOutputFormat,
-              thread.id,
-              attemptController.signal,
-              Boolean(requestOptions?.nodeConfig?.mcp)
-            ),
-            // Stamp from the attempt that produced the result: any retry
-            // (attempt > 0) re-runs on a fresh startThread (cold), so the prior
-            // session context is lost even when the initial resumeThread succeeded.
-            resumedOutcome(resumeSessionId, !sessionResumeFailed && attempt === 0)
-          );
-          return;
-        } catch (error) {
-          const err = error as Error;
-
-          if (requestOptions?.abortSignal?.aborted) {
-            throw new Error('Query aborted');
-          }
-
-          const { enrichedError, errorClass, shouldRetry } = classifyAndEnrichCodexError(
-            err,
-            requestOptions?.model
-          );
-
-          getLog().error(
-            { err, errorClass, attempt, maxRetries: MAX_SUBPROCESS_RETRIES },
-            'query_error'
-          );
-
-          if (!shouldRetry || attempt >= MAX_SUBPROCESS_RETRIES) {
-            throw enrichedError;
-          }
-
-          const delayMs = this.retryBaseDelayMs * Math.pow(2, attempt);
-          getLog().info({ attempt, delayMs, errorClass }, 'retrying_query');
-          await new Promise(resolve => setTimeout(resolve, delayMs));
-          lastError = enrichedError;
-        }
+        yield* this.streamCodexAttempt(input, thread, attempt.index, attempt.controller);
+        return;
+      } catch (error) {
+        lastError = await this.handleCodexAttemptError(error as Error, input, attempt.index);
       } finally {
-        if (requestOptions?.abortSignal) {
-          requestOptions.abortSignal.removeEventListener('abort', onCallerAbort);
-        }
-        // The per-attempt AbortController is short-lived and goes out of
-        // scope at iteration end — no explicit abort() cleanup needed.
-        // Calling abort() here would race with the codex-sdk's own finally
-        // (which calls child.removeAllListeners() + child.kill()), firing
-        // Node's internal spawn-signal abort listener on a listenerless
-        // child and surfacing an uncaught AbortError.  See #1735.
+        attempt.dispose();
       }
     }
-
     throw lastError ?? new Error('Codex query failed after retries');
+  }
+
+  private startRetryThread(
+    codex: Codex,
+    threadOptions: ThreadOptions,
+    cwd: string,
+    attempt: number,
+    model: string | undefined
+  ): CodexThread {
+    getLog().debug({ cwd, attempt }, 'starting_new_thread');
+    try {
+      return codex.startThread(threadOptions);
+    } catch (startError) {
+      const err = startError as Error;
+      if (isModelAccessError(err.message)) {
+        getLog().debug({ attempt, errorClass: 'model_access' }, 'query_error_pre_retry');
+        throw new Error(buildModelAccessMessage(model));
+      }
+      throw new Error(`Codex query failed: ${err.message}`);
+    }
+  }
+
+  private async *streamCodexAttempt(
+    input: CodexAttemptInput,
+    thread: CodexThread,
+    attempt: number,
+    attemptController: AbortController
+  ): AsyncGenerator<MessageChunk> {
+    const result = await thread.runStreamed(input.effectivePrompt, input.turnOptions);
+    yield* withResumedOutcome(
+      streamCodexEvents(
+        result.events as AsyncIterable<Record<string, unknown>>,
+        input.hasOutputFormat,
+        thread.id,
+        attemptController.signal,
+        Boolean(input.requestOptions?.nodeConfig?.mcp)
+      ),
+      resumedOutcome(input.resumeSessionId, !input.sessionResumeFailed && attempt === 0)
+    );
+  }
+
+  private async handleCodexAttemptError(
+    err: Error,
+    input: CodexAttemptInput,
+    attempt: number
+  ): Promise<Error> {
+    if (input.requestOptions?.abortSignal?.aborted) throw new Error('Query aborted');
+    const { enrichedError, errorClass, shouldRetry } = classifyAndEnrichCodexError(
+      err,
+      input.requestOptions?.model
+    );
+    getLog().error({ err, errorClass, attempt, maxRetries: MAX_SUBPROCESS_RETRIES }, 'query_error');
+    if (!shouldRetry || attempt >= MAX_SUBPROCESS_RETRIES) throw enrichedError;
+    const delayMs = this.retryBaseDelayMs * Math.pow(2, attempt);
+    getLog().info({ attempt, delayMs, errorClass }, 'retrying_query');
+    await new Promise(resolve => setTimeout(resolve, delayMs));
+    return enrichedError;
   }
 
   getType(): string {

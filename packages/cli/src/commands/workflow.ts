@@ -25,8 +25,14 @@ import {
   getIsolationProvider,
   resolveFolderBackend,
   classifyIsolationError,
+  encodeStrictEgressPolicy,
 } from '@archon/isolation';
-import type { ExecutionContext, ContainerBackend, ContainerBackendConfig } from '@archon/isolation';
+import type {
+  ExecutionContext,
+  ContainerBackend,
+  ContainerBackendConfig,
+  PreparedEnv,
+} from '@archon/isolation';
 import {
   createLogger,
   getArchonHome,
@@ -38,11 +44,28 @@ import {
 import { join } from 'node:path';
 import { mkdirSync, openSync, closeSync, readFileSync, writeSync } from 'node:fs';
 import { spawn, type ChildProcess } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { createWorkflowDeps } from '@archon/core/workflows/store-adapter';
+import {
+  createHardenedControllerActions,
+  prepareHardenedControllerSession,
+  resumeHardenedControllerSession,
+  getHardenedControllerEgressPolicy,
+  getHardenedControllerProxyBudgetSeed,
+  getHardenedControllerValidatorNodeModules,
+  assertHardenedControllerResumeRoute,
+  type HardenedControllerRepoInput,
+  type HardenedControllerSession,
+} from '@archon/core/workflows/hardened-controller';
 import { createChildWorktreeResolver } from '@archon/core/workflows/child-isolation-resolver';
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
 import { resolveWorkflowName } from '@archon/workflows/router';
 import { executeWorkflow, hydrateResumableRun } from '@archon/workflows/executor';
+import {
+  buildWorkflowPinState,
+  WORKFLOW_PIN_METADATA_KEY,
+} from '@archon/workflows/workflow-pinning';
+import { WORKFLOW_BUDGET_METADATA_KEY, type WorkflowBudgetState } from '@archon/workflows/budget';
 import { assertWorkflowRequirementsMet } from '@archon/workflows/utils/workflow-requirements';
 import {
   getWorkflowEventEmitter,
@@ -223,55 +246,173 @@ const DEFAULT_RUNNER_IMAGE = 'archon-runner:latest';
 
 /**
  * Resolve the container backend config from the merged `container` config,
- * applying Phase B defaults (bridge network, 4 GiB memory, 512 pids).
+ * applying Phase B defaults (no network egress, 4 GiB memory, 512 pids).
  *
  * `container.*` comes from hand-parsed YAML (not Zod), so the values are
  * untrusted at runtime despite their static types — validate them here. In
- * particular `network` must be `bridge`/`none`: a stray `host` would otherwise
- * flow straight to `docker run --network host` and drop the network isolation.
+ * particular `network` must be `none` until restricted controller-proxy egress
+ * exists: `bridge`/`host` would otherwise expose Docker NAT or host networking.
  */
 export function resolveContainerBackendConfig(
-  cfg: { image?: string; network?: string; memoryMb?: number; pidsLimit?: number } | undefined
+  cfg:
+    | { profile?: string; image?: string; network?: string; memoryMb?: number; pidsLimit?: number }
+    | undefined
 ): ContainerBackendConfig {
-  const network = cfg?.network;
-  if (network !== undefined && network !== 'bridge' && network !== 'none') {
+  assertSupportedContainerSettings(cfg);
+  const profile = cfg?.profile;
+  if (profile !== undefined && profile !== 'hardened') {
     throw new Error(
-      `Invalid container.network '${network}' in .archon/config.yaml — must be ` +
-        "'bridge' or 'none'. Host networking is not allowed for container isolation."
+      `Invalid container.profile '${profile}' in .archon/config.yaml — only 'hardened' is supported. ` +
+        'Legacy overlay/native profiles are not allowed.'
+    );
+  }
+  const network = cfg?.network;
+  if (network !== undefined && network !== 'none') {
+    throw new Error(
+      `Invalid container.network '${network}' in .archon/config.yaml — must be 'none'. ` +
+        'Provider egress requires a restricted controller proxy, which is not implemented yet.'
     );
   }
   // Positive INTEGERS — `docker run --memory`/`--pids-limit` reject fractions,
   // and Number.isFinite alone would let `512.5` through to a runtime docker error.
   const memoryMb = cfg?.memoryMb;
-  if (memoryMb !== undefined && (!Number.isInteger(memoryMb) || memoryMb <= 0)) {
-    throw new Error(
-      `Invalid container.memoryMb '${String(memoryMb)}' — must be a positive integer (MiB).`
-    );
-  }
+  assertPositiveContainerInteger(memoryMb, 'memoryMb', ' (MiB)');
   const pidsLimit = cfg?.pidsLimit;
-  if (pidsLimit !== undefined && (!Number.isInteger(pidsLimit) || pidsLimit <= 0)) {
-    throw new Error(
-      `Invalid container.pidsLimit '${String(pidsLimit)}' — must be a positive integer.`
-    );
-  }
+  assertPositiveContainerInteger(pidsLimit, 'pidsLimit');
   return {
+    profile: 'hardened',
     image: cfg?.image?.trim() || DEFAULT_RUNNER_IMAGE,
-    network: network ?? 'bridge',
+    network: network ?? 'none',
     memoryMb: memoryMb ?? 4096,
     pidsLimit: pidsLimit ?? 512,
   };
 }
 
+function assertPositiveContainerInteger(
+  value: number | undefined,
+  key: 'memoryMb' | 'pidsLimit',
+  unit = ''
+): void {
+  if (value === undefined || (Number.isInteger(value) && value > 0)) return;
+  throw new Error(
+    `Invalid container.${key} '${String(value)}' — must be a positive integer${unit}.`
+  );
+}
+
+export function bindHardenedContainerConfig(
+  base: ContainerBackendConfig,
+  session: HardenedControllerSession
+): ContainerBackendConfig {
+  if (base.egressPolicy !== undefined) {
+    throw new Error('Repository container configuration cannot authorize egress.');
+  }
+  if (base.proxyBudget !== undefined) {
+    throw new Error('Repository container configuration cannot authorize provider budget.');
+  }
+  const egressPolicy = getHardenedControllerEgressPolicy(session);
+  const proxyBudget = getHardenedControllerProxyBudgetSeed(session);
+  return {
+    ...base,
+    image: session.policyMetadata.image,
+    ...(egressPolicy ? { egressPolicy } : {}),
+    ...(proxyBudget ? { proxyBudget } : {}),
+  };
+}
+
+export function assertHardenedEgressEnvironment(
+  config: ContainerBackendConfig,
+  metadata: unknown,
+  ownerRunId: string
+): void {
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
+    throw new Error('Cannot resume hardened run: isolation metadata is missing.');
+  }
+  const expected = config.egressPolicy ? encodeStrictEgressPolicy(config.egressPolicy) : undefined;
+  if ((metadata as Record<string, unknown>).egressPolicyB64 !== expected) {
+    throw new Error(
+      'Cannot resume hardened run: egress differs from authenticated controller policy.'
+    );
+  }
+  const record = metadata as Record<string, unknown>;
+  if (config.egressPolicy && !config.proxyBudget) {
+    throw new Error('Cannot resume hardened run: provider budget authority is missing.');
+  }
+  const proxyBudgetSeedDigest = config.proxyBudget
+    ? sessionProxyBudgetDigest(config.proxyBudget)
+    : undefined;
+  if (record.proxyBudgetSeedDigest !== proxyBudgetSeedDigest) {
+    throw new Error(
+      'Cannot resume hardened run: provider budget differs from authenticated controller policy.'
+    );
+  }
+  if (record.image !== config.image || record.ownerRunId !== ownerRunId) {
+    throw new Error(
+      'Cannot resume hardened run: isolation image or run ownership differs from controller authority.'
+    );
+  }
+}
+
+function assertSupportedContainerSettings(config: unknown): void {
+  if (config === undefined) return;
+  if (!config || typeof config !== 'object' || Array.isArray(config)) {
+    throw new Error('Invalid container configuration: expected an object.');
+  }
+  const allowed = new Set([
+    'profile',
+    'image',
+    'network',
+    'memoryMb',
+    'pidsLimit',
+    'enabled',
+    'repoInputs',
+    'repo_inputs',
+  ]);
+  for (const key of Object.keys(config)) {
+    if (!allowed.has(key)) {
+      throw new Error(
+        `Unsupported container setting '${key}'; additional access requires controller-owned admission.`
+      );
+    }
+  }
+}
+
+function sessionProxyBudgetDigest(
+  seed: NonNullable<ContainerBackendConfig['proxyBudget']>
+): string {
+  return createHash('sha256').update(stableSerializeForWorkflow(seed)).digest('hex');
+}
+
+function stableSerializeForWorkflow(value: unknown): string {
+  if (value === undefined) return 'null';
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stableSerializeForWorkflow).join(',')}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .sort()
+    .filter(key => record[key] !== undefined)
+    .map(key => `${JSON.stringify(key)}:${stableSerializeForWorkflow(record[key])}`)
+    .join(',')}}`;
+}
+
 /**
- * H2 — a container run has an UNRESOLVED write-back when its overlay diff was raised
- * for review (`pending_writeback` set) but never applied or discarded
+ * H2 — a container run has an UNRESOLVED write-back when isolated changes were
+ * raised for review (`pending_writeback` set) but never applied or discarded
  * (`writeback_resolved !== true`). This happens on a failed/partial apply. The CLI
- * teardown must PRESERVE the container+volume in this state (the overlay is the only
- * copy of the changes) rather than destroy it. Pure so the decision is unit-testable.
+ * teardown must PRESERVE the container+volumes in this state (they are the only
+ * copy of the changes) rather than destroy them. Pure so the decision is unit-testable.
  */
 export function hasUnresolvedWriteback(metadata: Record<string, unknown> | undefined): boolean {
   if (!metadata) return false;
   return metadata.pending_writeback !== undefined && metadata.writeback_resolved !== true;
+}
+
+export function shouldPreserveHardenedContainer(
+  metadata: Record<string, unknown> | undefined,
+  status: WorkflowRunStatus | undefined
+): boolean {
+  if (metadata?.isolation !== 'container') return false;
+  if (hasUnresolvedWriteback(metadata)) return true;
+  return status === 'failed' || status === 'cancelled';
 }
 
 /**
@@ -863,6 +1004,133 @@ export async function workflowListCommand(cwd: string, json?: boolean): Promise<
 /**
  * Run a specific workflow
  */
+
+async function resolveCliArchonUserId(): Promise<string | undefined> {
+  const cliId = resolveCliUserId();
+  if (!cliId) return undefined;
+  try {
+    const cliUser = await userDb.findOrCreateUserByPlatformIdentity('cli', cliId, cliId);
+    return cliUser.id;
+  } catch (error) {
+    getLog().warn({ err: error as Error, cliId }, 'cli.user_identity_resolve_failed');
+    return undefined;
+  }
+}
+
+function metadataRecord(metadata: Record<string, unknown> | undefined): Record<string, unknown> {
+  return metadata ?? {};
+}
+
+function resumeBudgetInput(
+  metadata: Record<string, unknown> | undefined
+): HardenedControllerSession['workflowBudgetGrants'][number]['tokens'] | undefined {
+  const raw = metadata?.[WORKFLOW_BUDGET_METADATA_KEY];
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined;
+  const tokens = (raw as Record<string, unknown>).tokens;
+  if (typeof tokens !== 'object' || tokens === null || Array.isArray(tokens)) return undefined;
+  const record = tokens as Record<string, unknown>;
+  if (typeof record.total !== 'number') return undefined;
+  return {
+    total: record.total,
+    ...(typeof record.input === 'number' ? { input: record.input } : {}),
+    ...(typeof record.output === 'number' ? { output: record.output } : {}),
+  };
+}
+
+function resumeDeadlineInput(metadata: Record<string, unknown> | undefined): string | undefined {
+  const raw = metadata?.[WORKFLOW_BUDGET_METADATA_KEY];
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined;
+  const deadlineAt = (raw as Record<string, unknown>).deadlineAt;
+  return typeof deadlineAt === 'string' ? deadlineAt : undefined;
+}
+
+function createHardenedControllerSessionForRun(input: {
+  run: WorkflowRun;
+  workflow: WorkflowDefinition;
+  workflowSource: WorkflowSource | undefined;
+  sourceRoot: string;
+  repoInputs?: readonly HardenedControllerRepoInput[];
+  conversationId: string;
+  userMessage: string;
+  image: string;
+  requestedImage?: string;
+}): HardenedControllerSession {
+  const tokens = resumeBudgetInput(input.run.metadata);
+  const deadlineAt = resumeDeadlineInput(input.run.metadata);
+  return prepareHardenedControllerSession({
+    runId: input.run.id,
+    workflow: input.workflow,
+    workflowSource: input.workflowSource,
+    sourceRoot: input.sourceRoot,
+    repoInputs: input.repoInputs,
+    conversationId: input.conversationId,
+    userMessage: input.userMessage,
+    image: input.image,
+    requestedImage: input.requestedImage,
+    ...(tokens || deadlineAt
+      ? { budget: { ...(tokens ? { tokens } : {}), ...(deadlineAt ? { deadlineAt } : {}) } }
+      : {}),
+  });
+}
+
+function resumeHardenedControllerSessionForRun(input: {
+  run: WorkflowRun;
+  workflow: WorkflowDefinition;
+  image: string;
+}): HardenedControllerSession {
+  const tokens = resumeBudgetInput(input.run.metadata);
+  const deadlineAt = resumeDeadlineInput(input.run.metadata);
+  if (!tokens || !deadlineAt) {
+    throw new Error(
+      `Cannot resume hardened run '${input.run.id}': persisted budget state is missing or malformed.`
+    );
+  }
+  return resumeHardenedControllerSession({
+    runId: input.run.id,
+    workflow: input.workflow,
+    image: input.image,
+    policyMetadata: metadataRecord(input.run.metadata).hardened_controller_policy,
+    budget: { tokens, deadlineAt },
+  });
+}
+
+function resolveDeclaredRepoInputs(
+  cfg: Record<string, unknown> | undefined
+): readonly HardenedControllerRepoInput[] | undefined {
+  const raw = cfg?.repoInputs ?? cfg?.repo_inputs;
+  if (raw === undefined) return undefined;
+  if (!Array.isArray(raw)) throw new Error('container.repo_inputs must be an array.');
+  return raw.map(resolveDeclaredRepoInput);
+}
+
+function resolveDeclaredRepoInput(entry: unknown, index: number): HardenedControllerRepoInput {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+    throw new Error(`container.repo_inputs[${String(index)}] must be an object.`);
+  }
+  const record = entry as Record<string, unknown>;
+  if (typeof record.path !== 'string' || record.path.trim().length === 0) {
+    throw new Error(`container.repo_inputs[${String(index)}].path must be a non-empty string.`);
+  }
+  if (record.source !== undefined && typeof record.source !== 'string') {
+    throw new Error(`container.repo_inputs[${String(index)}].source must be a string when set.`);
+  }
+  return {
+    targetPath: record.path,
+    sourcePath: record.source ?? record.path,
+  };
+}
+
+function initialBudgetMetadata(session: HardenedControllerSession): WorkflowBudgetState {
+  const grant = session.workflowBudgetGrants[0];
+  return {
+    workflowDigest: grant.workflowDigest,
+    deadlineAt: grant.deadlineAt,
+    tokens: { ...grant.tokens },
+    consumed: { input: 0, output: 0 },
+    updatedAt: new Date().toISOString(),
+  };
+}
+
 export async function workflowRunCommand(
   cwd: string,
   workflowName: string,
@@ -1111,6 +1379,8 @@ export async function workflowRunCommand(
     );
   }
 
+  const cliUserId = await resolveCliArchonUserId();
+
   // Try to find a codebase for this directory. Mirror the `run` dispatch gate
   // (cli.ts) and the --detach folder probe above: exact `default_cwd` match
   // first, then a path-prefix lookup so a subdirectory or worktree UNDER a
@@ -1218,9 +1488,8 @@ export async function workflowRunCommand(
   // backend via `opts.container`; the CLI only prepares/resumes and destroys.
   let containerBackend: ContainerBackend | undefined;
   let containerEnvId: string | undefined;
-  // Overlay mode the backend actually mounted (fuse = unprivileged; native =
-  // CAP_SYS_ADMIN, gate-bypassable). Threaded to the engine for the H4 run-start warning.
-  let containerOverlayMode: 'fuse' | 'native' | undefined;
+  let hardenedControllerSession: HardenedControllerSession | undefined;
+  let preCreatedHardenedRun: WorkflowRun | undefined;
 
   // Handle --resume: locate the prior failed run, reuse its worktree, and hand
   // the resumed-run handle to executeWorkflow below via opts. The executor no
@@ -1250,6 +1519,15 @@ export async function workflowRunCommand(
       throw new Error(`No resumable run found for workflow '${workflowName}' at path '${cwd}'.`);
     }
 
+    assertHardenedControllerResumeRoute(
+      resumable.id,
+      resumable.metadata?.isolation,
+      workflow.hardened?.required === true
+    );
+    if (resumable.metadata?.isolation === 'container' && codebase.kind !== 'folder') {
+      throw new Error('Cannot resume hardened container run through a non-folder isolation route.');
+    }
+
     getLog().info(
       {
         workflowRunId: resumable.id,
@@ -1259,8 +1537,8 @@ export async function workflowRunCommand(
       'workflow.resume_found_resumable'
     );
 
-    // A container run IS resumable (Phase C): the overlay lives on a persisted
-    // volume the resume rediscovers and restarts (see the folder branch below,
+    // A container run is resumable: isolated state lives on persisted named
+    // volumes the resume rediscovers and restarts (see the folder branch below,
     // which calls backend.resumeEnv when `resumable.metadata.isolation` is
     // 'container'). Nothing to reject here anymore.
 
@@ -1328,7 +1606,7 @@ export async function workflowRunCommand(
     // The in-place backend (default) keeps the agent's cwd at the folder root, so
     // it sees every child folder/repo, and per-service git (branch/commit/PR) is
     // the agent's job via bash/gh. The container backend (--container / config)
-    // instead runs everything inside an overlay-isolated container.
+    // instead runs everything inside a hardened volume-backed container.
     const folderCodebase = {
       id: codebase.id,
       defaultCwd: codebase.default_cwd,
@@ -1356,25 +1634,26 @@ export async function workflowRunCommand(
 
     if (wantsContainer) {
       const containerConfig = resolveContainerBackendConfig(folderConfig?.container);
-      const backend = resolveFolderBackend(folderCodebase, {
+      const isolationStore = isolationDb.createIsolationStore();
+      let backend = resolveFolderBackend(folderCodebase, {
         container: true,
-        store: isolationDb.createIsolationStore(),
+        store: isolationStore,
         containerConfig,
       });
-      let prepared;
+      const resolvedImageId = await backend.resolveImage();
+      let prepared: PreparedEnv | undefined;
       if (options.resume) {
         // Rediscover + restart the container for this run: `docker start` a
-        // suspended container, or recreate one over the persisted upper volume
-        // (the accumulated overlay is preserved). The env id was stamped into the
+        // suspended container, or recreate one over the persisted named volumes
+        // (the accumulated isolated workspace is preserved). The env id was stamped into the
         // run metadata at first-run creation. resumeEnv fails LOUD if the volume
         // is gone (un-applied work lost) rather than restarting from empty.
         //
         // Ordering (L3): the container is restarted FIRST (here) even on a
         // write-back-only resume where no DAG node will re-execute — kept uniform
         // with the mid-DAG-approval resume, which DOES need a live container. The
-        // subsequent write-back apply runs in an INDEPENDENT `docker run` helper
-        // over the volume (see overlay.ts), so it neither needs nor races the
-        // restarted run container.
+        // subsequent write-back/apply authority belongs to an independent controller
+        // action, so it neither needs nor races the restarted run container.
         const resumeEnvId =
           typeof resumable?.metadata?.isolation_env_id === 'string'
             ? resumable.metadata.isolation_env_id
@@ -1387,11 +1666,45 @@ export async function workflowRunCommand(
         }
         console.log(`Folder project — resuming container run (image ${containerConfig.image}).`);
         getLog().info(
-          { envId: resumeEnvId, image: containerConfig.image },
+          { envId: resumeEnvId, image: containerConfig.image, resolvedImageId },
           'workflow.resuming_in_container'
         );
         try {
-          prepared = await backend.resumeEnv(resumeEnvId);
+          if (resumable) {
+            hardenedControllerSession = resumeHardenedControllerSessionForRun({
+              run: resumable,
+              workflow,
+              image: resolvedImageId,
+            });
+          }
+          if (!hardenedControllerSession)
+            throw new Error('Hardened controller session is missing.');
+          const boundConfig = bindHardenedContainerConfig(
+            containerConfig,
+            hardenedControllerSession
+          );
+          const isolationRow = await isolationStore.getById(resumeEnvId);
+          assertHardenedEgressEnvironment(
+            boundConfig,
+            isolationRow?.metadata,
+            hardenedControllerSession.policyMetadata.runId
+          );
+          backend = resolveFolderBackend(folderCodebase, {
+            container: true,
+            store: isolationStore,
+            containerConfig: boundConfig,
+          });
+          const resumeBinding = {
+            image: boundConfig.image,
+            ownerRunId: hardenedControllerSession.policyMetadata.runId,
+            egressPolicyB64: boundConfig.egressPolicy
+              ? encodeStrictEgressPolicy(boundConfig.egressPolicy)
+              : undefined,
+            proxyBudgetSeedDigest: boundConfig.proxyBudget
+              ? sessionProxyBudgetDigest(boundConfig.proxyBudget)
+              : undefined,
+          };
+          prepared = await backend.resumeEnv(resumeEnvId, resumeBinding);
         } catch (resumeErr) {
           const err = resumeErr as Error;
           getLog().error({ err, envId: resumeEnvId }, 'workflow.container_resume_failed');
@@ -1400,12 +1713,81 @@ export async function workflowRunCommand(
       } else {
         console.log(`Folder project — running in container (image ${containerConfig.image}).`);
         getLog().info(
-          { cwd: codebase.default_cwd, image: containerConfig.image },
+          { cwd: codebase.default_cwd, image: containerConfig.image, resolvedImageId },
           'workflow.running_in_container'
         );
         try {
-          prepared = await backend.prepare({ codebase: folderCodebase });
+          const controllerDeps = createWorkflowDeps();
+          const workflowPin = buildWorkflowPinState(workflow, workflowSource);
+          preCreatedHardenedRun = await controllerDeps.store.createWorkflowRun({
+            workflow_name: workflow.name,
+            conversation_id: conversation.id,
+            codebase_id: codebase.id,
+            user_message: userMessage,
+            working_path: codebase.default_cwd,
+            metadata: {
+              isolation: 'container',
+              [WORKFLOW_PIN_METADATA_KEY]: workflowPin,
+            },
+            user_id: cliUserId,
+          });
+          const repoInputs = resolveDeclaredRepoInputs(
+            folderConfig?.container as Record<string, unknown> | undefined
+          );
+          hardenedControllerSession = createHardenedControllerSessionForRun({
+            run: preCreatedHardenedRun,
+            workflow,
+            workflowSource,
+            sourceRoot: codebase.default_cwd,
+            repoInputs,
+            conversationId,
+            userMessage,
+            image: resolvedImageId,
+            requestedImage: containerConfig.image,
+          });
+          if (!hardenedControllerSession.seed) {
+            throw new Error('Hardened controller did not produce a prepare seed.');
+          }
+          backend = resolveFolderBackend(folderCodebase, {
+            container: true,
+            store: isolationStore,
+            containerConfig: bindHardenedContainerConfig(
+              containerConfig,
+              hardenedControllerSession
+            ),
+          });
+          prepared = await backend.prepare({
+            codebase: folderCodebase,
+            ownerRunId: preCreatedHardenedRun.id,
+            seed: hardenedControllerSession.seed,
+          });
+          const preparedMetadata = {
+            ...metadataRecord(preCreatedHardenedRun.metadata),
+            isolation: 'container',
+            isolation_env_id: prepared.envId,
+            hardened_controller_policy: hardenedControllerSession.policyMetadata,
+            hardened_controller_policy_path: hardenedControllerSession.policyPath,
+            [WORKFLOW_BUDGET_METADATA_KEY]: initialBudgetMetadata(hardenedControllerSession),
+            [WORKFLOW_PIN_METADATA_KEY]: workflowPin,
+          };
+          await controllerDeps.store.updateWorkflowRun(preCreatedHardenedRun.id, {
+            metadata: preparedMetadata,
+          });
+          preCreatedHardenedRun = { ...preCreatedHardenedRun, metadata: preparedMetadata };
         } catch (prepErr) {
+          if (prepared?.envId) {
+            await backend.destroy(prepared.envId).catch(destroyErr => {
+              getLog().error(
+                { err: destroyErr as Error, envId: prepared?.envId },
+                'workflow.container_prepare_cleanup_failed'
+              );
+            });
+          }
+          if (preCreatedHardenedRun) {
+            await createWorkflowDeps()
+              .store.failWorkflowRun(preCreatedHardenedRun.id, (prepErr as Error).message)
+              .catch(() => undefined);
+          }
           // Map docker/daemon/image failures to an actionable message (daemon down,
           // runner image missing, docker-group permission — see errors.ts).
           const err = prepErr as Error;
@@ -1413,15 +1795,14 @@ export async function workflowRunCommand(
           throw new Error(classifyIsolationError(err));
         }
       }
-      // The container mounts the overlay at the SAME absolute path (same-absolute-
-      // path invariant), so prepared.cwd is the folder root. Consume it explicitly
+      // The container mounts the seeded workspace volume at the SAME absolute path
+      // (same-absolute-path invariant), so prepared.cwd is the folder root. Consume it explicitly
       // rather than assuming workingCwd — the container backend returns a
       // container-side cwd, unlike in-place.
       workingCwd = prepared.cwd;
       execContext = prepared.execContext;
       containerBackend = backend;
       containerEnvId = prepared.envId;
-      containerOverlayMode = prepared.overlayMode;
       isolationEnvId = prepared.envId;
     } else {
       // In-place (default) — byte-identical to pre-container behavior: keep
@@ -1575,22 +1956,6 @@ export async function workflowRunCommand(
 
   // Wire adapter for assistant message persistence
   adapter.setConversationDbId(conversationId, conversation.id);
-
-  // Resolve the CLI user once (ARCHON_USER_ID, else $USER/$USERNAME). When set,
-  // upsert via the `cli` platform identity so the same Archon user is reused
-  // across invocations — this is what attributes the workflow run to the human
-  // running the command and what `getUserProviderEnv` keys on for per-user
-  // AI-provider credentials (#1891 Phase 2).
-  const cliId = resolveCliUserId();
-  let cliUserId: string | undefined;
-  if (cliId) {
-    try {
-      const cliUser = await userDb.findOrCreateUserByPlatformIdentity('cli', cliId, cliId);
-      cliUserId = cliUser.id;
-    } catch (error) {
-      getLog().warn({ err: error as Error, cliId }, 'cli.user_identity_resolve_failed');
-    }
-  }
 
   // Persist user message for Web UI history.
   try {
@@ -1760,7 +2125,22 @@ export async function workflowRunCommand(
   // to executeWorkflow. Otherwise this is a fresh run and prepared stays null.
   // The lookup-by-(workflowName, cwd) was already done above for worktree-path
   // resolution; reuse that result rather than querying twice.
-  const deps = createWorkflowDeps();
+  const controllerHandlerStore = hardenedControllerSession ? createWorkflowDeps().store : undefined;
+  const deps = createWorkflowDeps(
+    hardenedControllerSession && controllerHandlerStore
+      ? {
+          controllerActions: createHardenedControllerActions({
+            session: hardenedControllerSession,
+            store: controllerHandlerStore,
+            snapshotArtifacts: containerBackend?.snapshotArtifacts?.bind(containerBackend),
+            playwrightNodeModules: () =>
+              getHardenedControllerValidatorNodeModules(hardenedControllerSession),
+          }),
+          controllerActionGrants: hardenedControllerSession.controllerActionGrants,
+          workflowBudgetGrants: hardenedControllerSession.workflowBudgetGrants,
+        }
+      : {}
+  );
   let prepared: Awaited<ReturnType<typeof hydrateResumableRun>> = null;
   if (options.resume && resumable) {
     try {
@@ -1799,7 +2179,15 @@ export async function workflowRunCommand(
           envId: containerEnvId,
           writeBack: workflow.container?.write_back ?? ('approve' as const),
           backend: containerBackend,
-          ...(containerOverlayMode ? { overlayMode: containerOverlayMode } : {}),
+          ...(hardenedControllerSession?.policyMetadata.proxyBudgetSeedDigest
+            ? {
+                proxyBudgetSeedDigest:
+                  hardenedControllerSession.policyMetadata.proxyBudgetSeedDigest,
+                egressPolicyB64: hardenedControllerSession.policyMetadata.egressPolicyB64,
+                image: hardenedControllerSession.policyMetadata.image,
+                ownerRunId: hardenedControllerSession.policyMetadata.runId,
+              }
+            : {}),
         }
       : undefined;
   // Per-child isolation resolver (#2121 slice 2, PR-A): built for git-repo codebases
@@ -1840,6 +2228,7 @@ export async function workflowRunCommand(
           execContext,
           container: containerRunCtx,
           resolveChildIsolation,
+          ...(preCreatedHardenedRun ? { preCreatedRun: preCreatedHardenedRun } : {}),
         };
     result = await executeWorkflow(
       deps,
@@ -1863,52 +2252,50 @@ export async function workflowRunCommand(
     process.off('SIGTERM', sigtermHandler);
     process.off('SIGINT', sigintHandler);
 
-    // Container teardown (Phase C) — in `finally` so a throw from executeWorkflow
-    // BEFORE its own try/catch (malformed config, env resolvers, unknown provider)
-    // can't orphan a privileged container+volume. A PAUSED run keeps its (already
-    // suspended, by the engine) container + volume for resume — destroying it would
-    // discard the overlay the resume needs. Every OTHER outcome (completed / failed /
-    // cancelled, or a pre-result throw) is terminal for this process → destroy. The
-    // write-back apply already ran inside the engine before completion, so a
-    // completed run's live-root changes are safe before this teardown removes the
-    // volume.
+    // Container teardown — in `finally` so a throw from executeWorkflow BEFORE its
+    // own try/catch (malformed config, env resolvers, unknown provider) can't orphan
+    // a hardened container+volumes. A PAUSED run keeps its (already suspended, by the
+    // engine) container + volumes for resume — destroying them would discard the
+    // isolated workspace the resume needs. Completed runs can destroy after the
+    // controller-owned export/write-back path resolves; failed/cancelled hardened
+    // runs preserve their volumes until explicit operator cleanup because there is
+    // no trusted artifact snapshot/export receipt yet.
     const runPaused = Boolean(result?.success && 'paused' in result && result.paused);
-    // H2 — preserve the container+volume whenever the un-applied overlay is still the
-    // only copy of the run's changes: a PAUSED run (awaiting the decision) OR a
-    // TERMINAL run whose write-back never resolved (e.g. a partial applyChanges threw
-    // → run failed with pending_writeback still un-applied). Destroying then would
-    // silently discard the changes despite the "reconcile manually" message. A failed
-    // run stays resumable, so `archon workflow resume <id>` re-runs the apply.
-    let unresolvedWriteback = false;
+    // H2 — preserve the container+volumes whenever the isolated workspace may be the
+    // only copy of the candidate/artifacts: a paused run, an unresolved write-back,
+    // or a failed/cancelled hardened run before verified export/publication.
+    let preserveContainer = false;
     if (containerBackend && containerEnvId && !runPaused && result?.workflowRunId) {
       try {
         const finalRun = await deps.store.getWorkflowRun(result.workflowRunId);
-        unresolvedWriteback = hasUnresolvedWriteback(finalRun?.metadata);
+        preserveContainer = shouldPreserveHardenedContainer(
+          finalRun?.metadata,
+          finalRun?.status ?? undefined
+        );
       } catch (lookupErr) {
         // FAIL CLOSED (R2-F1): if we can't read the run's metadata we can't tell
-        // whether an un-applied write-back is pending — do NOT destroy (the volume
-        // may be the only copy of the changes). Preserve + surface, same as an
-        // unresolved write-back.
-        unresolvedWriteback = true;
+        // whether an un-applied write-back or failed hardened run is pending — do
+        // NOT destroy. Preserve + surface, same as an unresolved write-back.
+        preserveContainer = true;
         getLog().error(
           { err: lookupErr as Error, envId: containerEnvId, runId: result.workflowRunId },
           'workflow.teardown_run_lookup_failed'
         );
       }
     }
-    if (containerBackend && containerEnvId && unresolvedWriteback) {
+    if (containerBackend && containerEnvId && preserveContainer) {
       console.error(
-        '\nWARNING: the write-back did not complete — the container + overlay volume are ' +
-          'PRESERVED so your changes are not lost. Retry with ' +
-          `\`bun run cli workflow resume ${result?.workflowRunId ?? '<run-id>'}\` (re-applies the ` +
-          'overlay), or reclaim manually via `docker ps -a --filter label=diy.archon.managed=true`.'
+        '\nWARNING: the hardened container state is not fully exported — the container + named volumes are ' +
+          'PRESERVED so candidate artifacts are not lost. Retry with ' +
+          `\`bun run cli workflow resume ${result?.workflowRunId ?? '<run-id>'}\` (re-enters the ` +
+          'controller write-back path), or reclaim manually via `docker ps -a --filter label=diy.archon.managed=true`.'
       );
       getLog().warn(
         { envId: containerEnvId, runId: result?.workflowRunId },
-        'workflow.container_preserved_unresolved_writeback'
+        'workflow.container_preserved_hardened_state'
       );
     }
-    if (containerBackend && containerEnvId && !runPaused && !unresolvedWriteback) {
+    if (containerBackend && containerEnvId && !runPaused && !preserveContainer) {
       try {
         await containerBackend.destroy(containerEnvId);
         // Persist a container_destroyed event (console timeline) and emit for any
@@ -1936,7 +2323,7 @@ export async function workflowRunCommand(
               );
             });
         }
-        console.log('Container and overlay volume removed.');
+        console.log('Container and named volumes removed.');
       } catch (destroyErr) {
         // destroy() throws only on a GENUINE docker failure (not idempotent
         // not-found). Surface it LOUD (console.error, not a --quiet log) so the
@@ -2740,8 +3127,8 @@ export async function workflowApproveCommand(
 
 /**
  * Reject a paused workflow run by ID.
- * If the workflow has an on_reject prompt, auto-resumes with the rejection feedback;
- * otherwise marks the run as cancelled.
+ * Legacy non-guarded workflows with on_reject auto-resume with rejection feedback;
+ * guarded normal gates cancel and require a fresh run.
  *
  * `runId` may be the short id printed by `workflow runs` (see resolveRunIdArg).
  */
@@ -2784,8 +3171,8 @@ export async function workflowRejectCommand(
   }
 
   // Not cancelled = either an on_reject rework (DAG approval gate) or a container
-  // write-back reject (discard the overlay). Both auto-resume; the resume drives
-  // the rework / the overlay discard + completion.
+  // write-back reject (discard isolated changes). Both auto-resume; the resume drives
+  // the rework / the discard + completion.
   if (!result.workingPath) {
     throw new Error(
       `Workflow run '${resolvedId}' has no working path recorded.\n` +

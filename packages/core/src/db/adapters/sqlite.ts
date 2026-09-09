@@ -52,6 +52,13 @@ export class SqliteAdapter implements IDatabase {
   }
 
   async query<T>(sql: string, params?: unknown[]): Promise<QueryResult<T>> {
+    return this.txTail.then(
+      () => this.executeQuery<T>(sql, params),
+      () => this.executeQuery<T>(sql, params)
+    );
+  }
+
+  private async executeQuery<T>(sql: string, params?: unknown[]): Promise<QueryResult<T>> {
     // Convert $1, $2, etc. to ? placeholders and reorder params to match
     const { sql: convertedSql, params: reorderedParams } = this.convertPlaceholders(
       sql,
@@ -108,14 +115,14 @@ export class SqliteAdapter implements IDatabase {
     fn: (query: <U>(sql: string, params?: unknown[]) => Promise<QueryResult<U>>) => Promise<T>
   ): Promise<T> {
     const run = async (): Promise<T> => {
-      await this.query('BEGIN');
+      await this.executeQuery('BEGIN');
       try {
-        const result = await fn(this.query.bind(this));
-        await this.query('COMMIT');
+        const result = await fn(this.executeQuery.bind(this));
+        await this.executeQuery('COMMIT');
         return result;
       } catch (e) {
         try {
-          await this.query('ROLLBACK');
+          await this.executeQuery('ROLLBACK');
         } catch (rollbackError) {
           getLog().error({ err: rollbackError as Error }, 'db.sqlite_transaction_rollback_failed');
         }

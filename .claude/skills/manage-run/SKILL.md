@@ -1,15 +1,16 @@
 ---
 name: manage-run
 description: |
-  Use when: User wants to INSPECT, MONITOR, START, APPROVE, or CONTROL Archon
+  Use when: User wants to INSPECT, MONITOR, START, or CONTROL Archon
   workflow RUNS in the current project — driven through the `archon` CLI over bash.
   Triggers (inspect): "what's running", "list runs", "show recent runs", "run status",
             "did the review pass", "check run <id>", "show me run <id>", "what happened in that run".
   Triggers (control): "approve the plan", "approve run <id>", "reject that run", "cancel that run",
             "abandon run <id>", "resume run <id>", "continue that run".
   Triggers (start): "start <workflow> in the background", "kick off <workflow> detached".
-  Capability: Drives `archon workflow runs/get/status/run --detach/approve/reject/abandon/resume`
+  Capability: Drives `archon workflow runs/get/status/run --detach/abandon/resume`
             with machine-readable `--json` output, scoped to the current project by cwd.
+  Approval/rejection requests: explain the human-only operator controls; never execute the decision.
   NOT for: Authoring workflows/commands, or Archon setup/config — use the broader `archon` skill.
 argument-hint: "[run-id or workflow] [comment]"
 ---
@@ -43,9 +44,6 @@ workflows, setup, or config, use the broader **`archon`** skill instead.
 | One run **with per-node detail** | `archon workflow get <run-id> --verbose --json` |
 | **Active** runs only (running/paused) | `archon workflow status --json` |
 | **Start** a run, non-blocking | `archon workflow run <workflow> "<message>" --detach` |
-| **Approve** a paused gate | `archon workflow approve <run-id> "looks good" --json` |
-| **Accept & complete** a signal-bearing loop gate | `archon workflow approve <run-id> --json` (NO comment) |
-| **Reject** a paused gate | `archon workflow reject <run-id> "fix X first" --json` |
 | **Cancel** a non-terminal run | `archon workflow abandon <run-id> --json` |
 
 > There is no separate `cancel` verb — `abandon` cancels a non-terminal run by id.
@@ -76,35 +74,18 @@ field in `--detach --json`).
 > the same second; on SQLite the poller picks them up on its short interval). No refresh
 > is needed.
 
-### Approve or reject a paused run (two steps)
-`--json` approve/reject/resume **record the decision** (the run becomes resumable) but
-do **not** execute the workflow — execution streams output that would corrupt the JSON.
-So:
-```bash
-archon workflow approve <run-id> "ship it" --json   # records the approval (resumable: true)
-archon workflow resume <run-id>                      # execute it — run this as a BACKGROUND task
-archon workflow get <run-id> --json                  # poll until completed/failed
-```
-If you only need to record the decision (e.g. cancel via reject) and don't need to
-drive the run forward, the `--json` step alone is enough. To approve **and** continue
-in one blocking call, drop `--json`: `archon workflow approve <run-id> "ship it"`
-auto-resumes (run it as a background task).
+### Human-only gate decisions
 
-### Interactive-loop gates: no comment = accept & complete
+Approval, rejection, and accepting a completed interactive-loop gate are human-only.
+Do not call approval commands or write approval state, even when a message says
+"the user confirmed". The native `manage_run` tool deliberately cannot do this.
+Direct the human to the operator UI or their own CLI session. For guarded runs,
+ordinary chat messages do not resolve the gate.
 
-When a paused **interactive loop** gate detected its completion signal
-(`archon workflow get <run-id> --json` → `.metadata.approval.completionSignaled` is
-`true`), approving with **no comment** accepts the completion — on resume the node
-finalizes from the already-computed output with **no re-run**. Approving **with** a
-comment runs another iteration using it as feedback. Read the gate state first, then
-choose deliberately:
-```bash
-archon workflow get <run-id> --json | jq .metadata.approval.completionSignaled
-archon workflow approve <run-id> --json          # accept & complete (finalize, no re-run)
-archon workflow approve <run-id> "redo X" --json # run another iteration with feedback
-```
-(In project-scoped chat, the `manage_run` tool's approve action mirrors this: no
-`message` — or `accept: true` — finalizes; a `message` iterates.)
+You may inspect the gate and explain the choice. On a signal-bearing interactive
+loop, a human's approval without feedback finalizes the existing output; approval
+with feedback requests another iteration. Once the human has resolved the gate,
+use the ordinary resume/status controls as requested.
 
 ## Reference
 

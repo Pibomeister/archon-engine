@@ -49,7 +49,12 @@ mock.module('@archon/paths', () => ({
 }));
 
 // --- Bootstrap provider registry (after path mocks, before dag-executor import) ---
-import { registerBuiltinProviders, registerPiProvider, clearRegistry } from '@archon/providers';
+import {
+  registerBuiltinProviders,
+  registerPiProvider,
+  clearRegistry,
+  registerProvider,
+} from '@archon/providers';
 clearRegistry();
 registerBuiltinProviders();
 // Pi is a community provider (best-effort structured output) — register it so the
@@ -88,11 +93,16 @@ import { OutputRefError } from './output-ref';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
 import type { IWorkflowStore } from './store';
 import { buildAiProfile } from './model-validation';
+import {
+  computeControllerActionManifestDigest,
+  computeControllerWorkflowDigest,
+} from './controller-actions';
+import { WORKFLOW_BUDGET_METADATA_KEY, type WorkflowBudgetGrant } from './budget';
 
 // --- Mock helpers ---
 
 function createMockStore(): IWorkflowStore {
-  return {
+  const store: IWorkflowStore = {
     createWorkflowRun: mock(() =>
       Promise.resolve({
         id: 'mock-run-id',
@@ -155,6 +165,17 @@ function createMockStore(): IWorkflowStore {
     upsertWorkflowNodeSession: mock(() => Promise.resolve()),
     deleteWorkflowNodeSessions: mock(() => Promise.resolve({ deleted: 0 })),
   };
+  store.createWorkflowEventStrict = data => store.createWorkflowEvent(data);
+  store.createControllerCompletionEvent = async (data, deadlineAt) => {
+    if (
+      (await store.getWorkflowRunStatus(data.workflow_run_id)) !== 'running' ||
+      Date.now() > deadlineAt
+    ) {
+      throw new Error('controller completion is no longer live');
+    }
+    await store.createWorkflowEvent(data);
+  };
+  return store;
 }
 
 /** All-true capabilities for Claude mock */
@@ -203,6 +224,27 @@ const mockGetAgentProviderDag = mock(() => ({
   getType: () => 'claude',
   getCapabilities: mockClaudeCapabilities,
 }));
+
+const TEST_BEST_EFFORT_CONTAINER_PROVIDER = 'test-best-effort-container';
+registerProvider({
+  id: TEST_BEST_EFFORT_CONTAINER_PROVIDER,
+  displayName: 'Test Best Effort Container',
+  factory: () => ({
+    sendQuery: mockSendQueryDag,
+    getType: () => TEST_BEST_EFFORT_CONTAINER_PROVIDER,
+    getCapabilities: () => ({
+      ...mockClaudeCapabilities(),
+      structuredOutput: 'best-effort' as const,
+      containerExec: true,
+    }),
+  }),
+  capabilities: {
+    ...mockClaudeCapabilities(),
+    structuredOutput: 'best-effort' as const,
+    containerExec: true,
+  },
+  builtIn: false,
+});
 
 function createMockDeps(storeOverride?: IWorkflowStore): WorkflowDeps {
   const store = storeOverride ?? createMockStore();
@@ -2172,6 +2214,3256 @@ describe('executeDagWorkflow -- bash nodes', () => {
     } finally {
       execSpy.mockRestore();
     }
+  });
+});
+
+describe('executeDagWorkflow -- controller action nodes', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(
+      tmpdir(),
+      `dag-controller-action-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    await mkdir(testDir, { recursive: true });
+    mockSendQueryDag.mockClear();
+  });
+
+  afterEach(async () => {
+    mockGetAgentProviderDag.mockReset();
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    }));
+    await rm(testDir, { recursive: true, force: true });
+  });
+
+  const publishWorkflow = (timeout?: number): WorkflowDefinition => ({
+    name: 'release-workflow',
+    nodes: [
+      {
+        id: 'ship',
+        controller_action: 'publish',
+        phase: 'publication',
+        ...(timeout === undefined ? {} : { timeout }),
+      },
+    ],
+  });
+
+  const manifestInput = () => ({ target: 'origin/main', commit: 'abc123' });
+
+  const manifestFor = (input: Record<string, unknown> = manifestInput()) => ({
+    id: 'manifest-release-1',
+    digest: computeControllerActionManifestDigest({ id: 'manifest-release-1', input }),
+    input,
+  });
+
+  const grantFor = (
+    workflow: WorkflowDefinition,
+    runId: string,
+    actionManifest = manifestFor()
+  ) => ({
+    runId,
+    workflowName: workflow.name,
+    workflowDigest: computeControllerWorkflowDigest(workflow),
+    nodeId: 'ship',
+    action: 'publish' as const,
+    phase: 'publication',
+    actionManifest,
+  });
+
+  const hardenedExecContext = {
+    kind: 'container' as const,
+    containerId: 'sealed-container',
+    execUser: 'archon',
+    profile: 'hardened',
+  };
+
+  it('fails closed when a trusted controller handler is absent', async () => {
+    const store = createMockStore();
+    const deps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun('controller-missing-handler');
+
+    await executeDagWorkflow(
+      deps,
+      platform,
+      'conv-controller',
+      testDir,
+      {
+        name: 'controller-test',
+        nodes: [{ id: 'ship', controller_action: 'publish', phase: 'publication' }],
+      },
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(mockSendQueryDag.mock.calls).toHaveLength(0);
+    const failedEvents = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.filter(
+      call => (call[0] as { event_type: string }).event_type === 'node_failed'
+    );
+    expect(JSON.stringify(failedEvents)).toContain("Controller action 'publish' is not configured");
+  });
+
+  it('refuses controller effects when the store has only best-effort telemetry writes', async () => {
+    const store = createMockStore();
+    delete store.createWorkflowEventStrict;
+    const workflow = publishWorkflow();
+    const run = makeWorkflowRun('controller-no-strict-store');
+    const handler = mock(async () => 'must not execute');
+    await executeDagWorkflow(
+      {
+        ...createMockDeps(store),
+        controllerActions: { publish: handler },
+        controllerActionGrants: [grantFor(workflow, run.id)],
+      },
+      createMockPlatform(),
+      'conv-controller',
+      testDir,
+      workflow,
+      run,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      hardenedExecContext
+    );
+    expect(handler).not.toHaveBeenCalled();
+    expect(store.completeWorkflowRun).not.toHaveBeenCalled();
+  });
+
+  for (const failure of ['late-cancel', 'late-deadline', 'missing-atomic-store'] as const) {
+    it(`refuses controller completion on ${failure}`, async () => {
+      const store = createMockStore();
+      if (failure === 'missing-atomic-store') delete store.createControllerCompletionEvent;
+      const workflow = publishWorkflow();
+      workflow.nodes.push({ id: 'after', prompt: 'must not run', depends_on: ['ship'] });
+      const run = makeWorkflowRun('controller-late-liveness');
+      const handler = mock(async () => {
+        if (failure === 'late-cancel')
+          store.getWorkflowRunStatus = mock(async () => 'cancelled' as const);
+        if (failure === 'late-deadline') setSystemTime(new Date(Date.now() + 120_000));
+        return 'not certified';
+      });
+      try {
+        await executeDagWorkflow(
+          {
+            ...createMockDeps(store),
+            controllerActions: { publish: handler },
+            controllerActionGrants: [grantFor(workflow, run.id)],
+          },
+          createMockPlatform(),
+          'conv-controller',
+          testDir,
+          workflow,
+          run,
+          'claude',
+          undefined,
+          join(testDir, 'artifacts'),
+          join(testDir, 'state'),
+          join(testDir, 'logs'),
+          'main',
+          'docs/',
+          minimalConfig,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          hardenedExecContext
+        );
+        const events = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
+          call => call[0]
+        );
+        expect(
+          events.filter(
+            event => event.event_type === 'node_completed' && event.step_name === 'ship'
+          )
+        ).toHaveLength(0);
+        expect(
+          events.filter(event => event.event_type === 'node_started' && event.step_name === 'after')
+        ).toHaveLength(0);
+        expect(mockSendQueryDag).not.toHaveBeenCalled();
+        if (failure === 'missing-atomic-store') expect(handler).not.toHaveBeenCalled();
+      } finally {
+        setSystemTime();
+      }
+    });
+  }
+
+  it('does not contradict an atomic completion when cancellation follows its commit', async () => {
+    const store = createMockStore();
+    store.createControllerCompletionEvent = async data => {
+      await store.createWorkflowEvent(data);
+      store.getWorkflowRunStatus = mock(async () => 'cancelled' as const);
+    };
+    const workflow = publishWorkflow();
+    workflow.nodes.push({ id: 'after', prompt: 'must not run', depends_on: ['ship'] });
+    const run = makeWorkflowRun('controller-cancel-after-commit');
+    await executeDagWorkflow(
+      {
+        ...createMockDeps(store),
+        controllerActions: { publish: async () => 'committed' },
+        controllerActionGrants: [grantFor(workflow, run.id)],
+      },
+      createMockPlatform(),
+      'conv-controller',
+      testDir,
+      workflow,
+      run,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      hardenedExecContext
+    );
+    const events = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
+      call => call[0]
+    );
+    expect(
+      events.filter(event => event.event_type === 'node_completed' && event.step_name === 'ship')
+    ).toHaveLength(1);
+    expect(
+      events.filter(event => event.event_type === 'node_failed' && event.step_name === 'ship')
+    ).toHaveLength(0);
+    expect(
+      events.filter(event => event.event_type === 'node_started' && event.step_name === 'after')
+    ).toHaveLength(0);
+    expect(mockSendQueryDag).not.toHaveBeenCalled();
+  });
+
+  it('does not advance past a controller action whose completion audit cannot persist', async () => {
+    const store = createMockStore();
+    store.createWorkflowEvent = mock(async event => {
+      if (event.event_type === 'node_completed' && event.step_name === 'ship') {
+        throw new Error('controller completion audit offline');
+      }
+    });
+    const workflow = publishWorkflow();
+    const run = makeWorkflowRun('controller-audit-failure');
+    const handler = mock(async () => 'sealed');
+    await executeDagWorkflow(
+      {
+        ...createMockDeps(store),
+        controllerActions: { publish: handler },
+        controllerActionGrants: [grantFor(workflow, run.id)],
+      },
+      createMockPlatform(),
+      'conv-controller',
+      testDir,
+      workflow,
+      run,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      hardenedExecContext
+    );
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(store.completeWorkflowRun).not.toHaveBeenCalled();
+    expect(store.failWorkflowRun).toHaveBeenCalled();
+  });
+
+  it('dispatches to the injected handler with workflow identity, phase, and exec context', async () => {
+    const store = createMockStore();
+    const handler = mock(() => Promise.resolve({ receipt: 'sealed' }));
+    const workflow = publishWorkflow();
+    const workflowRun = makeWorkflowRun('controller-handler-run');
+    const deps: WorkflowDeps = {
+      ...createMockDeps(store),
+      controllerActions: { publish: handler },
+      controllerActionGrants: [grantFor(workflow, workflowRun.id)],
+    };
+    const platform = createMockPlatform();
+
+    await executeDagWorkflow(
+      deps,
+      platform,
+      'conv-controller',
+      testDir,
+      workflow,
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      hardenedExecContext
+    );
+
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(handler.mock.calls[0][0]).toMatchObject({
+      workflowName: 'release-workflow',
+      workflowDigest: computeControllerWorkflowDigest(workflow),
+      node: { id: 'ship', controller_action: 'publish', phase: 'publication' },
+      actionManifest: {
+        id: 'manifest-release-1',
+        digest: computeControllerActionManifestDigest({
+          id: 'manifest-release-1',
+          input: manifestInput(),
+        }),
+        input: manifestInput(),
+      },
+      execContext: hardenedExecContext,
+    });
+    expect(Object.isFrozen(handler.mock.calls[0][0].actionManifest)).toBe(true);
+    const completed = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.find(
+      call => call[0].event_type === 'node_completed' && call[0].step_name === 'ship'
+    );
+    expect(completed?.[0].data.node_output).toBe('{"receipt":"sealed"}');
+    expect(Object.isFrozen(handler.mock.calls[0][0].actionManifest.input)).toBe(true);
+    const completedEvents = (
+      store.createWorkflowEvent as ReturnType<typeof mock>
+    ).mock.calls.filter(
+      call => (call[0] as { event_type: string }).event_type === 'node_completed'
+    );
+    expect(JSON.stringify(completedEvents)).toContain('"action":"publish"');
+  });
+
+  it('does not invoke a configured handler without a matching controller grant', async () => {
+    const store = createMockStore();
+    const handler = mock(() => Promise.resolve('ok'));
+    const workflow = publishWorkflow();
+    const deps: WorkflowDeps = {
+      ...createMockDeps(store),
+      controllerActions: { publish: handler },
+    };
+
+    await executeDagWorkflow(
+      deps,
+      createMockPlatform(),
+      'conv-controller',
+      testDir,
+      workflow,
+      makeWorkflowRun('no-grant-run'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      hardenedExecContext
+    );
+
+    expect(handler).toHaveBeenCalledTimes(0);
+    expect(
+      JSON.stringify((store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls)
+    ).toContain('is not authorized');
+  });
+
+  it('rejects a forged workflow with the same name but a changed digest before invocation', async () => {
+    const store = createMockStore();
+    const handler = mock(() => Promise.resolve('ok'));
+    const trustedWorkflow = publishWorkflow();
+    const forgedWorkflow: WorkflowDefinition = {
+      name: trustedWorkflow.name,
+      description: 'tampered after controller grant',
+      nodes: trustedWorkflow.nodes,
+    };
+    const workflowRun = makeWorkflowRun('forged-digest-run');
+    const deps: WorkflowDeps = {
+      ...createMockDeps(store),
+      controllerActions: { publish: handler },
+      controllerActionGrants: [grantFor(trustedWorkflow, workflowRun.id)],
+    };
+
+    await executeDagWorkflow(
+      deps,
+      createMockPlatform(),
+      'conv-controller',
+      testDir,
+      forgedWorkflow,
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      hardenedExecContext
+    );
+
+    expect(handler).toHaveBeenCalledTimes(0);
+  });
+
+  it('rejects a changed action manifest before invoking the handler', async () => {
+    const store = createMockStore();
+    const handler = mock(() => Promise.resolve('ok'));
+    const workflow = publishWorkflow();
+    const workflowRun = makeWorkflowRun('changed-manifest-run');
+    const approvedInput = { target: 'origin/main', commit: 'abc123' };
+    const changedManifest = {
+      id: 'manifest-release-1',
+      digest: computeControllerActionManifestDigest({
+        id: 'manifest-release-1',
+        input: approvedInput,
+      }),
+      input: { target: 'origin/main', commit: 'evil999' },
+    };
+    const deps: WorkflowDeps = {
+      ...createMockDeps(store),
+      controllerActions: { publish: handler },
+      controllerActionGrants: [grantFor(workflow, workflowRun.id, changedManifest)],
+    };
+
+    await executeDagWorkflow(
+      deps,
+      createMockPlatform(),
+      'conv-controller',
+      testDir,
+      workflow,
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      hardenedExecContext
+    );
+
+    expect(handler).toHaveBeenCalledTimes(0);
+    expect(
+      JSON.stringify((store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls)
+    ).toContain('invalid action manifest digest');
+  });
+
+  it('rejects wrong run, phase, and action grants before invocation', async () => {
+    const cases: Array<{ name: string; override: Partial<ReturnType<typeof grantFor>> }> = [
+      { name: 'wrong run', override: { runId: 'another-run' } },
+      { name: 'wrong phase', override: { phase: 'review' } },
+      { name: 'wrong action', override: { action: 'backfill' } },
+    ];
+
+    for (const testCase of cases) {
+      const store = createMockStore();
+      const handler = mock(() => Promise.resolve('ok'));
+      const workflow = publishWorkflow();
+      const workflowRun = makeWorkflowRun(`bad-grant-${testCase.name}`);
+      const deps: WorkflowDeps = {
+        ...createMockDeps(store),
+        controllerActions: { publish: handler },
+        controllerActionGrants: [{ ...grantFor(workflow, workflowRun.id), ...testCase.override }],
+      };
+
+      await executeDagWorkflow(
+        deps,
+        createMockPlatform(),
+        'conv-controller',
+        testDir,
+        workflow,
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        hardenedExecContext
+      );
+
+      expect(handler, testCase.name).toHaveBeenCalledTimes(0);
+    }
+  });
+
+  it('times out a hanging controller action and aborts its signal', async () => {
+    const store = createMockStore();
+    let observedSignal: AbortSignal | undefined;
+    const handler = mock(({ signal }: { signal: AbortSignal }) => {
+      observedSignal = signal;
+      return new Promise<string>(() => {});
+    });
+    const workflow = publishWorkflow(40);
+    const workflowRun = makeWorkflowRun('hanging-controller-run');
+    const deps: WorkflowDeps = {
+      ...createMockDeps(store),
+      controllerActions: { publish: handler },
+      controllerActionGrants: [grantFor(workflow, workflowRun.id)],
+    };
+
+    const startedAt = Date.now();
+    await executeDagWorkflow(
+      deps,
+      createMockPlatform(),
+      'conv-controller',
+      testDir,
+      workflow,
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      hardenedExecContext
+    );
+
+    expect(Date.now() - startedAt).toBeLessThan(500);
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(observedSignal?.aborted).toBe(true);
+    expect(
+      JSON.stringify((store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls)
+    ).toContain('exceeded timeout of 40ms');
+  });
+
+  it('polls run cancellation before controller handlers perform writes', async () => {
+    const store = createMockStore();
+    let statusCalls = 0;
+    store.getWorkflowRunStatus = mock(() => {
+      statusCalls += 1;
+      return Promise.resolve(statusCalls === 1 ? ('running' as const) : ('cancelled' as const));
+    });
+    let wrote = false;
+    const handler = mock(async ({ signal }: { signal: AbortSignal }) => {
+      await new Promise(resolve => setTimeout(resolve, 80));
+      if (!signal.aborted) wrote = true;
+      return 'done';
+    });
+    const workflow = publishWorkflow(500);
+    const workflowRun = makeWorkflowRun('cancelled-controller-run');
+    const deps: WorkflowDeps = {
+      ...createMockDeps(store),
+      controllerActions: { publish: handler },
+      controllerActionGrants: [grantFor(workflow, workflowRun.id)],
+    };
+
+    await executeDagWorkflow(
+      deps,
+      createMockPlatform(),
+      'conv-controller',
+      testDir,
+      workflow,
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      hardenedExecContext
+    );
+    await new Promise(resolve => setTimeout(resolve, 120));
+
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(wrote).toBe(false);
+    expect(statusCalls).toBeGreaterThanOrEqual(2);
+    expect(
+      JSON.stringify((store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls)
+    ).toContain('Controller action cancelled');
+  });
+
+  it('refuses child workflows and unfrozen host discovery before container execution', async () => {
+    const child = mock(async () => {
+      throw new Error('host child must never run');
+    });
+    const cases: { nodes: DagNode[]; evidence_policy?: { required: boolean } }[] = [
+      { nodes: [{ id: 'child', workflow: 'host-child' }] },
+      { nodes: [{ id: 'command', command: 'mutable-command' }] },
+      { nodes: [{ id: 'mcp', prompt: 'steal env', mcp: '.archon/mcp/leak.json' }] },
+      { nodes: [{ id: 'script', script: 'mutable-script', runtime: 'bun' }] },
+      {
+        nodes: [
+          { id: 'loop', loop: { command: 'mutable-loop', until: 'DONE', max_iterations: 1 } },
+        ],
+      },
+      { nodes: [{ id: 'ok', bash: 'true' }], evidence_policy: { required: true } },
+    ];
+    for (const candidate of cases) {
+      await expect(
+        executeDagWorkflow(
+          createMockDeps(),
+          createMockPlatform(),
+          'conv-refuse',
+          testDir,
+          { name: 'container-refusal', ...candidate },
+          makeWorkflowRun('container-refusal'),
+          'claude',
+          undefined,
+          join(testDir, 'artifacts'),
+          join(testDir, 'state'),
+          join(testDir, 'logs'),
+          'main',
+          'docs/',
+          minimalConfig,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          hardenedExecContext,
+          undefined,
+          child
+        )
+      ).rejects.toThrow(/unsupported in container/);
+    }
+    expect(child).not.toHaveBeenCalled();
+    expect(mockSendQueryDag).not.toHaveBeenCalled();
+  });
+
+  it('rejects hardened workflows when the container context does not declare the hardened profile', async () => {
+    const store = createMockStore();
+    const handler = mock(() => Promise.resolve('ok'));
+    const workflow: WorkflowDefinition = {
+      ...publishWorkflow(),
+      hardened: { required: true },
+    };
+    const workflowRun = makeWorkflowRun('hardened-legacy-container-run');
+    const deps: WorkflowDeps = {
+      ...createMockDeps(store),
+      controllerActions: { publish: handler },
+      controllerActionGrants: [grantFor(workflow, workflowRun.id)],
+    };
+
+    await expect(
+      executeDagWorkflow(
+        deps,
+        createMockPlatform(),
+        'conv-controller',
+        testDir,
+        workflow,
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { kind: 'container', containerId: 'legacy-container' }
+      )
+    ).rejects.toThrow("profile='hardened'");
+    expect(handler).toHaveBeenCalledTimes(0);
+  });
+
+  it('rejects hardened workflows before running nodes when no container context is supplied', async () => {
+    const store = createMockStore();
+    const deps: WorkflowDeps = {
+      ...createMockDeps(store),
+      controllerActions: { publish: mock(() => Promise.resolve('ok')) },
+    };
+
+    await expect(
+      executeDagWorkflow(
+        deps,
+        createMockPlatform(),
+        'conv-controller',
+        testDir,
+        {
+          name: 'hardened-release',
+          hardened: { required: true },
+          nodes: [{ id: 'ship', controller_action: 'publish', phase: 'publication' }],
+        },
+        makeWorkflowRun('hardened-host-run'),
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      )
+    ).rejects.toThrow('requires hardened container execution');
+  });
+});
+
+describe('executeDagWorkflow -- AI total timeout', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(
+      tmpdir(),
+      `dag-ai-deadline-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    await mkdir(testDir, { recursive: true });
+    mockSendQueryDag.mockClear();
+  });
+
+  afterEach(async () => {
+    mockGetAgentProviderDag.mockReset();
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    }));
+    await rm(testDir, { recursive: true, force: true });
+  });
+
+  it('enforces the total AI deadline even when the stream emits before each idle window', async () => {
+    const store = createMockStore();
+    const activeSendQuery = mock(async function* (_prompt, _cwd, _resume, options) {
+      const signal = options?.abortSignal as AbortSignal | undefined;
+      for (let i = 0; i < 100; i++) {
+        if (signal?.aborted) return;
+        await new Promise(resolve => setTimeout(resolve, 10));
+        yield { type: 'assistant' as const, content: `tick-${String(i)}\n` };
+      }
+      yield { type: 'result' as const, sessionId: 'active-stream-completed' };
+    });
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: activeSendQuery,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    }));
+    const startedAt = Date.now();
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      createMockPlatform(),
+      'conv-active-deadline',
+      testDir,
+      {
+        name: 'active-deadline-test',
+        nodes: [
+          {
+            id: 'ai',
+            prompt: 'emit forever',
+            idle_timeout: 1_000,
+            timeout: 50,
+            retry: { max_attempts: 2, delay_ms: 1, on_error: 'all' },
+          } as DagNode,
+        ],
+      },
+      makeWorkflowRun('active-deadline-run'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(Date.now() - startedAt).toBeLessThan(500);
+    expect(activeSendQuery).toHaveBeenCalledTimes(1);
+    expect(
+      JSON.stringify((store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls)
+    ).toContain('exceeded total timeout');
+  });
+
+  it('enforces timeout as a total AI deadline across retries, not an idle-only gap', async () => {
+    const hangingSendQuery = mock(async function* (_prompt, _cwd, _resume, options) {
+      await new Promise<void>(resolve => {
+        const signal = options?.abortSignal as AbortSignal | undefined;
+        if (signal?.aborted) {
+          resolve();
+          return;
+        }
+        signal?.addEventListener('abort', () => resolve(), { once: true });
+      });
+    });
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: hangingSendQuery,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    }));
+    const startedAt = Date.now();
+
+    await executeDagWorkflow(
+      createMockDeps(),
+      createMockPlatform(),
+      'conv-deadline',
+      testDir,
+      {
+        name: 'deadline-test',
+        nodes: [
+          {
+            id: 'ai',
+            prompt: 'hang',
+            idle_timeout: 30_000,
+            timeout: 50,
+            retry: { max_attempts: 2, delay_ms: 1, on_error: 'all' },
+          } as DagNode,
+        ],
+      },
+      makeWorkflowRun('deadline-run'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+
+    expect(Date.now() - startedAt).toBeLessThan(500);
+    expect(hangingSendQuery).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('executeDagWorkflow -- hardened durable budgets', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(tmpdir(), `dag-budget-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(testDir, { recursive: true });
+    mockSendQueryDag.mockClear();
+  });
+
+  afterEach(async () => {
+    mockGetAgentProviderDag.mockReset();
+    mockGetAgentProviderDag.mockImplementation(() => ({
+      sendQuery: mockSendQueryDag,
+      getType: () => 'claude',
+      getCapabilities: mockClaudeCapabilities,
+    }));
+    await rm(testDir, { recursive: true, force: true });
+  });
+
+  const hardenedExecContext = {
+    kind: 'container' as const,
+    containerId: 'budget-container',
+    execUser: 'archon',
+    profile: 'hardened',
+  };
+
+  const budgetWorkflow = (nodes: DagNode[]): WorkflowDefinition => ({
+    name: 'budgeted-workflow',
+    description: 'requires a controller budget grant',
+    hardened: { required: true },
+    nodes,
+  });
+
+  const grantFor = (
+    workflow: WorkflowDefinition,
+    runId: string,
+    total = 100
+  ): WorkflowBudgetGrant => ({
+    runId,
+    workflowName: workflow.name,
+    workflowDigest: computeControllerWorkflowDigest(workflow),
+    deadlineAt: new Date(Date.now() + 60_000).toISOString(),
+    tokens: { total },
+  });
+
+  function proxyBudgetStatus(
+    runId: string,
+    workflow: WorkflowDefinition,
+    consumed: { input: number; output: number },
+    budgetGrant: WorkflowBudgetGrant = grantFor(workflow, runId)
+  ) {
+    return {
+      source: 'controller-proxy-ledger' as const,
+      envId: 'env-budget',
+      grant: {
+        schema: 'archon.proxy-budget-grant.v1' as const,
+        rootChainId: runId,
+        runId,
+        workflowDigest: computeControllerWorkflowDigest(workflow),
+        policyDigest: 'policy-digest',
+        deadlineEpochMs: Date.parse(budgetGrant.deadlineAt),
+        inputTokenLimit: budgetGrant.tokens.input ?? budgetGrant.tokens.total,
+        outputTokenLimit: budgetGrant.tokens.output ?? budgetGrant.tokens.total,
+        totalTokenLimit: budgetGrant.tokens.total,
+      },
+      consumed,
+      pendingReservations: 0,
+      unknownReservations: 0,
+      acceptingReservations: true,
+    };
+  }
+
+  function proxyBudgetContext(
+    readProxyBudgetStatus: (
+      envId: string,
+      binding: {
+        egressPolicyB64: string;
+        image: string;
+        ownerRunId: string;
+        proxyBudgetSeedDigest: string;
+      }
+    ) => Promise<ReturnType<typeof proxyBudgetStatus>>
+  ) {
+    return {
+      envId: 'env-budget',
+      writeBack: 'auto' as const,
+      proxyBudgetSeedDigest: 'a'.repeat(64),
+      egressPolicyB64: 'egress-policy',
+      image: 'sha256:' + '1'.repeat(64),
+      ownerRunId: 'owner-run',
+      backend: {
+        readProxyBudgetStatus,
+        suspend: mock(async () => undefined),
+        finalize: mock(async () => ({ hasChanges: false, changeSummary: { files: [] } })),
+        applyChanges: mock(async () => ({ applied: true, files: [] })),
+        discardChanges: mock(async () => undefined),
+      },
+    };
+  }
+
+  function proxyBudgetContextForConsumptions(
+    runId: string,
+    workflow: WorkflowDefinition,
+    grant: WorkflowBudgetGrant,
+    consumptions: Array<{ input: number; output: number }>
+  ) {
+    const reads = [...consumptions];
+    const readProxyBudgetStatus = mock(async () =>
+      proxyBudgetStatus(
+        runId,
+        workflow,
+        reads.shift() ?? consumptions.at(-1) ?? { input: 0, output: 0 },
+        grant
+      )
+    );
+    return proxyBudgetContext(readProxyBudgetStatus);
+  }
+
+  function lastBudgetWrite(
+    store: IWorkflowStore
+  ): { consumed: { input: number; output: number } } | undefined {
+    return (store.updateWorkflowRun as ReturnType<typeof mock>).mock.calls
+      .map(
+        call =>
+          (call[1] as { metadata?: Record<string, unknown> }).metadata?.[
+            WORKFLOW_BUDGET_METADATA_KEY
+          ]
+      )
+      .filter(Boolean)
+      .at(-1) as { consumed: { input: number; output: number } } | undefined;
+  }
+
+  for (const metadata of [
+    {
+      approval: { type: 'approval', nodeId: 'review', message: 'Review' },
+      rejection_reason: 'Fix',
+    },
+    { approval: { type: 'approval', nodeId: 'review', message: 'Review', resolved: 'rejected' } },
+    { approval: {}, rejection_reason: 'Fix' },
+    { rejection_reason: 'Fix' },
+    { approval: { resolved: 'rejected' } },
+    { approval: null },
+    { approval: 123 },
+    { approval: { nodeId: 'review', message: 'Review', resolved: 'invalid' } },
+    { approval: { nodeId: 'review', message: 'Review', type: 'invalid' } },
+    { rejection_reason: false },
+  ]) {
+    it(`refuses persisted guarded rejection or malformed approval before rework: ${JSON.stringify(metadata)}`, async () => {
+      const store = createMockStore();
+      const deps = createMockDeps(store);
+      const workflow = budgetWorkflow([
+        {
+          id: 'review',
+          approval: { message: 'Review', on_reject: { prompt: 'Fix', max_attempts: 3 } },
+        },
+      ]);
+      const run = makeWorkflowRun('budget-reject-stale', { metadata });
+      await expect(
+        executeDagWorkflow(
+          { ...deps, workflowBudgetGrants: [grantFor(workflow, run.id)] },
+          createMockPlatform(),
+          'conv-budget',
+          testDir,
+          workflow,
+          run,
+          'claude',
+          undefined,
+          join(testDir, 'artifacts'),
+          join(testDir, 'state'),
+          join(testDir, 'logs'),
+          'main',
+          'docs/',
+          minimalConfig,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          hardenedExecContext
+        )
+      ).rejects.toThrow(/Guarded.*(fresh guarded run|malformed)/);
+      expect(mockSendQueryDag).not.toHaveBeenCalled();
+      expect(store.pauseWorkflowRun).not.toHaveBeenCalled();
+    });
+  }
+
+  it('fails closed before AI work when a hardened run has no controller budget grant', async () => {
+    const store = createMockStore();
+    const workflow = budgetWorkflow([{ id: 'ai', prompt: 'do work', depends_on: [] }]);
+
+    await expect(
+      executeDagWorkflow(
+        createMockDeps(store),
+        createMockPlatform(),
+        'conv-budget',
+        testDir,
+        workflow,
+        makeWorkflowRun('budget-no-grant'),
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        hardenedExecContext
+      )
+    ).rejects.toThrow(/requires a controller-private budget grant/);
+
+    expect(mockSendQueryDag).toHaveBeenCalledTimes(0);
+  });
+
+  it('refuses a hardened workflow child before dispatch even with fabricated child grants', async () => {
+    const store = createMockStore();
+    const workflow = budgetWorkflow([{ id: 'child', workflow: 'child-budgeted' } as DagNode]);
+    const workflowRun = makeWorkflowRun('budget-child-parent');
+    const runChild = mock(async () => ({
+      childRunId: 'child-run-should-not-exist',
+      status: 'completed' as const,
+      output: 'spent outside parent',
+    }));
+
+    await expect(
+      executeDagWorkflow(
+        {
+          ...createMockDeps(store),
+          workflowBudgetGrants: [
+            grantFor(workflow, workflowRun.id),
+            {
+              runId: 'child-run-should-not-exist',
+              workflowName: 'child-budgeted',
+              workflowDigest: 'sha256:fabricated-child',
+              deadlineAt: new Date(Date.now() + 60_000).toISOString(),
+              tokens: { total: 1_000_000 },
+            },
+          ],
+        },
+        createMockPlatform(),
+        'conv-budget',
+        testDir,
+        workflow,
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        hardenedExecContext,
+        undefined,
+        runChild
+      )
+    ).rejects.toThrow(/Child workflows are unsupported in container runs/);
+
+    expect(runChild).not.toHaveBeenCalled();
+    expect(store.createWorkflowRun).not.toHaveBeenCalled();
+    expect(mockSendQueryDag).not.toHaveBeenCalled();
+  });
+
+  it('refuses hardened workflow child retry before any repeated child dispatch', async () => {
+    const store = createMockStore();
+    const workflow = budgetWorkflow([
+      {
+        id: 'child',
+        workflow: 'child-budgeted',
+        retry: { max_attempts: 2, delay_ms: 1, on_error: 'all' },
+      } as DagNode,
+    ]);
+    const workflowRun = makeWorkflowRun('budget-child-retry-parent');
+    const runChild = mock(async () => ({
+      childRunId: 'child-run-should-not-exist',
+      status: 'failed' as const,
+      error: 'spent outside parent',
+    }));
+
+    await expect(
+      executeDagWorkflow(
+        { ...createMockDeps(store), workflowBudgetGrants: [grantFor(workflow, workflowRun.id)] },
+        createMockPlatform(),
+        'conv-budget',
+        testDir,
+        workflow,
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        hardenedExecContext,
+        undefined,
+        runChild
+      )
+    ).rejects.toThrow(/Child workflows are unsupported in container runs/);
+
+    expect(runChild).not.toHaveBeenCalled();
+    expect(store.createWorkflowRun).not.toHaveBeenCalled();
+  });
+
+  it('refuses resumed hardened workflow children before re-driving an existing child', async () => {
+    const store = createMockStore();
+    const workflow = budgetWorkflow([{ id: 'child', workflow: 'child-budgeted' } as DagNode]);
+    const workflowDigest = computeControllerWorkflowDigest(workflow);
+    const deadlineAt = new Date(Date.now() + 60_000).toISOString();
+    const workflowRun = makeWorkflowRun('budget-child-resume-parent', {
+      metadata: {
+        [WORKFLOW_BUDGET_METADATA_KEY]: {
+          workflowDigest,
+          deadlineAt,
+          tokens: { total: 100 },
+          consumed: { input: 10, output: 5 },
+          updatedAt: new Date().toISOString(),
+        },
+      },
+    });
+    const runChild = mock(async () => ({
+      childRunId: 'existing-child-run',
+      status: 'completed' as const,
+      output: 'resumed outside parent',
+    }));
+
+    await expect(
+      executeDagWorkflow(
+        {
+          ...createMockDeps(store),
+          workflowBudgetGrants: [
+            {
+              runId: workflowRun.id,
+              workflowName: workflow.name,
+              workflowDigest,
+              deadlineAt,
+              tokens: { total: 100 },
+            },
+          ],
+        },
+        createMockPlatform(),
+        'conv-budget',
+        testDir,
+        workflow,
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig,
+        undefined,
+        undefined,
+        new Map(),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        hardenedExecContext,
+        undefined,
+        runChild,
+        { input: 10, output: 5 }
+      )
+    ).rejects.toThrow(/Child workflows are unsupported in container runs/);
+
+    expect(runChild).not.toHaveBeenCalled();
+    expect(store.findChildRuns).not.toHaveBeenCalled();
+    expect(mockSendQueryDag).not.toHaveBeenCalled();
+  });
+
+  it('fails closed before hardened AI work when proxy ledger binding is missing', async () => {
+    const store = createMockStore();
+    const workflow = budgetWorkflow([{ id: 'ai', prompt: 'do work', depends_on: [] }]);
+    const workflowRun = makeWorkflowRun('budget-no-ledger-binding');
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'done' };
+      yield { type: 'result', sessionId: 'budget-session', tokens: { input: 1, output: 0 } };
+    });
+
+    await expect(
+      executeDagWorkflow(
+        { ...createMockDeps(store), workflowBudgetGrants: [grantFor(workflow, workflowRun.id)] },
+        createMockPlatform(),
+        'conv-budget',
+        testDir,
+        workflow,
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        hardenedExecContext
+      )
+    ).rejects.toThrow(/proxy ledger binding|proxy ledger status/);
+
+    expect(mockSendQueryDag).not.toHaveBeenCalled();
+  });
+
+  it('allows a hardened deterministic no-egress bash workflow without proxy ledger status', async () => {
+    const store = createMockStore();
+    const workflow = budgetWorkflow([{ id: 'offline', bash: 'echo offline-ok' } as BashNode]);
+    const workflowRun = makeWorkflowRun('budget-offline-bash');
+
+    const execSpy = spyOn(git, 'execFileAsync').mockResolvedValue({
+      stdout: 'offline-ok\n',
+      stderr: '',
+    });
+    try {
+      await executeDagWorkflow(
+        { ...createMockDeps(store), workflowBudgetGrants: [grantFor(workflow, workflowRun.id)] },
+        createMockPlatform(),
+        'conv-budget',
+        testDir,
+        workflow,
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        hardenedExecContext
+      );
+    } finally {
+      execSpy.mockRestore();
+    }
+
+    expect(mockSendQueryDag).not.toHaveBeenCalled();
+    expect(store.completeWorkflowRun).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses verified proxy ledger consumption instead of forged low provider tokens', async () => {
+    const store = createMockStore();
+    const workflow = budgetWorkflow([{ id: 'ai', prompt: 'finish', depends_on: [] }]);
+    const workflowRun = makeWorkflowRun('budget-ledger-low');
+    const grant = grantFor(workflow, workflowRun.id, 100);
+    const statusReads = [
+      { input: 95, output: 0 },
+      { input: 95, output: 0 },
+      { input: 101, output: 0 },
+    ];
+    const readProxyBudgetStatus = mock(async () =>
+      proxyBudgetStatus(
+        workflowRun.id,
+        workflow,
+        statusReads.shift() ?? { input: 101, output: 0 },
+        grant
+      )
+    );
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'done' };
+      yield { type: 'result', sessionId: 'budget-session', tokens: { input: 1, output: 0 } };
+    });
+
+    await expect(
+      executeDagWorkflow(
+        { ...createMockDeps(store), workflowBudgetGrants: [grant] },
+        createMockPlatform(),
+        'conv-budget',
+        testDir,
+        workflow,
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        hardenedExecContext,
+        proxyBudgetContext(readProxyBudgetStatus)
+      )
+    ).rejects.toThrow(/total token budget exceeded|exceeded hardened workflow total token budget/);
+
+    expect(mockSendQueryDag).toHaveBeenCalledTimes(1);
+    expect(lastBudgetWrite(store)?.consumed).toEqual({ input: 101, output: 0 });
+  });
+
+  it('uses verified proxy ledger consumption instead of forged high provider tokens', async () => {
+    const store = createMockStore();
+    const workflow = budgetWorkflow([{ id: 'ai', prompt: 'finish', depends_on: [] }]);
+    const workflowRun = makeWorkflowRun('budget-ledger-high');
+    const grant = grantFor(workflow, workflowRun.id, 100);
+    const statusReads = [
+      { input: 0, output: 0 },
+      { input: 5, output: 1 },
+    ];
+    const readProxyBudgetStatus = mock(async () =>
+      proxyBudgetStatus(
+        workflowRun.id,
+        workflow,
+        statusReads.shift() ?? { input: 5, output: 1 },
+        grant
+      )
+    );
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'done' };
+      yield { type: 'result', sessionId: 'budget-session', tokens: { input: 999, output: 0 } };
+    });
+
+    await executeDagWorkflow(
+      { ...createMockDeps(store), workflowBudgetGrants: [grant] },
+      createMockPlatform(),
+      'conv-budget',
+      testDir,
+      workflow,
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      hardenedExecContext,
+      proxyBudgetContext(readProxyBudgetStatus)
+    );
+
+    expect(mockSendQueryDag).toHaveBeenCalledTimes(1);
+    expect(lastBudgetWrite(store)?.consumed).toEqual({ input: 5, output: 1 });
+  });
+
+  it('uses verified proxy ledger consumption instead of mutated high persisted budget state', async () => {
+    const store = createMockStore();
+    const workflow = budgetWorkflow([{ id: 'ai', prompt: 'finish', depends_on: [] }]);
+    const workflowRun = makeWorkflowRun('budget-ledger-persisted-high', {
+      metadata: {
+        [WORKFLOW_BUDGET_METADATA_KEY]: {
+          workflowDigest: computeControllerWorkflowDigest(workflow),
+          deadlineAt: new Date(Date.now() + 60_000).toISOString(),
+          tokens: { total: 100 },
+          consumed: { input: 99, output: 0 },
+          updatedAt: new Date().toISOString(),
+        },
+      },
+    });
+    const grant = {
+      ...grantFor(workflow, workflowRun.id, 100),
+      deadlineAt: (workflowRun.metadata[WORKFLOW_BUDGET_METADATA_KEY] as { deadlineAt: string })
+        .deadlineAt,
+    };
+    const statusReads = [
+      { input: 0, output: 0 },
+      { input: 5, output: 0 },
+    ];
+    const readProxyBudgetStatus = mock(async () =>
+      proxyBudgetStatus(
+        workflowRun.id,
+        workflow,
+        statusReads.shift() ?? { input: 5, output: 0 },
+        grant
+      )
+    );
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'done' };
+      yield { type: 'result', sessionId: 'budget-session', tokens: { input: 1, output: 0 } };
+    });
+
+    await executeDagWorkflow(
+      { ...createMockDeps(store), workflowBudgetGrants: [grant] },
+      createMockPlatform(),
+      'conv-budget',
+      testDir,
+      workflow,
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      new Map(),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      hardenedExecContext,
+      proxyBudgetContext(readProxyBudgetStatus),
+      undefined,
+      { input: 0, output: 0 }
+    );
+
+    expect(lastBudgetWrite(store)?.consumed).toEqual({ input: 5, output: 0 });
+    expect(store.completeWorkflowRun).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses verified proxy ledger consumption instead of mutated low persisted budget state', async () => {
+    const store = createMockStore();
+    const workflow = budgetWorkflow([{ id: 'ai', prompt: 'finish', depends_on: [] }]);
+    const workflowRun = makeWorkflowRun('budget-ledger-persisted-low', {
+      metadata: {
+        [WORKFLOW_BUDGET_METADATA_KEY]: {
+          workflowDigest: computeControllerWorkflowDigest(workflow),
+          deadlineAt: new Date(Date.now() + 60_000).toISOString(),
+          tokens: { total: 100 },
+          consumed: { input: 0, output: 0 },
+          updatedAt: new Date().toISOString(),
+        },
+      },
+    });
+    const grant = {
+      ...grantFor(workflow, workflowRun.id, 100),
+      deadlineAt: (workflowRun.metadata[WORKFLOW_BUDGET_METADATA_KEY] as { deadlineAt: string })
+        .deadlineAt,
+    };
+    const statusReads = [
+      { input: 95, output: 0 },
+      { input: 101, output: 0 },
+    ];
+    const readProxyBudgetStatus = mock(async () =>
+      proxyBudgetStatus(
+        workflowRun.id,
+        workflow,
+        statusReads.shift() ?? { input: 101, output: 0 },
+        grant
+      )
+    );
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'done' };
+      yield { type: 'result', sessionId: 'budget-session', tokens: { input: 1, output: 0 } };
+    });
+
+    await expect(
+      executeDagWorkflow(
+        { ...createMockDeps(store), workflowBudgetGrants: [grant] },
+        createMockPlatform(),
+        'conv-budget',
+        testDir,
+        workflow,
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig,
+        undefined,
+        undefined,
+        new Map(),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        hardenedExecContext,
+        proxyBudgetContext(readProxyBudgetStatus),
+        undefined,
+        { input: 0, output: 0 }
+      )
+    ).rejects.toThrow(/exceeded hardened workflow total token budget/);
+
+    expect(lastBudgetWrite(store)?.consumed).toEqual({ input: 101, output: 0 });
+  });
+
+  it('blocks hardened AI before work when verified proxy ledger status is pending', async () => {
+    const store = createMockStore();
+    const workflow = budgetWorkflow([{ id: 'ai', prompt: 'finish', depends_on: [] }]);
+    const workflowRun = makeWorkflowRun('budget-ledger-pending');
+    const grant = grantFor(workflow, workflowRun.id);
+    const readProxyBudgetStatus = mock(async () => ({
+      ...proxyBudgetStatus(workflowRun.id, workflow, { input: 10, output: 0 }, grant),
+      pendingReservations: 1,
+      acceptingReservations: false,
+    }));
+
+    await expect(
+      executeDagWorkflow(
+        { ...createMockDeps(store), workflowBudgetGrants: [grant] },
+        createMockPlatform(),
+        'conv-budget',
+        testDir,
+        workflow,
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        hardenedExecContext,
+        proxyBudgetContext(readProxyBudgetStatus)
+      )
+    ).rejects.toThrow(/pending or unknown/);
+    expect(mockSendQueryDag).not.toHaveBeenCalled();
+  });
+
+  it('uses persisted resume consumption when event-derived prior usage is missing', async () => {
+    const store = createMockStore();
+    const workflow = budgetWorkflow([{ id: 'ai', prompt: 'finish', depends_on: [] }]);
+    const workflowRun = makeWorkflowRun('budget-resume', {
+      metadata: {
+        [WORKFLOW_BUDGET_METADATA_KEY]: {
+          workflowDigest: computeControllerWorkflowDigest(workflow),
+          deadlineAt: new Date(Date.now() + 60_000).toISOString(),
+          tokens: { total: 100 },
+          consumed: { input: 90, output: 0 },
+          updatedAt: new Date(Date.now() - 1_000).toISOString(),
+        },
+      },
+    });
+    const grant = {
+      ...grantFor(workflow, workflowRun.id, 100),
+      deadlineAt: (workflowRun.metadata[WORKFLOW_BUDGET_METADATA_KEY] as { deadlineAt: string })
+        .deadlineAt,
+    };
+
+    const statusReads = [
+      { input: 90, output: 0 },
+      { input: 90, output: 0 },
+      { input: 101, output: 0 },
+    ];
+    const readProxyBudgetStatus = mock(async () =>
+      proxyBudgetStatus(
+        workflowRun.id,
+        workflow,
+        statusReads.shift() ?? { input: 101, output: 0 },
+        grant
+      )
+    );
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'done' };
+      yield { type: 'result', sessionId: 'budget-session', tokens: { input: 11, output: 0 } };
+    });
+
+    await expect(
+      executeDagWorkflow(
+        { ...createMockDeps(store), workflowBudgetGrants: [grant] },
+        createMockPlatform(),
+        'conv-budget',
+        testDir,
+        workflow,
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig,
+        undefined,
+        undefined,
+        new Map(),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        hardenedExecContext,
+        proxyBudgetContext(readProxyBudgetStatus),
+        undefined,
+        { input: 0, output: 0 }
+      )
+    ).rejects.toThrow(/exceeded hardened workflow total token budget/);
+
+    expect(mockSendQueryDag).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects resumed hardened runs without persisted budget state', async () => {
+    const workflow = budgetWorkflow([{ id: 'ai', prompt: 'finish', depends_on: [] }]);
+    const workflowRun = makeWorkflowRun('budget-resume-missing');
+
+    await expect(
+      executeDagWorkflow(
+        {
+          ...createMockDeps(createMockStore()),
+          workflowBudgetGrants: [grantFor(workflow, workflowRun.id)],
+        },
+        createMockPlatform(),
+        'conv-budget',
+        testDir,
+        workflow,
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig,
+        undefined,
+        undefined,
+        new Map(),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        hardenedExecContext,
+        undefined,
+        undefined,
+        { input: 0, output: 0 }
+      )
+    ).rejects.toThrow(/resume is missing persisted budget state/);
+    expect(mockSendQueryDag).toHaveBeenCalledTimes(0);
+  });
+
+  it('rejects malformed persisted budget state on resume', async () => {
+    const workflow = budgetWorkflow([{ id: 'ai', prompt: 'finish', depends_on: [] }]);
+    const workflowDigest = computeControllerWorkflowDigest(workflow);
+    const deadlineAt = new Date(Date.now() + 60_000).toISOString();
+    const workflowRun = makeWorkflowRun('budget-resume-malformed', {
+      metadata: {
+        [WORKFLOW_BUDGET_METADATA_KEY]: {
+          workflowDigest,
+          deadlineAt,
+          tokens: { total: 100 },
+          consumed: { input: -1, output: 0 },
+          updatedAt: 'not-a-date',
+        },
+      },
+    });
+
+    await expect(
+      executeDagWorkflow(
+        {
+          ...createMockDeps(createMockStore()),
+          workflowBudgetGrants: [
+            {
+              runId: workflowRun.id,
+              workflowName: workflow.name,
+              workflowDigest,
+              deadlineAt,
+              tokens: { total: 100 },
+            },
+          ],
+        },
+        createMockPlatform(),
+        'conv-budget',
+        testDir,
+        workflow,
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig,
+        undefined,
+        undefined,
+        new Map(),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        hardenedExecContext,
+        undefined,
+        undefined,
+        { input: 0, output: 0 }
+      )
+    ).rejects.toThrow(/persisted budget state is malformed/);
+    expect(mockSendQueryDag).toHaveBeenCalledTimes(0);
+  });
+
+  it('rejects resumed hardened runs whose grant does not match persisted budget state', async () => {
+    const workflow = budgetWorkflow([{ id: 'ai', prompt: 'finish', depends_on: [] }]);
+    const workflowDigest = computeControllerWorkflowDigest(workflow);
+    const workflowRun = makeWorkflowRun('budget-resume-mismatch', {
+      metadata: {
+        [WORKFLOW_BUDGET_METADATA_KEY]: {
+          workflowDigest,
+          deadlineAt: new Date(Date.now() + 60_000).toISOString(),
+          tokens: { total: 100 },
+          consumed: { input: 1, output: 0 },
+          updatedAt: new Date().toISOString(),
+        },
+      },
+    });
+
+    await expect(
+      executeDagWorkflow(
+        {
+          ...createMockDeps(createMockStore()),
+          workflowBudgetGrants: [grantFor(workflow, workflowRun.id, 101)],
+        },
+        createMockPlatform(),
+        'conv-budget',
+        testDir,
+        workflow,
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig,
+        undefined,
+        undefined,
+        new Map(),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        hardenedExecContext,
+        undefined,
+        undefined,
+        { input: 0, output: 0 }
+      )
+    ).rejects.toThrow(/does not match persisted budget state/);
+    expect(mockSendQueryDag).toHaveBeenCalledTimes(0);
+  });
+
+  it('rejects non-finite prior token usage before hardened resume work', async () => {
+    const workflow = budgetWorkflow([{ id: 'ai', prompt: 'finish', depends_on: [] }]);
+    const workflowDigest = computeControllerWorkflowDigest(workflow);
+    const deadlineAt = new Date(Date.now() + 60_000).toISOString();
+    const workflowRun = makeWorkflowRun('budget-prior-nan', {
+      metadata: {
+        [WORKFLOW_BUDGET_METADATA_KEY]: {
+          workflowDigest,
+          deadlineAt,
+          tokens: { total: 100 },
+          consumed: { input: 1, output: 0 },
+          updatedAt: new Date().toISOString(),
+        },
+      },
+    });
+
+    await expect(
+      executeDagWorkflow(
+        {
+          ...createMockDeps(createMockStore()),
+          workflowBudgetGrants: [
+            {
+              runId: workflowRun.id,
+              workflowName: workflow.name,
+              workflowDigest,
+              deadlineAt,
+              tokens: { total: 100 },
+            },
+          ],
+        },
+        createMockPlatform(),
+        'conv-budget',
+        testDir,
+        workflow,
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig,
+        undefined,
+        undefined,
+        new Map(),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        hardenedExecContext,
+        undefined,
+        undefined,
+        { input: Number.NaN, output: 0 }
+      )
+    ).rejects.toThrow(/prior token usage is malformed/);
+    expect(mockSendQueryDag).toHaveBeenCalledTimes(0);
+  });
+
+  it('rejects mismatched persisted budget state even on a fresh hardened run', async () => {
+    const workflow = budgetWorkflow([{ id: 'ai', prompt: 'finish', depends_on: [] }]);
+    const workflowDigest = computeControllerWorkflowDigest(workflow);
+    const deadlineAt = new Date(Date.now() + 60_000).toISOString();
+    const workflowRun = makeWorkflowRun('budget-fresh-mismatch', {
+      metadata: {
+        [WORKFLOW_BUDGET_METADATA_KEY]: {
+          workflowDigest: 'different-digest',
+          deadlineAt,
+          tokens: { total: 100 },
+          consumed: { input: 0, output: 0 },
+          updatedAt: new Date().toISOString(),
+        },
+      },
+    });
+
+    await expect(
+      executeDagWorkflow(
+        {
+          ...createMockDeps(createMockStore()),
+          workflowBudgetGrants: [
+            {
+              runId: workflowRun.id,
+              workflowName: workflow.name,
+              workflowDigest,
+              deadlineAt,
+              tokens: { total: 100 },
+            },
+          ],
+        },
+        createMockPlatform(),
+        'conv-budget',
+        testDir,
+        workflow,
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        hardenedExecContext
+      )
+    ).rejects.toThrow(/does not match persisted budget state/);
+    expect(mockSendQueryDag).toHaveBeenCalledTimes(0);
+  });
+
+  it('refuses to continue after a hardened AI attempt without token usage', async () => {
+    const store = createMockStore();
+    const workflow = budgetWorkflow([
+      {
+        id: 'ai',
+        prompt: 'retry missing usage',
+        retry: { max_attempts: 3, delay_ms: 1, on_error: 'all' },
+        depends_on: [],
+      } as DagNode,
+    ]);
+    const workflowRun = makeWorkflowRun('budget-missing-usage');
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'failed without usage' };
+      yield {
+        type: 'result',
+        sessionId: 'missing-usage',
+        isError: true,
+        errorSubtype: 'api_error',
+      };
+    });
+
+    await expect(
+      executeDagWorkflow(
+        {
+          ...createMockDeps(store),
+          workflowBudgetGrants: [grantFor(workflow, workflowRun.id, 100)],
+        },
+        createMockPlatform(),
+        'conv-budget',
+        testDir,
+        workflow,
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        hardenedExecContext
+      )
+    ).rejects.toThrow(/proxy ledger binding|proxy ledger status/);
+
+    expect(mockSendQueryDag).toHaveBeenCalledTimes(0);
+  });
+
+  it('refuses unknown persisted consumption until the controller supplies authoritative usage', async () => {
+    const workflow = budgetWorkflow([{ id: 'ai', prompt: 'finish', depends_on: [] }]);
+    const workflowDigest = computeControllerWorkflowDigest(workflow);
+    const deadlineAt = new Date(Date.now() + 60_000).toISOString();
+    const workflowRun = makeWorkflowRun('budget-unknown-resume', {
+      metadata: {
+        [WORKFLOW_BUDGET_METADATA_KEY]: {
+          workflowDigest,
+          deadlineAt,
+          tokens: { total: 100 },
+          consumed: { input: 0, output: 0 },
+          unknownConsumption: true,
+          updatedAt: new Date().toISOString(),
+        },
+      },
+    });
+
+    await expect(
+      executeDagWorkflow(
+        {
+          ...createMockDeps(createMockStore()),
+          workflowBudgetGrants: [
+            {
+              runId: workflowRun.id,
+              workflowName: workflow.name,
+              workflowDigest,
+              deadlineAt,
+              tokens: { total: 100 },
+            },
+          ],
+        },
+        createMockPlatform(),
+        'conv-budget',
+        testDir,
+        workflow,
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig,
+        undefined,
+        undefined,
+        new Map(),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        hardenedExecContext,
+        undefined,
+        undefined,
+        { input: 0, output: 0 }
+      )
+    ).rejects.toThrow(/unknown prior budget consumption/);
+    expect(mockSendQueryDag).toHaveBeenCalledTimes(0);
+  });
+
+  it('continues from unknown persisted consumption only with verified proxy ledger usage', async () => {
+    const store = createMockStore();
+    const workflow = budgetWorkflow([{ id: 'ai', prompt: 'finish', depends_on: [] }]);
+    const workflowDigest = computeControllerWorkflowDigest(workflow);
+    const deadlineAt = new Date(Date.now() + 60_000).toISOString();
+    const workflowRun = makeWorkflowRun('budget-unknown-authoritative', {
+      metadata: {
+        [WORKFLOW_BUDGET_METADATA_KEY]: {
+          workflowDigest,
+          deadlineAt,
+          tokens: { total: 100 },
+          consumed: { input: 0, output: 0 },
+          unknownConsumption: true,
+          updatedAt: new Date().toISOString(),
+        },
+      },
+    });
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'done' };
+      yield { type: 'result', sessionId: 'authoritative', tokens: { input: 5, output: 0 } };
+    });
+    const grant = {
+      runId: workflowRun.id,
+      workflowName: workflow.name,
+      workflowDigest,
+      deadlineAt,
+      tokens: { total: 100 },
+    };
+    const statusReads = [
+      { input: 7, output: 0 },
+      { input: 12, output: 0 },
+    ];
+    const readProxyBudgetStatus = mock(async () =>
+      proxyBudgetStatus(
+        workflowRun.id,
+        workflow,
+        statusReads.shift() ?? { input: 12, output: 0 },
+        grant
+      )
+    );
+
+    await executeDagWorkflow(
+      { ...createMockDeps(store), workflowBudgetGrants: [grant] },
+      createMockPlatform(),
+      'conv-budget',
+      testDir,
+      workflow,
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      new Map(),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      hardenedExecContext,
+      proxyBudgetContext(readProxyBudgetStatus),
+      undefined,
+      { input: 0, output: 0 }
+    );
+
+    const budgetWrites = (store.updateWorkflowRun as ReturnType<typeof mock>).mock.calls
+      .map(
+        call =>
+          (call[1] as { metadata?: Record<string, unknown> }).metadata?.[
+            WORKFLOW_BUDGET_METADATA_KEY
+          ]
+      )
+      .filter(Boolean) as Array<{
+      consumed: { input: number; output: number };
+      unknownConsumption?: boolean;
+    }>;
+    expect(budgetWrites.at(-1)?.consumed).toEqual({ input: 12, output: 0 });
+    expect(budgetWrites.at(-1)?.unknownConsumption).toBeUndefined();
+  });
+
+  it('accumulates every valid structured-output reask pass against hardened budget on success', async () => {
+    const store = createMockStore();
+    const workflow = budgetWorkflow([
+      {
+        id: 'classify',
+        prompt: 'decide',
+        provider: TEST_BEST_EFFORT_CONTAINER_PROVIDER,
+        output_format: {
+          type: 'object',
+          properties: { verdict: { type: 'string' } },
+          required: ['verdict'],
+        },
+        retry: { max_attempts: 0 },
+        depends_on: [],
+      } as DagNode,
+    ]);
+    const workflowRun = makeWorkflowRun('budget-reask-success');
+    const grant = grantFor(workflow, workflowRun.id, 100);
+    mockSendQueryDag.mockImplementationOnce(function* () {
+      yield {
+        type: 'result',
+        sessionId: 'invalid-pass',
+        structuredOutput: { other: 'x' },
+        tokens: { input: 10, output: 1 },
+      };
+    });
+    mockSendQueryDag.mockImplementation(function* () {
+      yield {
+        type: 'result',
+        sessionId: 'valid-pass',
+        structuredOutput: { verdict: 'review' },
+        tokens: { input: 12, output: 2 },
+      };
+    });
+
+    await executeDagWorkflow(
+      {
+        ...createMockDeps(store),
+        workflowBudgetGrants: [grant],
+      },
+      createMockPlatform(),
+      'conv-budget',
+      testDir,
+      workflow,
+      workflowRun,
+      TEST_BEST_EFFORT_CONTAINER_PROVIDER,
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      hardenedExecContext,
+      proxyBudgetContextForConsumptions(workflowRun.id, workflow, grant, [
+        { input: 0, output: 0 },
+        { input: 0, output: 0 },
+        { input: 10, output: 1 },
+        { input: 10, output: 1 },
+        { input: 22, output: 3 },
+        { input: 22, output: 3 },
+        { input: 22, output: 3 },
+      ])
+    );
+
+    expect(mockSendQueryDag).toHaveBeenCalledTimes(2);
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const completed = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as Record<string, unknown>).event_type === 'node_completed' &&
+        (call[0] as Record<string, unknown>).step_name === 'classify'
+    );
+    if (completed === undefined) throw new Error('expected classify completion event');
+    const completedData = (completed[0] as Record<string, unknown>).data as Record<string, unknown>;
+    expect(completedData.tokens).toEqual({
+      input: 22,
+      output: 3,
+    });
+    const budgetWrites = (store.updateWorkflowRun as ReturnType<typeof mock>).mock.calls
+      .map(
+        call =>
+          (call[1] as { metadata?: Record<string, unknown> }).metadata?.[
+            WORKFLOW_BUDGET_METADATA_KEY
+          ]
+      )
+      .filter(Boolean) as Array<{ consumed: { input: number; output: number } }>;
+    expect(budgetWrites.at(-1)?.consumed).toEqual({ input: 22, output: 3 });
+  });
+
+  it('includes failed retry usage before checking a hardened structured-output reask pass', async () => {
+    const store = createMockStore();
+    const workflow = budgetWorkflow([
+      {
+        id: 'classify',
+        prompt: 'decide',
+        provider: TEST_BEST_EFFORT_CONTAINER_PROVIDER,
+        output_format: {
+          type: 'object',
+          properties: { verdict: { type: 'string' } },
+          required: ['verdict'],
+        },
+        retry: { max_attempts: 1, on_error: 'all', delay_ms: 1 },
+        depends_on: [],
+      } as DagNode,
+    ]);
+    const workflowRun = makeWorkflowRun('budget-retry-reask-exhausted');
+    const grant = grantFor(workflow, workflowRun.id, 100);
+    mockSendQueryDag.mockImplementationOnce(function* () {
+      yield {
+        type: 'result',
+        sessionId: 'retry-fails-after-usage',
+        tokens: { input: 70, output: 0 },
+      };
+      throw new Error('retryable provider failure');
+    });
+    mockSendQueryDag.mockImplementationOnce(function* () {
+      yield {
+        type: 'result',
+        sessionId: 'invalid-reask',
+        structuredOutput: { other: 'x' },
+        tokens: { input: 40, output: 0 },
+      };
+    });
+    mockSendQueryDag.mockImplementation(function* () {
+      yield {
+        type: 'result',
+        sessionId: 'must-not-run',
+        structuredOutput: { verdict: 'late' },
+        tokens: { input: 1, output: 0 },
+      };
+    });
+
+    let caught: Error | undefined;
+    try {
+      await executeDagWorkflow(
+        {
+          ...createMockDeps(store),
+          workflowBudgetGrants: [grant],
+        },
+        createMockPlatform(),
+        'conv-budget',
+        testDir,
+        workflow,
+        workflowRun,
+        TEST_BEST_EFFORT_CONTAINER_PROVIDER,
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        hardenedExecContext,
+        proxyBudgetContextForConsumptions(workflowRun.id, workflow, grant, [
+          { input: 0, output: 0 },
+          { input: 0, output: 0 },
+          { input: 0, output: 0 },
+          { input: 70, output: 0 },
+          { input: 110, output: 0 },
+        ])
+      );
+    } catch (error) {
+      caught = error as Error;
+    }
+
+    expect(caught?.message).toContain('exceeded hardened workflow total token budget');
+
+    expect(mockSendQueryDag).toHaveBeenCalledTimes(2);
+    const budgetWrites = (store.updateWorkflowRun as ReturnType<typeof mock>).mock.calls
+      .map(
+        call =>
+          (call[1] as { metadata?: Record<string, unknown> }).metadata?.[
+            WORKFLOW_BUDGET_METADATA_KEY
+          ]
+      )
+      .filter(Boolean) as Array<{
+      consumed: { input: number; output: number };
+    }>;
+    expect(budgetWrites.at(-1)?.consumed).toEqual({ input: 110, output: 0 });
+    const failed = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.find(
+      call => (call[0] as Record<string, unknown>).event_type === 'node_failed'
+    );
+    if (failed === undefined) throw new Error('expected node_failed event');
+    expect(((failed[0] as Record<string, unknown>).data as { error?: string }).error).toContain(
+      'exceeded hardened workflow total token budget'
+    );
+  });
+
+  it('marks unknown when failed retry usage overflows a hardened structured-output pass total', async () => {
+    const store = createMockStore();
+    const workflow = budgetWorkflow([
+      {
+        id: 'classify',
+        prompt: 'decide',
+        provider: TEST_BEST_EFFORT_CONTAINER_PROVIDER,
+        output_format: {
+          type: 'object',
+          properties: { verdict: { type: 'string' } },
+          required: ['verdict'],
+        },
+        retry: { max_attempts: 1, on_error: 'all', delay_ms: 1 },
+        depends_on: [],
+      } as DagNode,
+    ]);
+    const workflowRun = makeWorkflowRun('budget-retry-reask-overflow');
+    mockSendQueryDag.mockImplementationOnce(function* () {
+      yield {
+        type: 'result',
+        sessionId: 'retry-near-overflow',
+        tokens: { input: Number.MAX_SAFE_INTEGER - 1, output: 0 },
+      };
+      throw new Error('retryable provider failure');
+    });
+    mockSendQueryDag.mockImplementation(function* () {
+      yield {
+        type: 'result',
+        sessionId: 'invalid-overflow',
+        structuredOutput: { other: 'x' },
+        tokens: { input: 2, output: 0 },
+      };
+    });
+
+    await expect(
+      executeDagWorkflow(
+        {
+          ...createMockDeps(store),
+          workflowBudgetGrants: [grantFor(workflow, workflowRun.id, Number.MAX_SAFE_INTEGER)],
+        },
+        createMockPlatform(),
+        'conv-budget',
+        testDir,
+        workflow,
+        workflowRun,
+        TEST_BEST_EFFORT_CONTAINER_PROVIDER,
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        hardenedExecContext
+      )
+    ).rejects.toThrow(/proxy ledger binding|proxy ledger status/);
+
+    expect(mockSendQueryDag).toHaveBeenCalledTimes(0);
+  });
+
+  it('accumulates every valid structured-output reask pass against hardened budget on exhaustion', async () => {
+    mockCaptureWorkflowCompleted.mockClear();
+    const store = createMockStore();
+    const workflow = budgetWorkflow([
+      {
+        id: 'classify',
+        prompt: 'decide',
+        provider: TEST_BEST_EFFORT_CONTAINER_PROVIDER,
+        output_format: {
+          type: 'object',
+          properties: { verdict: { type: 'string' } },
+          required: ['verdict'],
+        },
+        retry: { max_attempts: 0 },
+        depends_on: [],
+      } as DagNode,
+    ]);
+    const workflowRun = makeWorkflowRun('budget-reask-exhaust');
+    const grant = grantFor(workflow, workflowRun.id, 100);
+    const passInputs = [10, 11, 12, 13];
+    mockSendQueryDag.mockImplementation(function* () {
+      const input = passInputs.shift() ?? 0;
+      yield {
+        type: 'result',
+        sessionId: `invalid-${String(input)}`,
+        structuredOutput: { other: 'x' },
+        tokens: { input, output: 1 },
+      };
+    });
+
+    await executeDagWorkflow(
+      {
+        ...createMockDeps(store),
+        workflowBudgetGrants: [grant],
+      },
+      createMockPlatform(),
+      'conv-budget',
+      testDir,
+      workflow,
+      workflowRun,
+      TEST_BEST_EFFORT_CONTAINER_PROVIDER,
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      hardenedExecContext,
+      proxyBudgetContextForConsumptions(workflowRun.id, workflow, grant, [
+        { input: 0, output: 0 },
+        { input: 0, output: 0 },
+        { input: 10, output: 1 },
+        { input: 10, output: 1 },
+        { input: 21, output: 2 },
+        { input: 21, output: 2 },
+        { input: 33, output: 3 },
+        { input: 33, output: 3 },
+        { input: 46, output: 4 },
+        { input: 46, output: 4 },
+        { input: 46, output: 4 },
+      ])
+    );
+
+    expect(mockSendQueryDag).toHaveBeenCalledTimes(4);
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const failed = eventCalls.find(
+      (call: unknown[]) => (call[0] as Record<string, unknown>).event_type === 'node_failed'
+    );
+    if (failed === undefined) throw new Error('expected classify failure event');
+    const failedData = (failed[0] as Record<string, unknown>).data as Record<string, unknown>;
+    expect(failedData.error).toContain('failed schema validation');
+    const telemetry = mockCaptureWorkflowCompleted.mock.calls.at(-1)?.[0] as
+      | Record<string, unknown>
+      | undefined;
+    expect(telemetry).toEqual(expect.objectContaining({ outcome: 'failed' }));
+    const budgetWrites = (store.updateWorkflowRun as ReturnType<typeof mock>).mock.calls
+      .map(
+        call =>
+          (call[1] as { metadata?: Record<string, unknown> }).metadata?.[
+            WORKFLOW_BUDGET_METADATA_KEY
+          ]
+      )
+      .filter(Boolean) as Array<{ consumed: { input: number; output: number } }>;
+    expect(budgetWrites.at(-1)?.consumed).toEqual({ input: 46, output: 4 });
+  });
+
+  it('retains structured-output reask usage when a later hardened pass reports usage then throws', async () => {
+    mockCaptureWorkflowCompleted.mockClear();
+    const store = createMockStore();
+    const workflow = budgetWorkflow([
+      {
+        id: 'classify',
+        prompt: 'decide',
+        provider: TEST_BEST_EFFORT_CONTAINER_PROVIDER,
+        output_format: {
+          type: 'object',
+          properties: { verdict: { type: 'string' } },
+          required: ['verdict'],
+        },
+        retry: { max_attempts: 0 },
+        depends_on: [],
+      } as DagNode,
+    ]);
+    const workflowRun = makeWorkflowRun('budget-reask-throws-after-usage');
+    const grant = grantFor(workflow, workflowRun.id, 100);
+    mockSendQueryDag.mockImplementationOnce(function* () {
+      yield {
+        type: 'result',
+        sessionId: 'invalid-pass',
+        structuredOutput: { other: 'x' },
+        tokens: { input: 10, output: 1 },
+      };
+    });
+    mockSendQueryDag.mockImplementation(function* () {
+      yield {
+        type: 'background_tasks',
+        tasks: [{ taskId: 't1', taskType: 'general', description: 'still running' }],
+      };
+      yield {
+        type: 'result',
+        sessionId: 'throws-after-usage',
+        structuredOutput: { other: 'still invalid' },
+        tokens: { input: 5, output: 1 },
+      };
+      throw new Error('provider exploded');
+    });
+
+    await executeDagWorkflow(
+      {
+        ...createMockDeps(store),
+        workflowBudgetGrants: [grant],
+      },
+      createMockPlatform(),
+      'conv-budget',
+      testDir,
+      workflow,
+      workflowRun,
+      TEST_BEST_EFFORT_CONTAINER_PROVIDER,
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      hardenedExecContext,
+      proxyBudgetContextForConsumptions(workflowRun.id, workflow, grant, [
+        { input: 0, output: 0 },
+        { input: 0, output: 0 },
+        { input: 10, output: 1 },
+        { input: 10, output: 1 },
+        { input: 15, output: 2 },
+        { input: 15, output: 2 },
+        { input: 15, output: 2 },
+      ])
+    );
+
+    expect(mockSendQueryDag).toHaveBeenCalledTimes(2);
+    const telemetry = mockCaptureWorkflowCompleted.mock.calls.at(-1)?.[0] as
+      | Record<string, unknown>
+      | undefined;
+    expect(telemetry).toEqual(
+      expect.objectContaining({
+        outcome: 'failed',
+        tokensIn: 15,
+        tokensOut: 2,
+      })
+    );
+    const budgetWrites = (store.updateWorkflowRun as ReturnType<typeof mock>).mock.calls
+      .map(
+        call =>
+          (call[1] as { metadata?: Record<string, unknown> }).metadata?.[
+            WORKFLOW_BUDGET_METADATA_KEY
+          ]
+      )
+      .filter(Boolean) as Array<{ consumed: { input: number; output: number } }>;
+    expect(budgetWrites.at(-1)?.consumed).toEqual({ input: 15, output: 2 });
+  });
+
+  it('marks unknown while preserving the prior floor when a later hardened pass throws before usage', async () => {
+    const store = createMockStore();
+    const workflow = budgetWorkflow([
+      {
+        id: 'classify',
+        prompt: 'decide',
+        provider: TEST_BEST_EFFORT_CONTAINER_PROVIDER,
+        output_format: {
+          type: 'object',
+          properties: { verdict: { type: 'string' } },
+          required: ['verdict'],
+        },
+        retry: { max_attempts: 0 },
+        depends_on: [],
+      } as DagNode,
+    ]);
+    const workflowRun = makeWorkflowRun('budget-reask-throws-before-usage');
+    mockSendQueryDag.mockImplementationOnce(function* () {
+      yield {
+        type: 'result',
+        sessionId: 'invalid-pass',
+        structuredOutput: { other: 'x' },
+        tokens: { input: 10, output: 1 },
+      };
+    });
+    mockSendQueryDag.mockImplementation(function* () {
+      if (Date.now() < 0) {
+        yield { type: 'result', sessionId: 'unreachable' };
+      }
+      throw new Error('provider exploded before usage');
+    });
+
+    await expect(
+      executeDagWorkflow(
+        {
+          ...createMockDeps(store),
+          workflowBudgetGrants: [grantFor(workflow, workflowRun.id, 100)],
+        },
+        createMockPlatform(),
+        'conv-budget',
+        testDir,
+        workflow,
+        workflowRun,
+        TEST_BEST_EFFORT_CONTAINER_PROVIDER,
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        hardenedExecContext
+      )
+    ).rejects.toThrow(/proxy ledger binding|proxy ledger status/);
+
+    expect(mockSendQueryDag).toHaveBeenCalledTimes(0);
+  });
+
+  it('marks unknown when accumulated structured-output reask tokens overflow', async () => {
+    const store = createMockStore();
+    const workflow = budgetWorkflow([
+      {
+        id: 'classify',
+        prompt: 'decide',
+        provider: TEST_BEST_EFFORT_CONTAINER_PROVIDER,
+        output_format: {
+          type: 'object',
+          properties: { verdict: { type: 'string' } },
+          required: ['verdict'],
+        },
+        retry: { max_attempts: 0 },
+        depends_on: [],
+      } as DagNode,
+    ]);
+    const workflowRun = makeWorkflowRun('budget-reask-overflow');
+    mockSendQueryDag.mockImplementationOnce(function* () {
+      yield {
+        type: 'result',
+        sessionId: 'near-overflow',
+        structuredOutput: { other: 'x' },
+        tokens: { input: Number.MAX_SAFE_INTEGER - 1, output: 0 },
+      };
+    });
+    mockSendQueryDag.mockImplementation(function* () {
+      yield {
+        type: 'result',
+        sessionId: 'overflow',
+        structuredOutput: { verdict: 'review' },
+        tokens: { input: 2, output: 0 },
+      };
+    });
+
+    await expect(
+      executeDagWorkflow(
+        {
+          ...createMockDeps(store),
+          workflowBudgetGrants: [grantFor(workflow, workflowRun.id, Number.MAX_SAFE_INTEGER)],
+        },
+        createMockPlatform(),
+        'conv-budget',
+        testDir,
+        workflow,
+        workflowRun,
+        TEST_BEST_EFFORT_CONTAINER_PROVIDER,
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        hardenedExecContext
+      )
+    ).rejects.toThrow(/proxy ledger binding|proxy ledger status/);
+
+    expect(mockSendQueryDag).toHaveBeenCalledTimes(0);
+  });
+
+  it('marks unknown and stops structured-output reasks when a hardened pass omits usage', async () => {
+    const store = createMockStore();
+    const workflow = budgetWorkflow([
+      {
+        id: 'classify',
+        prompt: 'decide',
+        provider: TEST_BEST_EFFORT_CONTAINER_PROVIDER,
+        output_format: {
+          type: 'object',
+          properties: { verdict: { type: 'string' } },
+          required: ['verdict'],
+        },
+        retry: { max_attempts: 0 },
+        depends_on: [],
+      } as DagNode,
+    ]);
+    const workflowRun = makeWorkflowRun('budget-reask-missing-usage');
+    mockSendQueryDag.mockImplementationOnce(function* () {
+      yield { type: 'result', sessionId: 'missing-usage', structuredOutput: { other: 'x' } };
+    });
+    mockSendQueryDag.mockImplementation(function* () {
+      yield {
+        type: 'result',
+        sessionId: 'valid-pass',
+        structuredOutput: { verdict: 'review' },
+        tokens: { input: 5, output: 0 },
+      };
+    });
+
+    await expect(
+      executeDagWorkflow(
+        {
+          ...createMockDeps(store),
+          workflowBudgetGrants: [grantFor(workflow, workflowRun.id, 100)],
+        },
+        createMockPlatform(),
+        'conv-budget',
+        testDir,
+        workflow,
+        workflowRun,
+        TEST_BEST_EFFORT_CONTAINER_PROVIDER,
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        hardenedExecContext
+      )
+    ).rejects.toThrow(/proxy ledger binding|proxy ledger status/);
+
+    expect(mockSendQueryDag).toHaveBeenCalledTimes(0);
+  });
+
+  it('marks unknown when a later cumulative result chunk omits hardened pass usage', async () => {
+    const store = createMockStore();
+    const workflow = budgetWorkflow([
+      {
+        id: 'classify',
+        prompt: 'decide',
+        provider: TEST_BEST_EFFORT_CONTAINER_PROVIDER,
+        output_format: {
+          type: 'object',
+          properties: { verdict: { type: 'string' } },
+          required: ['verdict'],
+        },
+        retry: { max_attempts: 0 },
+        depends_on: [],
+      } as DagNode,
+    ]);
+    const workflowRun = makeWorkflowRun('budget-reask-later-result-missing-usage');
+    mockSendQueryDag.mockImplementation(function* () {
+      yield {
+        type: 'background_tasks',
+        tasks: [{ taskId: 't1', taskType: 'general', description: 'still running' }],
+      };
+      yield {
+        type: 'result',
+        sessionId: 'partial-usage',
+        structuredOutput: { other: 'x' },
+        tokens: { input: 3, output: 1 },
+      };
+      yield { type: 'background_tasks', tasks: [] };
+      yield {
+        type: 'result',
+        sessionId: 'final-missing-usage',
+        structuredOutput: { verdict: 'review' },
+      };
+    });
+
+    await expect(
+      executeDagWorkflow(
+        {
+          ...createMockDeps(store),
+          workflowBudgetGrants: [grantFor(workflow, workflowRun.id, 100)],
+        },
+        createMockPlatform(),
+        'conv-budget',
+        testDir,
+        workflow,
+        workflowRun,
+        TEST_BEST_EFFORT_CONTAINER_PROVIDER,
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        hardenedExecContext
+      )
+    ).rejects.toThrow(/proxy ledger binding|proxy ledger status/);
+
+    expect(mockSendQueryDag).toHaveBeenCalledTimes(0);
+  });
+
+  it('blocks a structured-output reask before the next pass when the hardened budget is exhausted', async () => {
+    const store = createMockStore();
+    const workflow = budgetWorkflow([
+      {
+        id: 'classify',
+        prompt: 'decide',
+        provider: TEST_BEST_EFFORT_CONTAINER_PROVIDER,
+        output_format: {
+          type: 'object',
+          properties: { verdict: { type: 'string' } },
+          required: ['verdict'],
+        },
+        retry: { max_attempts: 0 },
+        depends_on: [],
+      } as DagNode,
+    ]);
+    const workflowRun = makeWorkflowRun('budget-reask-exhausted-before-next-pass');
+    const grant = grantFor(workflow, workflowRun.id, 50);
+    mockSendQueryDag.mockImplementationOnce(function* () {
+      yield {
+        type: 'result',
+        sessionId: 'over-budget',
+        structuredOutput: { other: 'x' },
+        tokens: { input: 51, output: 0 },
+      };
+    });
+    mockSendQueryDag.mockImplementation(function* () {
+      yield {
+        type: 'result',
+        sessionId: 'valid-pass',
+        structuredOutput: { verdict: 'review' },
+        tokens: { input: 1, output: 0 },
+      };
+    });
+
+    await expect(
+      executeDagWorkflow(
+        {
+          ...createMockDeps(store),
+          workflowBudgetGrants: [grant],
+        },
+        createMockPlatform(),
+        'conv-budget',
+        testDir,
+        workflow,
+        workflowRun,
+        TEST_BEST_EFFORT_CONTAINER_PROVIDER,
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        hardenedExecContext,
+        proxyBudgetContextForConsumptions(workflowRun.id, workflow, grant, [
+          { input: 0, output: 0 },
+          { input: 0, output: 0 },
+          { input: 51, output: 0 },
+        ])
+      )
+    ).rejects.toThrow(/exceeded hardened workflow total token budget/);
+
+    expect(mockSendQueryDag).toHaveBeenCalledTimes(1);
+  });
+
+  it('serializes concurrent budget checkpoints so later smaller writes cannot regress totals', async () => {
+    const store = createMockStore();
+    const appliedConsumption: number[] = [];
+    (store.updateWorkflowRun as ReturnType<typeof mock>).mockImplementation(async (_id, patch) => {
+      const state = (patch as { metadata?: Record<string, unknown> }).metadata?.[
+        WORKFLOW_BUDGET_METADATA_KEY
+      ] as { consumed?: { input: number } } | undefined;
+      if (state?.consumed?.input === 60) {
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      if (state?.consumed) appliedConsumption.push(state.consumed.input);
+    });
+    const workflow = budgetWorkflow([
+      { id: 'fast', prompt: 'fast sixty', depends_on: [] },
+      { id: 'slow', prompt: 'slow ten', depends_on: [] },
+    ]);
+    const workflowRun = makeWorkflowRun('budget-concurrent');
+    const grant = grantFor(workflow, workflowRun.id, 100);
+    mockSendQueryDag.mockImplementation(async function* (prompt: string) {
+      if (prompt.includes('slow')) {
+        await new Promise(resolve => setTimeout(resolve, 5));
+      }
+      yield { type: 'assistant', content: 'done' };
+      yield {
+        type: 'result',
+        sessionId: prompt.includes('fast') ? 'fast' : 'slow',
+        tokens: prompt.includes('fast') ? { input: 60, output: 0 } : { input: 10, output: 0 },
+      };
+    });
+
+    await executeDagWorkflow(
+      {
+        ...createMockDeps(store),
+        workflowBudgetGrants: [grant],
+      },
+      createMockPlatform(),
+      'conv-budget',
+      testDir,
+      workflow,
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      hardenedExecContext,
+      proxyBudgetContextForConsumptions(workflowRun.id, workflow, grant, [
+        { input: 0, output: 0 },
+        { input: 0, output: 0 },
+        { input: 0, output: 0 },
+        { input: 60, output: 0 },
+        { input: 70, output: 0 },
+        { input: 70, output: 0 },
+      ])
+    );
+
+    for (let i = 1; i < appliedConsumption.length; i++) {
+      expect(appliedConsumption[i]).toBeGreaterThanOrEqual(appliedConsumption[i - 1]);
+    }
+    expect(appliedConsumption.at(-1)).toBe(70);
+  });
+
+  it('persists cumulative budget state across a resumed hardened run', async () => {
+    const store = createMockStore();
+    const workflow = budgetWorkflow([{ id: 'ai', prompt: 'finish', depends_on: [] }]);
+    const workflowDigest = computeControllerWorkflowDigest(workflow);
+    const deadlineAt = new Date(Date.now() + 60_000).toISOString();
+    const workflowRun = makeWorkflowRun('budget-persist', {
+      metadata: {
+        [WORKFLOW_BUDGET_METADATA_KEY]: {
+          workflowDigest,
+          deadlineAt,
+          tokens: { total: 100 },
+          consumed: { input: 90, output: 0 },
+          updatedAt: new Date(Date.now() - 1_000).toISOString(),
+        },
+      },
+    });
+
+    const grant = {
+      runId: workflowRun.id,
+      workflowName: workflow.name,
+      workflowDigest,
+      deadlineAt,
+      tokens: { total: 100 },
+    };
+
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'done' };
+      yield { type: 'result', sessionId: 'budget-session', tokens: { input: 5, output: 0 } };
+    });
+
+    await executeDagWorkflow(
+      {
+        ...createMockDeps(store),
+        workflowBudgetGrants: [grant],
+      },
+      createMockPlatform(),
+      'conv-budget',
+      testDir,
+      workflow,
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      new Map(),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      hardenedExecContext,
+      proxyBudgetContextForConsumptions(workflowRun.id, workflow, grant, [
+        { input: 90, output: 0 },
+        { input: 90, output: 0 },
+        { input: 95, output: 0 },
+        { input: 95, output: 0 },
+        { input: 95, output: 0 },
+      ]),
+      undefined,
+      { input: 0, output: 0 }
+    );
+
+    const budgetWrites = (store.updateWorkflowRun as ReturnType<typeof mock>).mock.calls
+      .map(
+        call =>
+          (call[1] as { metadata?: Record<string, unknown> }).metadata?.[
+            WORKFLOW_BUDGET_METADATA_KEY
+          ]
+      )
+      .filter(Boolean) as Array<{ consumed: { input: number; output: number } }>;
+    expect(budgetWrites.at(-1)?.consumed).toEqual({ input: 95, output: 0 });
+    expect(store.completeWorkflowRun).toHaveBeenCalledTimes(1);
+  });
+
+  it('fails closed before hardened loop AI work when proxy ledger binding is missing', async () => {
+    const store = createMockStore();
+    const workflow = budgetWorkflow([
+      {
+        id: 'loop',
+        loop: { prompt: 'iterate', until: 'DONE', max_iterations: 2 },
+        depends_on: [],
+      } as DagNode,
+    ]);
+    const workflowRun = makeWorkflowRun('budget-loop-no-ledger-binding');
+    mockSendQueryDag.mockImplementation(function* () {
+      yield { type: 'assistant', content: 'DONE' };
+      yield { type: 'result', sessionId: 'loop-budget', tokens: { input: 1, output: 0 } };
+    });
+
+    await executeDagWorkflow(
+      { ...createMockDeps(store), workflowBudgetGrants: [grantFor(workflow, workflowRun.id)] },
+      createMockPlatform(),
+      'conv-budget',
+      testDir,
+      workflow,
+      workflowRun,
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      hardenedExecContext
+    );
+
+    expect(mockSendQueryDag).not.toHaveBeenCalled();
+    expect(store.completeWorkflowRun).not.toHaveBeenCalled();
+    expect(store.failWorkflowRun).toHaveBeenCalledTimes(1);
+  });
+
+  it('applies the hardened token budget inside loop iterations', async () => {
+    const store = createMockStore();
+    const workflow = budgetWorkflow([
+      {
+        id: 'loop',
+        loop: { prompt: 'iterate', until: 'DONE', max_iterations: 2 },
+        depends_on: [],
+      } as DagNode,
+    ]);
+    const workflowRun = makeWorkflowRun('budget-loop');
+    const grant = grantFor(workflow, workflowRun.id, 100);
+    const statusReads = [
+      { input: 0, output: 0 },
+      { input: 0, output: 0 },
+      { input: 60, output: 0 },
+      { input: 60, output: 0 },
+      { input: 110, output: 0 },
+    ];
+    const readProxyBudgetStatus = mock(async () =>
+      proxyBudgetStatus(
+        workflowRun.id,
+        workflow,
+        statusReads.shift() ?? { input: 110, output: 0 },
+        grant
+      )
+    );
+    let calls = 0;
+    mockSendQueryDag.mockImplementation(function* () {
+      calls++;
+      yield { type: 'assistant', content: calls === 1 ? 'more' : 'DONE' };
+      yield {
+        type: 'result',
+        sessionId: `loop-budget-${calls}`,
+        tokens: calls === 1 ? { input: 60, output: 0 } : { input: 50, output: 0 },
+      };
+    });
+
+    await expect(
+      executeDagWorkflow(
+        { ...createMockDeps(store), workflowBudgetGrants: [grant] },
+        createMockPlatform(),
+        'conv-budget',
+        testDir,
+        workflow,
+        workflowRun,
+        'claude',
+        undefined,
+        join(testDir, 'artifacts'),
+        join(testDir, 'state'),
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        hardenedExecContext,
+        proxyBudgetContext(readProxyBudgetStatus)
+      )
+    ).rejects.toThrow(/exceeded hardened workflow total token budget/);
+
+    expect(calls).toBe(2);
   });
 });
 
@@ -9342,6 +12634,273 @@ describe('executeDagWorkflow -- terminal node output selection', () => {
     const cost = ((completed[0][0] as Record<string, unknown>).data as Record<string, unknown>)
       .cost_usd as number;
     expect(cost).toBeCloseTo(0.03, 5);
+  });
+
+  it('best-effort provider: missing earlier reask usage prevents a finite token total from later valid usage', async () => {
+    mockSendQueryDag.mockImplementationOnce(function* () {
+      yield { type: 'result', sessionId: 's1', structuredOutput: { other: 'x' } };
+    });
+    mockSendQueryDag.mockImplementation(function* () {
+      yield {
+        type: 'result',
+        sessionId: 's2',
+        structuredOutput: { verdict: 'review' },
+        tokens: { input: 5, output: 1 },
+      };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'reask-missing-token-accounting',
+        nodes: [
+          {
+            id: 'classify',
+            prompt: 'decide',
+            provider: 'pi',
+            output_format: {
+              type: 'object',
+              properties: { verdict: { type: 'string' } },
+              required: ['verdict'],
+            },
+            retry: { max_attempts: 0 },
+          },
+        ],
+      },
+      workflowRun,
+      'pi',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      { ...minimalConfig, assistant: 'pi' }
+    );
+
+    expect(mockSendQueryDag.mock.calls.length).toBe(2);
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const completed = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as Record<string, unknown>).event_type === 'node_completed' &&
+        (call[0] as Record<string, unknown>).step_name === 'classify'
+    );
+    if (completed === undefined) throw new Error('expected classify completion event');
+    const completedData = (completed[0] as Record<string, unknown>).data as Record<string, unknown>;
+    expect(completedData.tokens).toBeUndefined();
+  });
+
+  it('best-effort provider: retains usage when a later pass reports usage then throws', async () => {
+    mockCaptureWorkflowCompleted.mockClear();
+    mockSendQueryDag.mockImplementationOnce(function* () {
+      yield {
+        type: 'result',
+        sessionId: 's1',
+        structuredOutput: { other: 'x' },
+        tokens: { input: 10, output: 1 },
+      };
+    });
+    mockSendQueryDag.mockImplementation(function* () {
+      yield {
+        type: 'background_tasks',
+        tasks: [{ taskId: 't1', taskType: 'general', description: 'still running' }],
+      };
+      yield {
+        type: 'result',
+        sessionId: 'throws-after-usage',
+        structuredOutput: { other: 'still invalid' },
+        tokens: { input: 5, output: 1 },
+      };
+      throw new Error('provider exploded');
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'reask-throws-after-token-accounting',
+        nodes: [
+          {
+            id: 'classify',
+            prompt: 'decide',
+            provider: 'pi',
+            output_format: {
+              type: 'object',
+              properties: { verdict: { type: 'string' } },
+              required: ['verdict'],
+            },
+            retry: { max_attempts: 0 },
+          },
+        ],
+      },
+      workflowRun,
+      'pi',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      { ...minimalConfig, assistant: 'pi' }
+    );
+
+    expect(mockSendQueryDag.mock.calls.length).toBe(2);
+    const telemetry = mockCaptureWorkflowCompleted.mock.calls.at(-1)?.[0] as
+      | Record<string, unknown>
+      | undefined;
+    expect(telemetry).toEqual(
+      expect.objectContaining({
+        outcome: 'failed',
+        tokensIn: 15,
+        tokensOut: 2,
+      })
+    );
+  });
+
+  it('best-effort provider: does not report partial usage as complete when a later pass throws before usage', async () => {
+    mockCaptureWorkflowCompleted.mockClear();
+    mockSendQueryDag.mockImplementationOnce(function* () {
+      yield {
+        type: 'result',
+        sessionId: 's1',
+        structuredOutput: { other: 'x' },
+        tokens: { input: 10, output: 1 },
+      };
+    });
+    mockSendQueryDag.mockImplementation(function* () {
+      if (Date.now() < 0) {
+        yield { type: 'result', sessionId: 'unreachable' };
+      }
+      throw new Error('provider exploded before usage');
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'reask-throws-before-token-accounting',
+        nodes: [
+          {
+            id: 'classify',
+            prompt: 'decide',
+            provider: 'pi',
+            output_format: {
+              type: 'object',
+              properties: { verdict: { type: 'string' } },
+              required: ['verdict'],
+            },
+            retry: { max_attempts: 0 },
+          },
+        ],
+      },
+      workflowRun,
+      'pi',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      { ...minimalConfig, assistant: 'pi' }
+    );
+
+    expect(mockSendQueryDag.mock.calls.length).toBe(2);
+    const telemetry = mockCaptureWorkflowCompleted.mock.calls.at(-1)?.[0] as
+      | Record<string, unknown>
+      | undefined;
+    expect(telemetry).toEqual(expect.objectContaining({ outcome: 'failed' }));
+    expect(telemetry).not.toEqual(expect.objectContaining({ tokensIn: 10, tokensOut: 1 }));
+  });
+
+  it('best-effort provider: later cumulative result without usage clears stale pass tokens', async () => {
+    mockSendQueryDag.mockImplementation(function* () {
+      yield {
+        type: 'background_tasks',
+        tasks: [{ taskId: 't1', taskType: 'general', description: 'still running' }],
+      };
+      yield {
+        type: 'result',
+        sessionId: 's1',
+        structuredOutput: { other: 'x' },
+        tokens: { input: 3, output: 1 },
+      };
+      yield { type: 'background_tasks', tasks: [] };
+      yield {
+        type: 'result',
+        sessionId: 's1',
+        structuredOutput: { verdict: 'review' },
+      };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      mockDeps,
+      platform,
+      'conv-dag',
+      testDir,
+      {
+        name: 'reask-cumulative-result-missing-token-accounting',
+        nodes: [
+          {
+            id: 'classify',
+            prompt: 'decide',
+            provider: 'pi',
+            output_format: {
+              type: 'object',
+              properties: { verdict: { type: 'string' } },
+              required: ['verdict'],
+            },
+            retry: { max_attempts: 0 },
+          },
+        ],
+      },
+      workflowRun,
+      'pi',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'state'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      { ...minimalConfig, assistant: 'pi' }
+    );
+
+    expect(mockSendQueryDag.mock.calls.length).toBe(1);
+    const eventCalls = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls;
+    const completed = eventCalls.find(
+      (call: unknown[]) =>
+        (call[0] as Record<string, unknown>).event_type === 'node_completed' &&
+        (call[0] as Record<string, unknown>).step_name === 'classify'
+    );
+    if (completed === undefined) throw new Error('expected classify completion event');
+    const completedData = (completed[0] as Record<string, unknown>).data as Record<string, unknown>;
+    expect(completedData.tokens).toBeUndefined();
   });
 
   it('best-effort provider: reask exhaustion fails loudly', async () => {
@@ -17176,16 +20735,16 @@ describe('collectContainerIncompatibleProviders', () => {
     expect([...bad]).toEqual([]);
   });
 
-  it('flags a node whose provider lacks containerExec (codex)', () => {
-    const nodes = [promptNode('a'), promptNode('b', 'codex')];
+  it('flags a node whose provider lacks containerExec (pi)', () => {
+    const nodes = [promptNode('a'), promptNode('b', 'pi')];
     const bad = collectContainerIncompatibleProviders(nodes, 'claude');
-    expect([...bad]).toEqual(['codex']);
+    expect([...bad]).toEqual(['pi']);
   });
 
   it('flags the workflow-level provider when a node does not override it', () => {
     const nodes = [promptNode('a')];
-    const bad = collectContainerIncompatibleProviders(nodes, 'codex');
-    expect([...bad]).toEqual(['codex']);
+    const bad = collectContainerIncompatibleProviders(nodes, 'pi');
+    expect([...bad]).toEqual(['pi']);
   });
 
   it('ignores bash/script nodes (deterministic, no provider)', () => {
@@ -17197,15 +20756,15 @@ describe('collectContainerIncompatibleProviders', () => {
   it('recurses loop_group bodies', () => {
     const group = {
       id: 'g',
-      loop_group: { max_iterations: 2, nodes: [promptNode('inner', 'codex')] },
+      loop_group: { max_iterations: 2, nodes: [promptNode('inner', 'pi')] },
     } as unknown as DagNode;
     const bad = collectContainerIncompatibleProviders([group], 'claude');
-    expect([...bad]).toEqual(['codex']);
+    expect([...bad]).toEqual(['pi']);
   });
 });
 
 describe('buildSubprocessDockerArgs — bash/script env isolation', () => {
-  const CTX = { kind: 'container' as const, containerId: 'cid-9' };
+  const CTX = { kind: 'container' as const, profile: 'hardened' as const, containerId: 'cid-9' };
 
   it('delivers the Archon-managed env via -e flags only and runs at the same cwd', () => {
     const args = buildSubprocessDockerArgs(CTX, 'bash', ['-c', 'echo hi'], {
@@ -17269,7 +20828,11 @@ describe('buildSubprocessDockerArgs — bash/script env isolation', () => {
 // ---------------------------------------------------------------------------
 
 describe('executeDagWorkflow -- container write-back gate', () => {
-  const CONTAINER_EXEC = { kind: 'container' as const, containerId: 'cid-1' };
+  const CONTAINER_EXEC = {
+    kind: 'container' as const,
+    profile: 'hardened' as const,
+    containerId: 'cid-1',
+  };
   const wbTestDir = join(tmpdir(), `dag-wb-test-${Date.now()}`);
 
   function makeWritebackBackend(over?: Partial<Record<string, unknown>>) {
@@ -17293,6 +20856,7 @@ describe('executeDagWorkflow -- container write-back gate', () => {
     runMetadata?: Record<string, unknown>;
     status?: 'running' | 'paused';
     claimed?: boolean;
+    agentArtifacts?: boolean;
   }): Promise<IWorkflowStore> {
     const store = createMockStore();
     store.getWorkflowRunStatus = mock(() => Promise.resolve(opts.status ?? ('running' as const)));
@@ -17323,11 +20887,65 @@ describe('executeDagWorkflow -- container write-back gate', () => {
       undefined,
       undefined,
       undefined,
-      CONTAINER_EXEC,
+      {
+        ...CONTAINER_EXEC,
+        ...(opts.agentArtifacts ? { agentArtifactsDir: '/archon-artifacts' } : {}),
+      },
       { envId: 'env-x', writeBack: opts.writeBack ?? 'approve', backend: opts.backend }
     );
     return store;
   }
+
+  it('exports drained container artifacts before finalization without certifying them', async () => {
+    const order: string[] = [];
+    const snapshot = mock(async (_envId: string, destination: string) => {
+      order.push('snapshot');
+      await mkdir(destination, { recursive: true });
+      return {
+        snapshotDir: destination,
+        image: 'sha256:' + '1'.repeat(64),
+        totalBytes: 0,
+        files: [],
+      };
+    });
+    const backend = makeWritebackBackend({
+      snapshotArtifacts: snapshot,
+      finalize: mock(async () => {
+        order.push('finalize');
+        return { requiresApproval: false };
+      }),
+    });
+    try {
+      const store = await runGate({ backend, agentArtifacts: true });
+      expect(order).toEqual(['snapshot', 'finalize']);
+      expect(snapshot.mock.calls[0]?.[0]).toBe('env-x');
+      const manifest = JSON.parse(await readFile(`${snapshot.mock.calls[0]?.[1]}.json`, 'utf8'));
+      expect(manifest.kind).toBe('advisory-agent-artifacts');
+      expect(manifest.authority).toBe('none');
+      expect(manifest.terminal).toBe(false);
+      expect(manifest.authority_mac).toBeUndefined();
+      expect(store.completeWorkflowRun).toHaveBeenCalledTimes(1);
+    } finally {
+      await rm(join(wbTestDir, 'artifacts'), { recursive: true, force: true });
+    }
+  });
+
+  it('refuses completion when configured container artifact export is unavailable or fails', async () => {
+    const missing = makeWritebackBackend();
+    await expect(runGate({ backend: missing, agentArtifacts: true })).rejects.toThrow(
+      /export is unavailable/
+    );
+    expect(missing.finalize).not.toHaveBeenCalled();
+    const failed = makeWritebackBackend({
+      snapshotArtifacts: mock(async () => {
+        throw new Error('unsafe snapshot');
+      }),
+    });
+    await expect(runGate({ backend: failed, agentArtifacts: true })).rejects.toThrow(
+      'unsafe snapshot'
+    );
+    expect(failed.finalize).not.toHaveBeenCalled();
+  });
 
   it('empty diff → completes normally, no pause', async () => {
     const backend = makeWritebackBackend({

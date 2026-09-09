@@ -611,7 +611,8 @@ export type WorkflowNodeType =
   | 'loop'
   | 'loop_group'
   | 'approval'
-  | 'cancel';
+  | 'cancel'
+  | 'controller_action';
 
 /**
  * Terminal workflow-run event (`workflow_completed` / `workflow_failed`).

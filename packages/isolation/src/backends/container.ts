@@ -1,33 +1,40 @@
 /**
- * Container isolation backend for FOLDER-kind projects (Phase B).
+ * Hardened container isolation backend for folder projects.
  *
- * Runs a folder-project workflow inside a Docker container over a **read-only
- * bind mount of the project root** (`/mnt/lower`) plus a **writable overlayfs
- * upper layer** on a per-run named volume (`/mnt/upper`), merged at the SAME
- * absolute path as the host cwd (so `working_path`, `$ARTIFACTS_DIR`, and every
- * path substitution stay unchanged — no translation layer anywhere).
- *
- * Lifecycle in Phase B: `prepare()` creates the volume + container and returns a
- * `{ kind: 'container', containerId }` execution context; the engine threads
- * that to the Claude provider (spawns its CLI via `docker exec`) and to
- * `bash:`/`script:` nodes (also `docker exec`), so isolation has no host-escape
- * hole. `destroy()` removes the container + volume. The approval-gated
- * write-back of the overlay diff to the live root is Phase C — until then a
- * container run's changes stay in the overlay and are discarded on `destroy()`.
- *
- * Only Claude runs in-container in v1; the engine fails fast pre-dispatch for
- * any node whose provider lacks the `containerExec` capability.
+ * The hardened profile seeds a per-run Docker named volume from the controller
+ * environment, removes live VCS metadata before any agent-facing execution, and
+ * starts an unprivileged container over that volume. Agent turns and deterministic
+ * subprocesses run via `docker exec` inside the container; the live worktree,
+ * host home, credential files, and Docker socket are never mounted into the
+ * agent-facing container.
  */
 
 import { randomUUID } from 'crypto';
+import { chmod, mkdtemp, rm, writeFile } from 'fs/promises';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import { encodeStrictEgressPolicy, decodeStrictEgressPolicy } from '../egress/strict-policy';
+import { digestBudgetPolicy, digestProxyBudgetSeed } from '../egress/strict-proxy-launcher';
+import { createEgressTlsMaterial } from '../egress/tls-material';
+import type { EgressTlsMaterial } from '../egress/tls-material';
 import type { BranchName } from '@archon/git';
 import { createLogger } from '@archon/paths';
-import type { WriteBackFinalizeResult, WriteBackApplySummary } from '@archon/providers/types';
+import type {
+  ProviderOrigin,
+  WriteBackFinalizeResult,
+  WriteBackApplySummary,
+} from '@archon/providers/types';
+import {
+  snapshotContainerArtifacts,
+  type ArtifactSnapshotResult,
+} from '../container/artifact-snapshot';
 import type {
   BackendPrepareRequest,
   ContainerBackendConfig,
+  HardenedProxyBudgetSeed,
   IIsolationBackend,
   PreparedEnv,
+  VerifiedProxyBudgetStatus,
 } from '../types';
 import { CONTAINER_LABELS } from '../types';
 import type { IIsolationStore } from '../store';
@@ -37,56 +44,104 @@ import {
   extractDockerError,
   type DockerRunner,
 } from '../container/docker-exec';
-import { summarizeOverlayChanges, applyOverlayChanges } from '../container/overlay';
+import type { BudgetStatus, ProxyBudgetGrant } from '../egress/proxy-budget-ledger';
 
 const log = createLogger('isolation.container');
 
-/**
- * `branch_name` is NOT NULL (both dialects) and worktree-only. Container envs
- * have no branch, so we store an empty sentinel rather than migrate the column
- * to nullable (per plan Task 8 — avoid a schema change for a worktree-only field).
- */
 const NO_BRANCH_SENTINEL = '' as unknown as BranchName;
-
-/** Overlay-ready sentinel the entrypoint touches once the merged mount is up. */
-const READY_SENTINEL = '/mnt/upper/.ready';
-/** Max time to wait for the container's overlay mount to come up. */
+const READY_SENTINEL = '/tmp/archon-container-ready';
 const READY_TIMEOUT_MS = 20_000;
-/** Poll interval while waiting for the ready sentinel. */
 const READY_POLL_INTERVAL_MS = 250;
+const AGENT_USER = 'archon';
+const AGENT_HOME = '/home/archon';
+const AGENT_ARTIFACTS_DIR = '/archon-artifacts';
+const SEED_TARGET_ROOT = '/seed-workspace';
+const EGRESS_SOCKET_ROOT = '/archon-egress';
+const EGRESS_SOCKET_PATH = `${EGRESS_SOCKET_ROOT}/proxy.sock`;
+const EGRESS_PUBLIC_CA_PATH = `${EGRESS_SOCKET_ROOT}/ca.crt`;
+const PROXY_PRIVATE_ROOT = '/archon-proxy-private';
+const PROXY_POLICY_PATH = `${PROXY_PRIVATE_ROOT}/policy.json`;
+const PROXY_LEAF_KEY_PATH = `${PROXY_PRIVATE_ROOT}/leaf.key`;
+const PROXY_LEAF_CERT_PATH = `${PROXY_PRIVATE_ROOT}/leaf.crt`;
+const PROXY_CA_CERT_PATH = `${PROXY_PRIVATE_ROOT}/ca.crt`;
+const PROXY_BUDGET_GRANT_PATH = `${PROXY_PRIVATE_ROOT}/budget.json`;
+const PROXY_PROVIDER_POLICIES_PATH = `${PROXY_PRIVATE_ROOT}/provider-policies.json`;
+const PROXY_BUDGET_ROOT = '/archon-budget';
+const PROXY_BUDGET_LEDGER_CLI = '/usr/local/lib/archon/egress/proxy-budget-ledger-cli.ts';
+const STRICT_PROXY_CLI = '/usr/local/lib/archon/egress/strict-https-proxy-cli.mjs';
+const AGENT_PROXY_PORT = 18080;
+const AGENT_CPUS = '2';
+const CONTROLLER_HELPER_CPUS = '1';
+const RESOURCE_LIMIT_POLICY_VERSION = 1;
 
-/**
- * Overlay mount modes, in PREFERENCE order (least-privileged first). `fuse` runs
- * with only `--device /dev/fuse` (no CAP_SYS_ADMIN — closes the remount escape,
- * but only mounts on rootless/userns daemons); `native` grants CAP_SYS_ADMIN
- * (works everywhere, grants the escape — see SECURITY.md). The backend tries them
- * in this order and keeps the first that mounts.
- */
-const OVERLAY_MODES = ['fuse', 'native'] as const;
-type OverlayMode = (typeof OVERLAY_MODES)[number];
+function providerBaseUrl(provider: string, host: string): string {
+  return provider === 'anthropic' ? `https://${host}` : `https://${host}/v1`;
+}
 
 export interface ContainerBackendDeps {
   store: IIsolationStore;
   config: ContainerBackendConfig;
-  /** Injectable docker runner (real `dockerCli` in prod; a fake in tests). */
   dockerRunner?: DockerRunner;
 }
 
-/**
- * Metadata persisted on the `isolation_environments` row for a container env.
- * `resourceId` is the stable handle used for container/volume names + the
- * `env-id` label; `destroy()` reads `containerId`/`volume` back off the row.
- */
 interface ContainerEnvMetadata {
   containerId: string;
   containerName: string;
   volume: string;
+  profile: 'hardened';
+  workspaceVolume: string;
+  homeVolume: string;
+  artifactsVolume: string;
+  agentArtifactsDir: string;
+  egressVolume?: string;
+  tlsVolume?: string;
+  tlsValidUntil?: string;
+  proxyContainerName?: string;
+  budgetVolume?: string;
+  budgetPolicyDigest?: string;
+  proxyBudgetSeedDigest?: string;
+  egressPolicyB64?: string;
   image: string;
+  requestedImage?: string;
+  ownerRunId?: string;
   resourceId: string;
   workspacePath: string;
-  /** Overlay mode that actually mounted (`fuse` = unprivileged; `native` = CAP_SYS_ADMIN). */
-  overlayMode: OverlayMode;
+  resourceLimits: ContainerResourceLimits;
+  isolationMode: 'hardened';
   [key: string]: unknown;
+}
+
+interface ContainerResourceLimits {
+  policyVersion: 1;
+  agentCpus: '2';
+  controllerHelperCpus: '1';
+  memoryMb: number;
+  pidsLimit: number;
+}
+
+interface ProxyBudgetSeed extends HardenedProxyBudgetSeed {
+  digest: string;
+  seedDigest: string;
+}
+
+interface PrepareEgressSetup {
+  egressVolume: string;
+  tlsVolume: string;
+  budgetVolume: string;
+  proxyContainerName: string;
+  policyB64: string;
+  tlsMaterial: EgressTlsMaterial;
+  budgetSeed: ProxyBudgetSeed;
+}
+
+interface StrictEgressResumeMetadata {
+  proxyContainerName: string;
+  tlsVolume: string;
+  egressVolume: string;
+  budgetVolume: string;
+  tlsValidUntil: string;
+  policyB64: string;
+  budgetPolicyDigest: string;
 }
 
 export class ContainerBackend implements IIsolationBackend {
@@ -95,6 +150,7 @@ export class ContainerBackend implements IIsolationBackend {
   private readonly store: IIsolationStore;
   private readonly config: ContainerBackendConfig;
   private readonly docker: DockerRunner;
+  private resolvedImageId: string | undefined;
 
   constructor(deps: ContainerBackendDeps) {
     this.store = deps.store;
@@ -102,85 +158,112 @@ export class ContainerBackend implements IIsolationBackend {
     this.docker = deps.dockerRunner ?? dockerCli;
   }
 
-  /**
-   * Create the per-run upper volume + container and wait for the overlay mount.
-   * Returns the host root as cwd (same-absolute-path invariant) and a container
-   * execution context. Inserts a tracking `isolation_environments` row so
-   * `destroy()` and (Phase C) resume/cleanup can find the container by label.
-   *
-   * Fails fast (no half-created state): preflight runs before any resource is
-   * created; if the container never signals ready, it is removed before throwing.
-   */
+  async resolveImage(): Promise<string> {
+    assertHardenedContainerConfig(this.config);
+    this.resolvedImageId ??= await dockerPreflight(this.config.image, this.docker);
+    return this.resolvedImageId;
+  }
+
   async prepare(req: BackendPrepareRequest): Promise<PreparedEnv> {
     const hostRoot = req.codebase.defaultCwd;
+    const seed = resolveSeed(req);
+    const ownerRunId = resolveOwnerRunId(req.ownerRunId);
     const { image } = this.config;
 
-    await dockerPreflight(image, this.docker);
+    const imageId = await this.resolveImage();
+    const providerOrigins = this.providerOriginsFromProxyBudget();
 
     const resourceId = randomUUID();
     const containerName = `archon-${resourceId}`;
-    const volume = `archon-${resourceId}-upper`;
+    const seedName = `${containerName}-seed`;
+    const workspaceVolume = `archon-${resourceId}-workspace`;
+    const homeVolume = `archon-${resourceId}-home`;
+    const artifactsVolume = `archon-${resourceId}-artifacts`;
+    const egress = await this.buildPrepareEgress(resourceId, containerName, imageId);
+    const egressVolume = egress?.egressVolume;
+    const tlsVolume = egress?.tlsVolume;
+    const budgetVolume = egress?.budgetVolume;
+    const proxyContainerName = egress?.proxyContainerName;
+    const resourceLimits = this.buildResourceLimits();
 
     log.info(
       { codebaseId: req.codebase.id, resourceId, image, hostRoot },
       'isolation.container_prepare_started'
     );
 
-    // 1. Per-run upper volume (VM-local — overlay upperdir/workdir must NEVER be
-    //    on a host bind mount, orbstack#1376 EACCES on macOS). Stamped with the same
-    //    labels as the container so leak-detection + cleanup can discover BOTH
-    //    resource types by `diy.archon.managed` label, not just the `archon-` name
-    //    prefix (volumes from older builds carry no label — match the prefix there).
-    await this.docker([
-      'volume',
-      'create',
-      '--label',
-      `${CONTAINER_LABELS.managed}=true`,
-      '--label',
-      `${CONTAINER_LABELS.codebaseId}=${req.codebase.id}`,
-      '--label',
-      `${CONTAINER_LABELS.envId}=${containerName}`,
-      volume,
-    ]);
-
-    // 2. Create + start the container, mounting the overlay with the
-    //    least-privileged mode that works (fuse without CAP_SYS_ADMIN first,
-    //    native + CAP_SYS_ADMIN fallback). Fails only after both modes fail.
-    let containerId: string;
-    let overlayMode: OverlayMode;
     try {
-      ({ containerId, mode: overlayMode } = await this.startContainerWithOverlay(
+      await this.createManagedVolumes(
+        [workspaceVolume, homeVolume, artifactsVolume, egressVolume, tlsVolume, budgetVolume],
+        req.codebase.id,
         containerName,
-        volume,
+        ownerRunId
+      );
+      await this.seedWorkspaceVolume(
+        seedName,
+        workspaceVolume,
+        seed.path,
+        imageId,
+        seed.allowGitMetadata,
+        ownerRunId
+      );
+      await this.initializeArtifactsVolume(
+        `${containerName}-artifacts-init`,
+        artifactsVolume,
+        imageId,
+        ownerRunId
+      );
+      await this.prepareStrictEgress(
+        egress,
+        `${containerName}-egress-init`,
+        `${containerName}-budget-init`,
+        req.codebase.id,
+        imageId,
+        ownerRunId
+      );
+      const containerId = await this.startHardenedContainer(
+        containerName,
+        workspaceVolume,
+        homeVolume,
+        artifactsVolume,
+        egressVolume,
         hostRoot,
-        req.codebase.id
-      ));
-    } catch (startErr) {
-      // The container(s) are already removed inside startContainerWithOverlay;
-      // only the volume can leak here — remove it (with a breadcrumb on failure).
-      await this.docker(['volume', 'rm', '-f', volume]).catch(rmErr => {
-        log.warn(
-          { volume, detail: extractDockerError(rmErr) },
-          'isolation.container_prepare_volume_cleanup_failed'
-        );
-      });
-      throw startErr;
-    }
+        req.codebase.id,
+        imageId,
+        resourceLimits,
+        ownerRunId
+      );
+      await this.waitForReady(containerId);
 
-    // 3. Track the environment. `branch_name` is NOT NULL in both dialects and
-    //    is worktree-only — a sentinel '' avoids a schema migration (per plan).
-    const metadata: ContainerEnvMetadata = {
-      containerId,
-      containerName,
-      volume,
-      image,
-      resourceId,
-      overlayMode,
-      workspacePath: hostRoot,
-    };
-    let row;
-    try {
-      row = await this.store.create({
+      const metadata: ContainerEnvMetadata = {
+        containerId,
+        containerName,
+        volume: workspaceVolume,
+        profile: 'hardened',
+        workspaceVolume,
+        homeVolume,
+        artifactsVolume,
+        agentArtifactsDir: AGENT_ARTIFACTS_DIR,
+        ...(egressVolume ? { egressVolume } : {}),
+        ...(tlsVolume ? { tlsVolume } : {}),
+        ...(egress ? { tlsValidUntil: egress.tlsMaterial.validUntil } : {}),
+        ...(proxyContainerName ? { proxyContainerName } : {}),
+        ...(budgetVolume ? { budgetVolume } : {}),
+        ...(egress
+          ? {
+              budgetPolicyDigest: egress.budgetSeed.digest,
+              proxyBudgetSeedDigest: egress.budgetSeed.seedDigest,
+              egressPolicyB64: egress.policyB64,
+            }
+          : {}),
+        image: imageId,
+        requestedImage: image,
+        ...(ownerRunId ? { ownerRunId } : {}),
+        resourceId,
+        isolationMode: 'hardened',
+        workspacePath: hostRoot,
+        resourceLimits,
+      };
+      const row = await this.store.create({
         codebase_id: req.codebase.id,
         workflow_type: 'task',
         workflow_id: resourceId,
@@ -189,69 +272,62 @@ export class ContainerBackend implements IIsolationBackend {
         branch_name: NO_BRANCH_SENTINEL,
         metadata,
       });
-    } catch (createErr) {
-      // The container + volume exist but there's no tracking row → they'd be
-      // orphaned. Remove both (best-effort, with breadcrumbs) before rethrowing.
-      await this.removeContainerAndVolume(containerName, volume);
-      throw createErr;
+
+      log.info({ envId: row.id, containerId, resourceId }, 'isolation.container_prepare_completed');
+      return {
+        cwd: hostRoot,
+        execContext: {
+          kind: 'container',
+          profile: 'hardened',
+          containerId,
+          execUser: AGENT_USER,
+          agentArtifactsDir: AGENT_ARTIFACTS_DIR,
+          ...(providerOrigins ? { providerOrigins } : {}),
+        },
+        envId: row.id,
+        agentArtifactsDir: AGENT_ARTIFACTS_DIR,
+        artifactSnapshot: { workspaceVolume: artifactsVolume, image: imageId, resourceId },
+      };
+    } catch (err) {
+      await this.removeContainerAndVolumes(
+        containerName,
+        [
+          workspaceVolume,
+          homeVolume,
+          artifactsVolume,
+          egressVolume,
+          tlsVolume,
+          budgetVolume,
+        ].filter(isString),
+        seedName,
+        proxyContainerName
+      );
+      throw err;
     }
-
-    log.info({ envId: row.id, containerId, resourceId }, 'isolation.container_prepare_completed');
-
-    return {
-      cwd: hostRoot,
-      execContext: { kind: 'container', containerId },
-      envId: row.id,
-      overlayMode,
-    };
   }
 
-  /**
-   * Remove the container + upper volume for a prepared environment and mark the
-   * tracking row destroyed. A missing container/volume is idempotent-OK (already
-   * gone), but a GENUINE docker failure (daemon down, volume in use, permission)
-   * does NOT mark the row destroyed and THROWS — so the caller surfaces a loud
-   * "clean up manually" message and a later cleanup/resume can retry. A missing
-   * DB row is a no-op; unusable metadata throws (would otherwise leak silently).
-   */
   async destroy(envId: string): Promise<void> {
     const row = await this.store.getById(envId);
     if (!row) {
       log.warn({ envId }, 'isolation.container_destroy_row_missing');
       return;
     }
-    const meta = row.metadata as Partial<ContainerEnvMetadata>;
-    const containerName = meta.containerName ?? meta.containerId;
-    const volume = meta.volume;
-
-    if (!containerName && !volume) {
-      // Metadata is present-but-unusable (e.g. an old row, or a metadata that
-      // failed to parse at the store boundary and was normalized to `{}`).
-      // Fail LOUDLY rather than silently "destroy" nothing and leak the container.
-      log.error(
-        { envId, rawMetadataType: typeof row.metadata },
-        'isolation.container_destroy_metadata_unusable'
-      );
-      throw new Error(
-        `Cannot destroy container env '${envId}': its metadata has no containerName/volume. ` +
-          'The container/volume may be orphaned — remove it via `docker ps -a ' +
-          '--filter label=diy.archon.managed=true` and `docker rm -f`.'
-      );
-    }
+    const meta = requireHardenedMetadata(envId, row.metadata as Partial<ContainerEnvMetadata>);
+    const containerName = meta.containerName;
+    const proxyContainerName = meta.proxyContainerName;
+    const volumes = collectVolumes(meta);
 
     const failures: string[] = [];
-    if (containerName) {
-      const err = await this.removeIgnoringNotFound(['rm', '-f', containerName]);
-      if (err) failures.push(`container ${containerName}: ${err}`);
+    for (const handle of [containerName, proxyContainerName].filter(isString)) {
+      const err = await this.removeIgnoringNotFound(['rm', '-f', handle]);
+      if (err) failures.push(`container ${handle}: ${err}`);
     }
-    if (volume) {
+    for (const volume of volumes) {
       const err = await this.removeIgnoringNotFound(['volume', 'rm', '-f', volume]);
       if (err) failures.push(`volume ${volume}: ${err}`);
     }
 
     if (failures.length > 0) {
-      // Real docker failure — the resources may still exist, so leave the row
-      // `active` (a cleanup/resume can retry) and throw so the caller is loud.
       log.error({ envId, failures }, 'isolation.container_destroy_failed');
       throw new Error(
         `Failed to remove the isolation container/volume for env '${envId}': ` + failures.join('; ')
@@ -262,168 +338,250 @@ export class ContainerBackend implements IIsolationBackend {
       log.warn({ envId, err: err as Error }, 'isolation.container_destroy_status_update_failed');
     });
 
-    log.info({ envId, containerName, volume }, 'isolation.container_destroy_completed');
+    log.info({ envId, containerName, volumes }, 'isolation.container_destroy_completed');
   }
 
-  /**
-   * Suspend a running container on pause (`docker stop`, default grace). The upper
-   * volume + container survive so `resumeEnv` can restart it; only the RAM/CPU are
-   * released. Idempotent: a container that is already stopped or gone is a no-op
-   * (the caller has nothing to reclaim). A GENUINE docker failure throws — a
-   * container we couldn't stop is still consuming resources and the caller must know.
-   */
   async suspend(envId: string): Promise<void> {
-    const meta = await this.loadMetadata(envId);
-    const handle = meta.containerName ?? meta.containerId;
-    if (!handle) {
-      log.warn({ envId }, 'isolation.container_suspend_no_handle');
-      return;
-    }
-    try {
-      await this.docker(['stop', handle]);
-      log.info({ envId, handle }, 'isolation.container_suspended');
-    } catch (err) {
-      const detail = extractDockerError(err);
-      if (/no such container|is not running/i.test(detail)) {
-        log.debug({ envId, handle, detail }, 'isolation.container_suspend_already_stopped');
-        return;
+    const meta = requireHardenedMetadata(envId, await this.loadMetadata(envId));
+    const handle = meta.containerName;
+    const proxyHandle = meta.proxyContainerName;
+    const failures: string[] = [];
+    for (const name of [handle, proxyHandle].filter(isString)) {
+      try {
+        await this.docker(['stop', name]);
+      } catch (err) {
+        const detail = extractDockerError(err);
+        if (/no such container|is not running/i.test(detail)) {
+          log.debug({ envId, handle: name, detail }, 'isolation.container_suspend_already_stopped');
+        } else {
+          failures.push(`${name}: ${detail}`);
+          log.error({ envId, handle: name, detail }, 'isolation.container_suspend_failed');
+        }
       }
-      log.error({ envId, handle, detail }, 'isolation.container_suspend_failed');
-      throw new Error(`Failed to suspend container '${handle}' for env '${envId}': ${detail}`);
     }
+    if (failures.length)
+      throw new Error(`Failed to suspend env '${envId}': ${failures.join('; ')}`);
+    log.info({ envId, handle }, 'isolation.container_suspended');
   }
 
-  /**
-   * Rediscover and restart a suspended environment for resume, returning a fresh
-   * {@link PreparedEnv}. Cases, in order:
-   *  - container present + running → reuse as-is,
-   *  - container present + stopped → `docker start` + re-wait for the overlay,
-   *  - container GONE but the upper volume survives → recreate a container over the
-   *    same volume (the accumulated overlay is preserved),
-   *  - volume ALSO gone → throw LOUD: the un-applied work is lost, never silently
-   *    restart from an empty overlay.
-   */
-  async resumeEnv(envId: string): Promise<PreparedEnv> {
-    const meta = await this.loadMetadata(envId);
-    const { containerName, volume, workspacePath } = meta;
-    if (!containerName || !volume || !workspacePath) {
+  async resumeEnv(
+    envId: string,
+    binding?: Parameters<NonNullable<IIsolationBackend['resumeEnv']>>[1]
+  ): Promise<PreparedEnv> {
+    const {
+      containerName,
+      workspaceVolume,
+      homeVolume,
+      artifactsVolume,
+      egressVolume,
+      tlsVolume,
+      tlsValidUntil,
+      proxyContainerName,
+      budgetVolume,
+      budgetPolicyDigest,
+      proxyBudgetSeedDigest,
+      workspacePath,
+      image,
+      resourceId,
+      egressPolicyB64,
+      resourceLimits,
+      ownerRunId,
+    } = requireHardenedMetadata(envId, await this.loadMetadata(envId));
+    if (
+      binding &&
+      (egressPolicyB64 !== binding.egressPolicyB64 ||
+        image !== binding.image ||
+        ownerRunId !== binding.ownerRunId ||
+        proxyBudgetSeedDigest !== binding.proxyBudgetSeedDigest)
+    ) {
       throw new Error(
-        `Cannot resume container env '${envId}': its tracking row is missing the ` +
-          'container name / volume / workspace path. The environment may be from an ' +
-          'incompatible version; start a fresh --container run.'
+        'Cannot resume strict egress: isolation policy differs from controller authority.'
+      );
+    }
+    if (binding) {
+      await this.verifyResumeResourceOwnership(
+        [
+          workspaceVolume,
+          homeVolume,
+          artifactsVolume,
+          egressVolume,
+          tlsVolume,
+          budgetVolume,
+        ].filter(isString),
+        [containerName, proxyContainerName].filter(isString),
+        binding
       );
     }
     const row = await this.store.getById(envId);
     const codebaseId = row?.codebase_id ?? '';
-    // The mode the row recorded; the recreate branch below may re-probe and override.
-    const priorMode: OverlayMode = meta.overlayMode ?? 'native';
 
     const presence = await this.describeContainer(containerName);
     if (presence === 'running') {
+      await this.ensureEgressProxy(
+        proxyContainerName,
+        tlsVolume,
+        egressVolume,
+        budgetVolume,
+        tlsValidUntil,
+        codebaseId,
+        image,
+        egressPolicyB64,
+        budgetPolicyDigest,
+        proxyBudgetSeedDigest,
+        ownerRunId
+      );
       const containerId = await this.getContainerId(containerName);
       log.info({ envId, containerName }, 'isolation.container_resume_reused_running');
-      return this.preparedEnvFor(containerId, workspacePath, envId, priorMode);
+      return this.preparedEnvFor(
+        containerId,
+        workspacePath,
+        envId,
+        artifactsVolume,
+        image,
+        resourceId
+      );
     }
     if (presence === 'stopped') {
+      await this.ensureEgressProxy(
+        proxyContainerName,
+        tlsVolume,
+        egressVolume,
+        budgetVolume,
+        tlsValidUntil,
+        codebaseId,
+        image,
+        egressPolicyB64,
+        budgetPolicyDigest,
+        proxyBudgetSeedDigest,
+        ownerRunId
+      );
       await this.docker(['start', containerName]);
       const containerId = await this.getContainerId(containerName);
       await this.waitForReady(containerId);
       log.info({ envId, containerName }, 'isolation.container_resume_restarted');
-      return this.preparedEnvFor(containerId, workspacePath, envId, priorMode);
-    }
-
-    // Container is gone. The overlay lives on the volume — recreate over it, or
-    // fail loudly if the volume is gone too (the un-applied work is unrecoverable).
-    if (!(await this.volumeExists(volume))) {
-      throw new Error(
-        `Cannot resume container env '${envId}': both the container and its overlay ` +
-          `volume '${volume}' are gone, so the un-applied changes are lost. This run ` +
-          'cannot continue — start a fresh --container run. (A `docker volume rm` or ' +
-          'an aggressive prune likely removed it; paused runs are never auto-pruned.)'
+      return this.preparedEnvFor(
+        containerId,
+        workspacePath,
+        envId,
+        artifactsVolume,
+        image,
+        resourceId
       );
     }
-    const { containerId, mode } = await this.startContainerWithOverlay(
+
+    if (
+      !(await this.volumeExists(workspaceVolume)) ||
+      !(await this.volumeExists(homeVolume)) ||
+      !(await this.volumeExists(artifactsVolume)) ||
+      (egressVolume !== undefined && !(await this.volumeExists(egressVolume))) ||
+      (tlsVolume !== undefined && !(await this.volumeExists(tlsVolume))) ||
+      (budgetVolume !== undefined && !(await this.volumeExists(budgetVolume)))
+    ) {
+      throw new Error(
+        `Cannot resume container env '${envId}': one or more per-run volumes are gone, ` +
+          'so the un-applied isolated state is lost. Start a fresh --container run.'
+      );
+    }
+    await this.ensureEgressProxy(
+      proxyContainerName,
+      tlsVolume,
+      egressVolume,
+      budgetVolume,
+      tlsValidUntil,
+      codebaseId,
+      image,
+      egressPolicyB64,
+      budgetPolicyDigest,
+      proxyBudgetSeedDigest,
+      ownerRunId
+    );
+    const containerId = await this.startHardenedContainer(
       containerName,
-      volume,
+      workspaceVolume,
+      homeVolume,
+      artifactsVolume,
+      egressVolume,
       workspacePath,
-      codebaseId
+      codebaseId,
+      image,
+      resourceLimits,
+      ownerRunId
     );
-    log.info({ envId, containerName, volume }, 'isolation.container_resume_recreated');
-    return this.preparedEnvFor(containerId, workspacePath, envId, mode);
+    await this.waitForReady(containerId);
+    log.info(
+      { envId, containerName, workspaceVolume, homeVolume },
+      'isolation.container_resume_recreated'
+    );
+    return this.preparedEnvFor(
+      containerId,
+      workspacePath,
+      envId,
+      artifactsVolume,
+      image,
+      resourceId
+    );
   }
 
-  /**
-   * Inspect the finished run's overlay diff. Runs a read-only helper against the
-   * upper volume (no running container needed). Empty diff → `requiresApproval:
-   * false` so the engine completes without a write-back gate.
-   */
+  async snapshotArtifacts(envId: string, destinationDir: string): Promise<ArtifactSnapshotResult> {
+    const { artifactsVolume, image, resourceId } = requireHardenedMetadata(
+      envId,
+      await this.loadMetadata(envId)
+    );
+    await this.suspend(envId);
+    return snapshotContainerArtifacts(
+      this.docker,
+      { workspaceVolume: artifactsVolume, image, resourceId },
+      { destinationDir }
+    );
+  }
+
+  async readProxyBudgetStatus(
+    envId: string,
+    binding: Parameters<NonNullable<IIsolationBackend['readProxyBudgetStatus']>>[1]
+  ): Promise<VerifiedProxyBudgetStatus> {
+    const meta = requireHardenedMetadata(envId, await this.loadMetadata(envId));
+    const metadata = this.assertProxyBudgetStatusAuthority(envId, meta, binding);
+    await this.verifyResumeResourceOwnership(
+      [metadata.egressVolume, metadata.tlsVolume, metadata.budgetVolume],
+      [metadata.proxyContainerName],
+      binding
+    );
+    await this.assertStrictEgressVolumesExist(metadata);
+    const budgetSeed = this.resolveProxyBudgetSeed(metadata.policyB64, meta.image);
+    if (
+      metadata.budgetPolicyDigest !== budgetSeed.digest ||
+      binding.proxyBudgetSeedDigest !== budgetSeed.seedDigest
+    ) {
+      throw new Error('Cannot read proxy budget status: controller seed binding drifted.');
+    }
+    const rawStatus = await this.readFixedProxyBudgetStatus(metadata, meta.image, meta.ownerRunId);
+    return normalizeVerifiedProxyBudgetStatus(envId, rawStatus, budgetSeed.grant);
+  }
+
   async finalize(envId: string): Promise<WriteBackFinalizeResult> {
-    const meta = await this.loadMetadata(envId);
-    const { volume, workspacePath, image } = meta;
-    if (!volume || !workspacePath || !image) {
-      throw new Error(
-        `Cannot finalize container env '${envId}': tracking row missing volume / ` +
-          'workspace path / image.'
-      );
-    }
-    const changeSummary = await summarizeOverlayChanges(this.docker, {
-      volume,
-      hostRoot: workspacePath,
-      image,
-    });
-    log.info(
-      { envId, totalCount: changeSummary.totalCount, truncated: changeSummary.truncated },
-      'isolation.container_finalized'
+    await this.loadMetadata(envId);
+    throw new Error(
+      `Cannot finalize container env '${envId}': hardened container write-back is not implemented. ` +
+        'The live worktree was never mounted into the agent container; preserve the named volumes ' +
+        'for controller-owned publication/write-back support.'
     );
-    return { requiresApproval: changeSummary.totalCount > 0, changeSummary };
   }
 
-  /**
-   * Apply the overlay diff to the live project root — the ONE moment the live root
-   * is written. Runs the write-back helper (mounts the live root read-write). Does
-   * NOT tear the environment down; the caller destroys the container + volume after
-   * the run completes.
-   */
   async applyChanges(envId: string): Promise<WriteBackApplySummary> {
-    const meta = await this.loadMetadata(envId);
-    const { volume, workspacePath, image } = meta;
-    if (!volume || !workspacePath || !image) {
-      throw new Error(
-        `Cannot apply container env '${envId}': tracking row missing volume / ` +
-          'workspace path / image.'
-      );
-    }
-    const summary = await applyOverlayChanges(this.docker, {
-      volume,
-      hostRoot: workspacePath,
-      image,
-    });
-    log.info(
-      { envId, filesApplied: summary.filesApplied, filesDeleted: summary.filesDeleted },
-      'isolation.container_changes_applied'
+    await this.loadMetadata(envId);
+    throw new Error(
+      `Cannot apply container env '${envId}': hardened container write-back is not implemented. ` +
+        'Refusing to copy untrusted agent artifacts to the live worktree without a controller action.'
     );
-    return summary;
   }
 
-  /**
-   * Discard the overlay diff (write-back rejected). The live root is never touched;
-   * the volume is reclaimed by the caller's subsequent `destroy`. A no-op beyond a
-   * breadcrumb — the discard IS "do nothing to the live root, then destroy".
-   */
   async discardChanges(envId: string): Promise<void> {
     log.info({ envId }, 'isolation.container_changes_discarded');
   }
 
-  /**
-   * Load a container env's persisted metadata, or throw if the row is gone. The
-   * store normalizes `metadata` to a parsed object on every dialect (SQLite returns
-   * it as a JSON string otherwise), so this reads it directly.
-   */
   private async loadMetadata(envId: string): Promise<Partial<ContainerEnvMetadata>> {
     const row = await this.store.getById(envId);
-    if (!row) {
-      throw new Error(`Container env '${envId}' not found (its tracking row is gone).`);
-    }
+    if (!row) throw new Error(`Container env '${envId}' not found (its tracking row is gone).`);
     return row.metadata as Partial<ContainerEnvMetadata>;
   }
 
@@ -431,17 +589,791 @@ export class ContainerBackend implements IIsolationBackend {
     containerId: string,
     cwd: string,
     envId: string,
-    overlayMode: OverlayMode
+    artifactsVolume?: string,
+    image?: string,
+    resourceId?: string
   ): PreparedEnv {
-    return { cwd, execContext: { kind: 'container', containerId }, envId, overlayMode };
+    const providerOrigins = this.providerOriginsFromProxyBudget();
+    return {
+      cwd,
+      execContext: {
+        kind: 'container',
+        profile: 'hardened',
+        containerId,
+        execUser: AGENT_USER,
+        agentArtifactsDir: AGENT_ARTIFACTS_DIR,
+        ...(providerOrigins ? { providerOrigins } : {}),
+      },
+      envId,
+      ...(artifactsVolume && image && resourceId
+        ? {
+            agentArtifactsDir: AGENT_ARTIFACTS_DIR,
+            artifactSnapshot: { workspaceVolume: artifactsVolume, image, resourceId },
+          }
+        : {}),
+    };
   }
 
-  /**
-   * Container presence as three outcomes: `running`, `stopped` (exists but not
-   * running), or `missing` (no such container). Distinct from {@link containerState}
-   * which folds "missing" and "inspect blip" into `unknown` — resume MUST tell
-   * "gone" (→ recreate over the volume) apart from "stopped" (→ start).
-   */
+  private async buildPrepareEgress(
+    resourceId: string,
+    containerName: string,
+    imageId: string
+  ): Promise<PrepareEgressSetup | undefined> {
+    const policy = this.config.egressPolicy;
+    if (!policy) return undefined;
+    const policyB64 = encodeStrictEgressPolicy(policy);
+    return {
+      egressVolume: `archon-${resourceId}-egress`,
+      tlsVolume: `archon-${resourceId}-egress-tls`,
+      budgetVolume: `archon-${resourceId}-budget`,
+      proxyContainerName: `${containerName}-egress-proxy`,
+      policyB64,
+      tlsMaterial: await createEgressTlsMaterial(policy.targets.map(target => target.host)),
+      budgetSeed: this.resolveProxyBudgetSeed(policyB64, imageId),
+    };
+  }
+
+  private async createManagedVolumes(
+    volumes: (string | undefined)[],
+    codebaseId: string,
+    containerName: string,
+    ownerRunId?: string
+  ): Promise<void> {
+    for (const volume of volumes.filter(isString)) {
+      await this.createManagedVolume(volume, codebaseId, containerName, ownerRunId);
+    }
+  }
+
+  private async prepareStrictEgress(
+    egress: PrepareEgressSetup | undefined,
+    egressInitName: string,
+    budgetInitName: string,
+    codebaseId: string,
+    imageId: string,
+    ownerRunId?: string
+  ): Promise<void> {
+    if (!egress) return;
+    await this.stageStrictEgressVolumes(
+      egressInitName,
+      egress.tlsVolume,
+      egress.egressVolume,
+      egress.budgetVolume,
+      imageId,
+      egress.policyB64,
+      egress.tlsMaterial,
+      egress.budgetSeed,
+      ownerRunId
+    );
+    await this.initializeProxyBudgetLedger(
+      budgetInitName,
+      egress.tlsVolume,
+      egress.budgetVolume,
+      imageId,
+      ownerRunId
+    );
+    await this.startEgressProxy(
+      egress.proxyContainerName,
+      egress.tlsVolume,
+      egress.egressVolume,
+      egress.budgetVolume,
+      codebaseId,
+      imageId,
+      egress.policyB64,
+      egress.budgetSeed.digest,
+      ownerRunId
+    );
+  }
+
+  private async createManagedVolume(
+    volume: string,
+    codebaseId: string,
+    containerName: string,
+    ownerRunId?: string
+  ): Promise<void> {
+    await this.docker([
+      'volume',
+      'create',
+      '--label',
+      `${CONTAINER_LABELS.managed}=true`,
+      '--label',
+      `${CONTAINER_LABELS.codebaseId}=${codebaseId}`,
+      '--label',
+      `${CONTAINER_LABELS.envId}=${containerName}`,
+      ...ownerRunLabelArgs(ownerRunId),
+      volume,
+    ]);
+  }
+
+  private async verifyResumeResourceOwnership(
+    volumes: string[],
+    containers: string[],
+    binding: { image: string; ownerRunId: string }
+  ): Promise<void> {
+    const label = CONTAINER_LABELS.ownerRunId;
+    for (const volume of volumes) {
+      const { stdout } = await this.docker([
+        'volume',
+        'inspect',
+        '--format',
+        `{{index .Labels "${label}"}}`,
+        volume,
+      ]);
+      if (stdout.trim() !== binding.ownerRunId)
+        throw new Error('Cannot resume: volume ownership differs from controller authority.');
+    }
+    for (const container of containers) {
+      if ((await this.describeContainer(container)) === 'missing') continue;
+      const { stdout } = await this.docker([
+        'inspect',
+        '--format',
+        `{{index .Config.Labels "${label}"}}\n{{.Image}}`,
+        container,
+      ]);
+      const [owner, image] = stdout.trim().split('\n');
+      if (owner !== binding.ownerRunId || image !== binding.image)
+        throw new Error('Cannot resume: container identity differs from controller authority.');
+    }
+  }
+
+  private async seedWorkspaceVolume(
+    seedName: string,
+    workspaceVolume: string,
+    seedRoot: string,
+    imageRef: string,
+    allowGitMetadata: boolean,
+    ownerRunId?: string
+  ): Promise<void> {
+    await this.docker([
+      'create',
+      '--name',
+      seedName,
+      '--label',
+      `${CONTAINER_LABELS.managed}=true`,
+      '--label',
+      `${CONTAINER_LABELS.envId}=${seedName}`,
+      ...ownerRunLabelArgs(ownerRunId),
+      '--network',
+      'none',
+      '--cpus',
+      CONTROLLER_HELPER_CPUS,
+      '--cap-drop',
+      'ALL',
+      '--cap-add',
+      'CHOWN',
+      '--security-opt',
+      'no-new-privileges',
+      '-v',
+      `${workspaceVolume}:${SEED_TARGET_ROOT}`,
+      '--entrypoint',
+      'sleep',
+      imageRef,
+      'infinity',
+    ]);
+    try {
+      await this.docker(['cp', `${seedRoot}/.`, `${seedName}:${SEED_TARGET_ROOT}/`], {
+        timeout: 120_000,
+      });
+      await this.docker(['start', seedName]);
+      await this.docker([
+        'exec',
+        '-u',
+        '0',
+        seedName,
+        'sh',
+        '-c',
+        buildSeedValidationScript(SEED_TARGET_ROOT, allowGitMetadata),
+      ]);
+    } finally {
+      await this.removeIgnoringNotFound(['rm', '-f', seedName]);
+    }
+  }
+
+  private async initializeArtifactsVolume(
+    initName: string,
+    artifactsVolume: string,
+    imageRef: string,
+    ownerRunId?: string
+  ): Promise<void> {
+    await this.docker([
+      'run',
+      '--rm',
+      '--name',
+      initName,
+      '--label',
+      `${CONTAINER_LABELS.managed}=true`,
+      '--label',
+      `${CONTAINER_LABELS.envId}=${initName}`,
+      ...ownerRunLabelArgs(ownerRunId),
+      '--network',
+      'none',
+      '--cpus',
+      CONTROLLER_HELPER_CPUS,
+      '--cap-drop',
+      'ALL',
+      '--cap-add',
+      'CHOWN',
+      '--security-opt',
+      'no-new-privileges',
+      '-v',
+      `${artifactsVolume}:${AGENT_ARTIFACTS_DIR}`,
+      '--entrypoint',
+      'sh',
+      imageRef,
+      '-c',
+      `umask 077 && mkdir -p ${AGENT_ARTIFACTS_DIR}/run ${AGENT_ARTIFACTS_DIR}/state ${AGENT_ARTIFACTS_DIR}/logs && chown -R ${AGENT_USER}:${AGENT_USER} ${AGENT_ARTIFACTS_DIR}`,
+    ]);
+  }
+
+  private async startHardenedContainer(
+    containerName: string,
+    workspaceVolume: string,
+    homeVolume: string,
+    artifactsVolume: string,
+    egressVolume: string | undefined,
+    hostRoot: string,
+    codebaseId: string,
+    imageRef: string,
+    resourceLimits: ContainerResourceLimits,
+    ownerRunId?: string
+  ): Promise<string> {
+    const args = [
+      'run',
+      '-d',
+      '--name',
+      containerName,
+      '--label',
+      `${CONTAINER_LABELS.managed}=true`,
+      '--label',
+      `${CONTAINER_LABELS.codebaseId}=${codebaseId}`,
+      '--label',
+      `${CONTAINER_LABELS.envId}=${containerName}`,
+      ...ownerRunLabelArgs(ownerRunId),
+      '--restart',
+      'no',
+      '--user',
+      AGENT_USER,
+      '--read-only',
+      '--cap-drop',
+      'ALL',
+      '--security-opt',
+      'no-new-privileges',
+      '--memory',
+      `${resourceLimits.memoryMb}m`,
+      '--cpus',
+      resourceLimits.agentCpus,
+      '--pids-limit',
+      String(resourceLimits.pidsLimit),
+      '--network',
+      this.config.network,
+      '--tmpfs',
+      '/tmp:rw,nosuid,nodev,size=256m',
+      '--tmpfs',
+      '/run:rw,nosuid,nodev,size=16m',
+      '-v',
+      `${workspaceVolume}:${hostRoot}`,
+      '-v',
+      `${homeVolume}:${AGENT_HOME}`,
+      '-v',
+      `${artifactsVolume}:${AGENT_ARTIFACTS_DIR}`,
+      ...agentEgressArgs(egressVolume),
+      '-e',
+      `ARCHON_WORKSPACE_PATH=${hostRoot}`,
+      '-e',
+      `HOME=${AGENT_HOME}`,
+      '-e',
+      `ARCHON_AGENT_ARTIFACTS_DIR=${AGENT_ARTIFACTS_DIR}`,
+      '-e',
+      `CLAUDE_CONFIG_DIR=${AGENT_HOME}/.claude`,
+      imageRef,
+    ];
+    const { stdout } = await this.docker(args);
+    return stdout.trim();
+  }
+
+  private async startEgressProxy(
+    proxyContainerName: string,
+    tlsVolume: string,
+    egressVolume: string,
+    budgetVolume: string,
+    codebaseId: string,
+    imageRef: string,
+    policyB64: string | undefined,
+    budgetPolicyDigest: string | undefined,
+    ownerRunId?: string
+  ): Promise<void> {
+    if (!policyB64) throw new Error('Cannot start strict egress proxy without a frozen policy.');
+    if (!budgetPolicyDigest)
+      throw new Error('Cannot start strict egress proxy without a budget policy digest.');
+    await this.docker([
+      'run',
+      '-d',
+      '--name',
+      proxyContainerName,
+      '--label',
+      `${CONTAINER_LABELS.managed}=true`,
+      '--label',
+      `${CONTAINER_LABELS.codebaseId}=${codebaseId}`,
+      '--label',
+      `${CONTAINER_LABELS.envId}=${proxyContainerName}`,
+      ...ownerRunLabelArgs(ownerRunId),
+      '--restart',
+      'no',
+      '--user',
+      AGENT_USER,
+      '--read-only',
+      '--cap-drop',
+      'ALL',
+      '--security-opt',
+      'no-new-privileges',
+      '--memory',
+      '128m',
+      '--cpus',
+      CONTROLLER_HELPER_CPUS,
+      '--pids-limit',
+      '128',
+      '--network',
+      'bridge',
+      '--tmpfs',
+      '/tmp:rw,nosuid,nodev,size=16m',
+      '-v',
+      `${egressVolume}:${EGRESS_SOCKET_ROOT}`,
+      '-v',
+      `${tlsVolume}:${PROXY_PRIVATE_ROOT}:ro`,
+      '-v',
+      `${budgetVolume}:${PROXY_BUDGET_ROOT}`,
+      '-e',
+      `ARCHON_EGRESS_SOCKET=${EGRESS_SOCKET_PATH}`,
+      '-e',
+      `ARCHON_EGRESS_POLICY_B64=${policyB64}`,
+      '-e',
+      `ARCHON_PROXY_IMAGE_ID=${imageRef}`,
+      '-e',
+      `ARCHON_PROXY_BUDGET_POLICY_DIGEST=${budgetPolicyDigest}`,
+      '--entrypoint',
+      'node',
+      imageRef,
+      STRICT_PROXY_CLI,
+    ]);
+    await this.waitForProxyReady(proxyContainerName);
+  }
+
+  private resolveProxyBudgetSeed(egressPolicyB64: string, imageRef: string): ProxyBudgetSeed {
+    const budget = this.config.proxyBudget;
+    if (!budget) throw new Error('Strict egress requires a controller-seeded proxy budget.');
+    const providerPolicies = budget.providerPolicies.map(policy => ({ ...policy }));
+    const digest = digestBudgetPolicy({ egressPolicyB64, image: imageRef, providerPolicies });
+    if (budget.grant.policyDigest !== digest) {
+      throw new Error('Proxy budget seed does not match frozen egress policy and image.');
+    }
+    if (budget.grant.deadlineEpochMs <= Date.now()) {
+      throw new Error('Proxy budget seed deadline is expired.');
+    }
+    const seed = { grant: { ...budget.grant }, providerPolicies };
+    return { ...seed, digest, seedDigest: digestProxyBudgetSeed(seed) };
+  }
+
+  private providerOriginsFromProxyBudget(): ProviderOrigin[] | undefined {
+    const budget = this.config.proxyBudget;
+    if (!budget) return undefined;
+    const origins = new Map<string, ProviderOrigin>();
+    for (const policy of budget.providerPolicies) {
+      const next = {
+        provider: policy.provider,
+        baseUrl: providerBaseUrl(policy.provider, policy.host),
+      };
+      const existing = origins.get(policy.provider);
+      if (existing && existing.baseUrl !== next.baseUrl) {
+        throw new Error(`Conflicting provider origins for budget provider '${policy.provider}'.`);
+      }
+      origins.set(policy.provider, next);
+    }
+    return origins.size > 0 ? [...origins.values()] : undefined;
+  }
+
+  private buildResourceLimits(): ContainerResourceLimits {
+    return {
+      policyVersion: RESOURCE_LIMIT_POLICY_VERSION,
+      agentCpus: AGENT_CPUS,
+      controllerHelperCpus: CONTROLLER_HELPER_CPUS,
+      memoryMb: this.config.memoryMb,
+      pidsLimit: this.config.pidsLimit,
+    };
+  }
+
+  private async ensureEgressProxy(
+    proxyContainerName: string | undefined,
+    tlsVolume: string | undefined,
+    egressVolume: string | undefined,
+    budgetVolume: string | undefined,
+    tlsValidUntil: string | undefined,
+    codebaseId: string,
+    imageRef: string,
+    policyB64: string | undefined,
+    budgetPolicyDigest: string | undefined,
+    proxyBudgetSeedDigest: string | undefined,
+    ownerRunId?: string
+  ): Promise<void> {
+    const metadata = normalizeStrictEgressResumeMetadata({
+      proxyContainerName,
+      tlsVolume,
+      egressVolume,
+      budgetVolume,
+      tlsValidUntil,
+      policyB64,
+      budgetPolicyDigest,
+      proxyBudgetSeedDigest,
+    });
+    if (!metadata) return;
+    assertTlsStillValid(metadata.tlsValidUntil);
+    await this.assertStrictEgressVolumesExist(metadata);
+    const presence = await this.describeContainer(metadata.proxyContainerName);
+    if (presence === 'running') {
+      await this.assertProxyContainerBindingFromMetadata(metadata, imageRef);
+      return;
+    }
+    if (presence === 'stopped') {
+      await this.assertProxyContainerBindingFromMetadata(metadata, imageRef);
+      await this.docker(['start', metadata.proxyContainerName]);
+      await this.waitForProxyReady(metadata.proxyContainerName);
+      return;
+    }
+    await this.startEgressProxy(
+      metadata.proxyContainerName,
+      metadata.tlsVolume,
+      metadata.egressVolume,
+      metadata.budgetVolume,
+      codebaseId,
+      imageRef,
+      metadata.policyB64,
+      metadata.budgetPolicyDigest,
+      ownerRunId
+    );
+  }
+
+  private async assertStrictEgressVolumesExist(
+    metadata: StrictEgressResumeMetadata
+  ): Promise<void> {
+    const checks = [metadata.egressVolume, metadata.tlsVolume, metadata.budgetVolume];
+    for (const volume of checks) {
+      if (!(await this.volumeExists(volume))) {
+        throw new Error(
+          'Cannot resume strict egress: frozen egress, TLS or budget material volume is missing.'
+        );
+      }
+    }
+  }
+
+  private async assertProxyContainerBindingFromMetadata(
+    metadata: StrictEgressResumeMetadata,
+    imageRef: string
+  ): Promise<void> {
+    await this.assertProxyContainerBinding(
+      metadata.proxyContainerName,
+      metadata.tlsVolume,
+      metadata.egressVolume,
+      metadata.budgetVolume,
+      imageRef,
+      metadata.policyB64,
+      metadata.budgetPolicyDigest
+    );
+  }
+
+  private async assertProxyContainerBinding(
+    proxyContainerName: string,
+    tlsVolume: string,
+    egressVolume: string,
+    budgetVolume: string,
+    imageRef: string,
+    policyB64: string,
+    budgetPolicyDigest: string
+  ): Promise<void> {
+    const { stdout } = await this.docker([
+      'inspect',
+      '-f',
+      '{{json .Config.Env}}\n{{.Image}}\n{{json .Mounts}}',
+      proxyContainerName,
+    ]);
+    const [envJson, image, mountsJson] = stdout.trim().split('\n');
+    const env = JSON.parse(envJson ?? '[]') as unknown;
+    const mounts = JSON.parse(mountsJson ?? '[]') as unknown;
+    if (
+      !Array.isArray(env) ||
+      !env.includes(`ARCHON_EGRESS_POLICY_B64=${policyB64}`) ||
+      !env.includes(`ARCHON_EGRESS_SOCKET=${EGRESS_SOCKET_PATH}`) ||
+      !env.includes(`ARCHON_PROXY_IMAGE_ID=${imageRef}`) ||
+      !env.includes(`ARCHON_PROXY_BUDGET_POLICY_DIGEST=${budgetPolicyDigest}`) ||
+      image !== imageRef ||
+      !hasVolumeMount(mounts, tlsVolume, PROXY_PRIVATE_ROOT, false) ||
+      !hasVolumeMount(mounts, egressVolume, EGRESS_SOCKET_ROOT, true) ||
+      !hasVolumeMount(mounts, budgetVolume, PROXY_BUDGET_ROOT, true)
+    ) {
+      throw new Error('Cannot resume strict egress: proxy container binding drifted.');
+    }
+  }
+
+  private assertProxyBudgetStatusAuthority(
+    envId: string,
+    meta: ContainerEnvMetadata,
+    binding: Parameters<NonNullable<IIsolationBackend['readProxyBudgetStatus']>>[1]
+  ): StrictEgressResumeMetadata {
+    const metadata = normalizeStrictEgressResumeMetadata({
+      proxyContainerName: meta.proxyContainerName,
+      tlsVolume: meta.tlsVolume,
+      egressVolume: meta.egressVolume,
+      budgetVolume: meta.budgetVolume,
+      tlsValidUntil: meta.tlsValidUntil,
+      policyB64: meta.egressPolicyB64,
+      budgetPolicyDigest: meta.budgetPolicyDigest,
+      proxyBudgetSeedDigest: meta.proxyBudgetSeedDigest,
+    });
+    if (!metadata) throw new Error(`Container env '${envId}' has no proxy budget ledger.`);
+    if (
+      metadata.policyB64 !== binding.egressPolicyB64 ||
+      meta.image !== binding.image ||
+      meta.ownerRunId !== binding.ownerRunId ||
+      meta.proxyBudgetSeedDigest !== binding.proxyBudgetSeedDigest
+    ) {
+      throw new Error('Cannot read proxy budget status: controller authority differs.');
+    }
+    assertTlsStillValid(metadata.tlsValidUntil);
+    return metadata;
+  }
+
+  private async readFixedProxyBudgetStatus(
+    metadata: StrictEgressResumeMetadata,
+    imageRef: string,
+    ownerRunId?: string
+  ): Promise<BudgetStatus> {
+    const presence = await this.describeContainer(metadata.proxyContainerName);
+    const result =
+      presence === 'running'
+        ? await this.readStatusFromBoundRunningProxy(metadata, imageRef)
+        : await this.runProxyStatusHelper(metadata, imageRef, ownerRunId);
+    return parseProxyBudgetStatusOutput(result.stdout);
+  }
+
+  private async readStatusFromBoundRunningProxy(
+    metadata: StrictEgressResumeMetadata,
+    imageRef: string
+  ): Promise<{ stdout: string; stderr: string }> {
+    await this.assertProxyContainerBindingFromMetadata(metadata, imageRef);
+    return this.runProxyStatusInRunningProxy(metadata.proxyContainerName);
+  }
+
+  private async runProxyStatusInRunningProxy(
+    proxyContainerName: string
+  ): Promise<{ stdout: string; stderr: string }> {
+    return await this.docker([
+      'exec',
+      '-u',
+      AGENT_USER,
+      proxyContainerName,
+      '/usr/local/bin/bun',
+      PROXY_BUDGET_LEDGER_CLI,
+      '--status',
+    ]);
+  }
+
+  private async runProxyStatusHelper(
+    metadata: StrictEgressResumeMetadata,
+    imageRef: string,
+    ownerRunId?: string
+  ): Promise<{ stdout: string; stderr: string }> {
+    const helperName = `archon-budget-status-${randomUUID()}`;
+    return await this.docker([
+      'run',
+      '--rm',
+      '--name',
+      helperName,
+      '--label',
+      `${CONTAINER_LABELS.managed}=true`,
+      '--label',
+      `${CONTAINER_LABELS.envId}=${helperName}`,
+      ...ownerRunLabelArgs(ownerRunId),
+      '--network',
+      'none',
+      '--user',
+      AGENT_USER,
+      '--read-only',
+      '--memory',
+      '128m',
+      '--cpus',
+      CONTROLLER_HELPER_CPUS,
+      '--pids-limit',
+      '64',
+      '--cap-drop',
+      'ALL',
+      '--security-opt',
+      'no-new-privileges',
+      '-v',
+      `${metadata.tlsVolume}:${PROXY_PRIVATE_ROOT}:ro`,
+      '-v',
+      `${metadata.budgetVolume}:${PROXY_BUDGET_ROOT}`,
+      '--entrypoint',
+      '/usr/local/bin/bun',
+      imageRef,
+      PROXY_BUDGET_LEDGER_CLI,
+      '--status',
+    ]);
+  }
+
+  private async stageStrictEgressVolumes(
+    initName: string,
+    tlsVolume: string,
+    egressVolume: string,
+    budgetVolume: string,
+    imageRef: string,
+    policyB64: string,
+    material: EgressTlsMaterial,
+    budgetSeed: ProxyBudgetSeed,
+    ownerRunId?: string
+  ): Promise<void> {
+    const tempDir = await mkdtemp(join(tmpdir(), 'archon-egress-material-'));
+    await chmod(tempDir, 0o700);
+    let cleanupFailure: string | undefined;
+    try {
+      await writeFile(join(tempDir, 'policy.json'), Buffer.from(policyB64, 'base64'), {
+        mode: 0o600,
+      });
+      await writeFile(join(tempDir, 'leaf.key'), material.privateKey, { mode: 0o600 });
+      await writeFile(join(tempDir, 'leaf.crt'), material.certificate, { mode: 0o600 });
+      await writeFile(join(tempDir, 'ca.crt'), material.caCertificate, { mode: 0o600 });
+      await writeFile(join(tempDir, 'budget.json'), JSON.stringify(budgetSeed.grant), {
+        mode: 0o600,
+      });
+      await writeFile(
+        join(tempDir, 'provider-policies.json'),
+        JSON.stringify(budgetSeed.providerPolicies),
+        { mode: 0o600 }
+      );
+      await this.docker([
+        'create',
+        '--name',
+        initName,
+        '--label',
+        `${CONTAINER_LABELS.managed}=true`,
+        '--label',
+        `${CONTAINER_LABELS.envId}=${initName}`,
+        ...ownerRunLabelArgs(ownerRunId),
+        '--network',
+        'none',
+        '--user',
+        '0',
+        '--read-only',
+        '--memory',
+        '128m',
+        '--cpus',
+        CONTROLLER_HELPER_CPUS,
+        '--pids-limit',
+        '64',
+        '--cap-drop',
+        'ALL',
+        '--cap-add',
+        'CHOWN',
+        '--security-opt',
+        'no-new-privileges',
+        '-v',
+        `${tlsVolume}:${PROXY_PRIVATE_ROOT}`,
+        '-v',
+        `${egressVolume}:${EGRESS_SOCKET_ROOT}`,
+        '-v',
+        `${budgetVolume}:${PROXY_BUDGET_ROOT}`,
+        '--entrypoint',
+        'sleep',
+        imageRef,
+        'infinity',
+      ]);
+      await this.docker(['cp', `${tempDir}/.`, `${initName}:${PROXY_PRIVATE_ROOT}/`], {
+        timeout: 120_000,
+      });
+      await this.docker(['start', initName]);
+      await this.docker(['exec', '-u', '0', initName, 'sh', '-c', buildStrictEgressVolumeScript()]);
+    } finally {
+      try {
+        cleanupFailure = await this.removeIgnoringNotFound(['rm', '-f', initName]);
+      } finally {
+        await rm(tempDir, { recursive: true, force: true });
+      }
+    }
+    if (cleanupFailure) {
+      throw new Error(
+        `Failed to remove strict egress staging container '${initName}': ${cleanupFailure}`
+      );
+    }
+  }
+
+  private async initializeProxyBudgetLedger(
+    initName: string,
+    tlsVolume: string,
+    budgetVolume: string,
+    imageRef: string,
+    ownerRunId?: string
+  ): Promise<void> {
+    await this.docker([
+      'run',
+      '--rm',
+      '--name',
+      initName,
+      '--label',
+      `${CONTAINER_LABELS.managed}=true`,
+      '--label',
+      `${CONTAINER_LABELS.envId}=${initName}`,
+      ...ownerRunLabelArgs(ownerRunId),
+      '--network',
+      'none',
+      '--user',
+      AGENT_USER,
+      '--read-only',
+      '--memory',
+      '128m',
+      '--cpus',
+      CONTROLLER_HELPER_CPUS,
+      '--pids-limit',
+      '64',
+      '--cap-drop',
+      'ALL',
+      '--security-opt',
+      'no-new-privileges',
+      '-v',
+      `${tlsVolume}:${PROXY_PRIVATE_ROOT}:ro`,
+      '-v',
+      `${budgetVolume}:${PROXY_BUDGET_ROOT}`,
+      '--entrypoint',
+      '/usr/local/bin/bun',
+      imageRef,
+      PROXY_BUDGET_LEDGER_CLI,
+      '--create',
+    ]);
+  }
+
+  private async waitForProxyReady(proxyContainerName: string): Promise<void> {
+    const deadline = Date.now() + READY_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      try {
+        await this.probeStrictProxy(proxyContainerName);
+        return;
+      } catch {
+        const state = await this.containerState(proxyContainerName);
+        if (state === 'exited') {
+          const logs = await this.containerLogs(proxyContainerName);
+          throw new Error(`Egress proxy exited before becoming ready. Logs:\n${logs}`);
+        }
+        await sleep(READY_POLL_INTERVAL_MS);
+      }
+    }
+    const logs = await this.containerLogs(proxyContainerName);
+    throw new Error(
+      `Egress proxy did not become ready within ${READY_TIMEOUT_MS}ms. Logs:\n${logs}`
+    );
+  }
+
+  private async probeStrictProxy(proxyContainerName: string): Promise<void> {
+    await this.docker(
+      ['exec', proxyContainerName, 'node', '-e', buildStrictProxyProbeScript(EGRESS_SOCKET_PATH)],
+      { timeout: 5_000 }
+    );
+  }
+
   private async describeContainer(nameOrId: string): Promise<'running' | 'stopped' | 'missing'> {
     try {
       const { stdout } = await this.docker(['inspect', '-f', '{{.State.Running}}', nameOrId]);
@@ -469,11 +1401,6 @@ export class ContainerBackend implements IIsolationBackend {
     }
   }
 
-  /**
-   * Run a `docker rm`/`volume rm` and swallow ONLY the idempotent not-found case
-   * (the resource is already gone). Returns `undefined` on success or not-found,
-   * or the error detail string on a genuine failure the caller must surface.
-   */
   private async removeIgnoringNotFound(args: string[]): Promise<string | undefined> {
     try {
       await this.docker(args);
@@ -488,130 +1415,31 @@ export class ContainerBackend implements IIsolationBackend {
     }
   }
 
-  /**
-   * Start the container with the least-privileged overlay mount that works, and
-   * wait for it to become ready. Tries `fuse` FIRST — fuse-overlayfs runs with
-   * only `--device /dev/fuse` and NO `CAP_SYS_ADMIN`, closing the
-   * `mount -o remount,rw /mnt/lower` escape (see SECURITY.md). That path only
-   * succeeds where the daemon grants unprivileged FUSE mounts (rootless /
-   * userns-remap); on a standard rootful daemon it fails fast and we fall back to
-   * `native` (kernel overlay + `CAP_SYS_ADMIN`), which works everywhere but grants
-   * that escape. The failed attempt's container is removed before the next try so
-   * the name is free.
-   *
-   * @returns the ready container id + the mode that succeeded.
-   */
-  private async startContainerWithOverlay(
+  private async removeContainerAndVolumes(
     containerName: string,
-    volume: string,
-    hostRoot: string,
-    codebaseId: string
-  ): Promise<{ containerId: string; mode: OverlayMode }> {
-    const failures: string[] = [];
-    for (const mode of OVERLAY_MODES) {
-      let containerId: string;
-      try {
-        containerId = await this.runContainerInMode(
-          containerName,
-          volume,
-          hostRoot,
-          codebaseId,
-          mode
-        );
-      } catch (runErr) {
-        // `docker run` itself refused (e.g. `--device /dev/fuse` on a host with no
-        // fuse device) — record and try the next mode. Nothing to remove.
-        failures.push(`${mode}: ${extractDockerError(runErr)}`);
-        continue;
-      }
-      try {
-        await this.waitForReady(containerId);
-        if (mode !== OVERLAY_MODES[0]) {
-          log.warn({ containerName, mode }, 'isolation.container_overlay_fallback');
+    volumes: string[],
+    seedName?: string,
+    proxyContainerName?: string
+  ): Promise<void> {
+    const handles = [seedName, containerName, proxyContainerName].filter(isString);
+    for (const handle of handles) {
+      await this.docker(['rm', '-f', handle]).catch(err => {
+        const detail = extractDockerError(err);
+        if (!/no such container/i.test(detail)) {
+          log.warn({ handle, detail }, 'isolation.container_prepare_container_cleanup_failed');
         }
-        return { containerId, mode };
-      } catch (readyErr) {
-        // Container started but the mount failed (entrypoint exits fast) — remove
-        // it so the name is free for the next mode, then continue.
-        failures.push(`${mode}: ${(readyErr as Error).message}`);
-        await this.docker(['rm', '-f', containerName]).catch(rmErr => {
-          log.warn(
-            { containerName, mode, detail: extractDockerError(rmErr) },
-            'isolation.container_fallback_cleanup_failed'
-          );
-        });
-      }
+      });
     }
-    throw new Error(
-      'Could not mount the overlay in any mode. Native overlay needs CAP_SYS_ADMIN; ' +
-        'fuse-overlayfs needs /dev/fuse AND an unprivileged-mount daemon ' +
-        `(rootless / userns-remap). Attempts:\n${failures.join('\n')}`
-    );
+    for (const volume of volumes) {
+      await this.docker(['volume', 'rm', '-f', volume]).catch(err => {
+        log.warn(
+          { volume, detail: extractDockerError(err) },
+          'isolation.container_prepare_volume_cleanup_failed'
+        );
+      });
+    }
   }
 
-  /**
-   * `docker run -d` the runner image in the given overlay mode. `fuse` grants
-   * only `--device /dev/fuse` (no CAP_SYS_ADMIN); `native` grants
-   * `--cap-add SYS_ADMIN --security-opt apparmor=unconfined` (no device). The
-   * entrypoint mounts per `ARCHON_OVERLAY_MODE`.
-   *
-   * @returns the full container id from `docker run`'s stdout.
-   */
-  private async runContainerInMode(
-    containerName: string,
-    volume: string,
-    hostRoot: string,
-    codebaseId: string,
-    mode: OverlayMode
-  ): Promise<string> {
-    // Least-privilege per mode: fuse gets ONLY the device; native gets the caps.
-    const privilegeArgs =
-      mode === 'fuse'
-        ? ['--device', '/dev/fuse']
-        : ['--cap-add', 'SYS_ADMIN', '--security-opt', 'apparmor=unconfined'];
-
-    const args = [
-      'run',
-      '-d',
-      '--name',
-      containerName,
-      '--label',
-      `${CONTAINER_LABELS.managed}=true`,
-      '--label',
-      `${CONTAINER_LABELS.codebaseId}=${codebaseId}`,
-      '--label',
-      `${CONTAINER_LABELS.envId}=${containerName}`,
-      // Explicit: an auto-restart would resurrect a deliberately-stopped
-      // (paused, Phase C) container and re-run work — never what we want.
-      '--restart',
-      'no',
-      ...privilegeArgs,
-      '--memory',
-      `${this.config.memoryMb}m`,
-      '--pids-limit',
-      String(this.config.pidsLimit),
-      '--network',
-      this.config.network,
-      '-v',
-      `${hostRoot}:/mnt/lower:ro`,
-      '-v',
-      `${volume}:/mnt/upper`,
-      '-e',
-      `ARCHON_WORKSPACE_PATH=${hostRoot}`,
-      '-e',
-      `ARCHON_OVERLAY_MODE=${mode}`,
-      this.config.image,
-    ];
-    const { stdout } = await this.docker(args);
-    return stdout.trim();
-  }
-
-  /**
-   * Poll for the entrypoint's ready sentinel. Fails FAST if the container has
-   * exited (the entrypoint exits 1 on a mount failure) rather than waiting out the
-   * full timeout, so the mode fallback is quick. Throws with the container's tail
-   * logs so a mount failure surfaces the entrypoint's own error.
-   */
   private async waitForReady(containerId: string): Promise<void> {
     const deadline = Date.now() + READY_TIMEOUT_MS;
     while (Date.now() < deadline) {
@@ -619,65 +1447,487 @@ export class ContainerBackend implements IIsolationBackend {
         await this.docker(['exec', containerId, 'test', '-f', READY_SENTINEL], { timeout: 5_000 });
         return;
       } catch {
-        // Not ready yet. ONLY fast-fail when the container has DEFINITELY exited
-        // (`Running=false`) — a transient inspect error/timeout must NOT be read
-        // as "stopped", or an infra blip would silently trigger the native +
-        // CAP_SYS_ADMIN fallback (privilege broadening). On 'unknown' keep polling
-        // until the deadline (a real exit still surfaces via the timeout).
-        if ((await this.containerState(containerId)) === 'stopped') break;
-        await new Promise(resolve => setTimeout(resolve, READY_POLL_INTERVAL_MS));
+        const state = await this.containerState(containerId);
+        if (state === 'exited') {
+          const logs = await this.containerLogs(containerId);
+          throw new Error(`Container exited before becoming ready. Logs:\n${logs}`);
+        }
+        await sleep(READY_POLL_INTERVAL_MS);
       }
     }
-    let logs = '';
-    try {
-      const { stdout, stderr } = await this.docker(['logs', '--tail', '20', containerId]);
-      logs = `${stdout}\n${stderr}`.trim();
-    } catch {
-      // Best-effort — the timeout / exit is the real error.
-    }
-    throw new Error(
-      `Container overlay did not become ready.${logs ? ` Container logs:\n${logs}` : ''}`
-    );
+    const logs = await this.containerLogs(containerId);
+    throw new Error(`Container did not become ready within ${READY_TIMEOUT_MS}ms. Logs:\n${logs}`);
   }
 
-  /**
-   * Container running state as three distinct outcomes. Crucially, an inspect
-   * ERROR (daemon timeout, transient failure) is `unknown`, NOT `stopped` — the
-   * caller must not treat "couldn't tell" as "exited" (see waitForReady: only an
-   * explicit `stopped` may fast-fail into the privileged native fallback).
-   */
-  private async containerState(containerId: string): Promise<'running' | 'stopped' | 'unknown'> {
+  private async containerState(containerId: string): Promise<'running' | 'exited' | 'unknown'> {
     try {
-      const { stdout } = await this.docker(['inspect', '-f', '{{.State.Running}}', containerId], {
+      const { stdout } = await this.docker(['inspect', '-f', '{{.State.Status}}', containerId], {
         timeout: 5_000,
       });
-      const value = stdout.trim();
-      if (value === 'true') return 'running';
-      if (value === 'false') return 'stopped';
+      const status = stdout.trim();
+      if (status === 'running') return 'running';
+      if (status === 'exited' || status === 'dead') return 'exited';
       return 'unknown';
     } catch {
       return 'unknown';
     }
   }
 
-  /**
-   * Best-effort removal of a container + its upper volume, used to unwind a
-   * partially-prepared environment (e.g. after `store.create()` rejects) before
-   * a tracking row exists. Failures are logged (breadcrumbs) but never thrown —
-   * the caller is already rethrowing the original error.
-   */
-  private async removeContainerAndVolume(containerName: string, volume: string): Promise<void> {
-    await this.docker(['rm', '-f', containerName]).catch(err => {
-      log.warn(
-        { containerName, detail: extractDockerError(err) },
-        'isolation.container_unwind_rm_failed'
-      );
-    });
-    await this.docker(['volume', 'rm', '-f', volume]).catch(err => {
-      log.warn(
-        { volume, detail: extractDockerError(err) },
-        'isolation.container_unwind_volume_failed'
-      );
-    });
+  private async containerLogs(containerId: string): Promise<string> {
+    try {
+      const { stdout, stderr } = await this.docker(['logs', '--tail', '80', containerId], {
+        timeout: 5_000,
+      });
+      return `${stdout}${stderr}`.trim();
+    } catch (err) {
+      return `failed to read logs: ${extractDockerError(err)}`;
+    }
   }
+}
+
+function resolveSeed(req: BackendPrepareRequest): { path: string; allowGitMetadata: boolean } {
+  if (req.seed?.kind === 'directory' && req.seed.path.trim().length > 0) {
+    return { path: req.seed.path, allowGitMetadata: req.seed.allowGitMetadata === true };
+  }
+  throw new Error(
+    'Hardened container isolation requires a controller-prepared committed-input seed directory. ' +
+      'Refusing to copy the live workspace/root into the agent container.'
+  );
+}
+
+function buildSeedValidationScript(root: string, allowGitMetadata = false): string {
+  const quotedRoot = shellQuote(root);
+  const rejectExpression = [
+    ...(allowGitMetadata ? [] : ["-name '.git'"]),
+    "-name '.env*'",
+    "-name '.npmrc'",
+    "-name '.netrc'",
+    "-name '.aws'",
+    "-name '.docker'",
+    "-path '*/.config/gh'",
+  ].join(' -o ');
+  return [
+    'set -eu',
+    `normalize_root_access() {
+      chown root:root "$1"
+      chmod u+rwx "$1"
+      find "$1" -type d -exec chown root:root {} \\; -exec chmod u+rwx {} \\;
+      bad_owner="$(find "$1" -type d ! -user 0 -print -quit)"
+      test -z "$bad_owner"
+    }`,
+    `normalize_root_access ${quotedRoot}`,
+    `bad_seed="$(find ${quotedRoot} \\( -type l -o \\( ${rejectExpression} \\) \\) -print -quit)"`,
+    'if [ -n "$bad_seed" ]; then echo \'seed contains forbidden credential, link or VCS path\' >&2; exit 1; fi',
+    `chown -R ${AGENT_USER}:${AGENT_USER} ${quotedRoot}`,
+    `if [ -d ${quotedRoot}/.archon/controller-origins ]; then normalize_root_access ${quotedRoot}/.archon/controller-origins; chown -R root:root ${quotedRoot}/.archon/controller-origins; chmod -R a-w,a+rX ${quotedRoot}/.archon/controller-origins; fi`,
+  ].join('\n');
+}
+
+function requireHardenedMetadata(
+  envId: string,
+  meta: Partial<ContainerEnvMetadata>
+): ContainerEnvMetadata {
+  const reason = validateHardenedMetadata(meta);
+  if (!reason) return meta as ContainerEnvMetadata;
+  throw new Error(
+    `Cannot use container env '${envId}': its hardened metadata is invalid (${reason}). ` +
+      'Legacy or tampered metadata is diagnostic-only; start a fresh --container run.'
+  );
+}
+
+function validateHardenedMetadata(meta: Partial<ContainerEnvMetadata>): string | undefined {
+  if (meta.profile !== 'hardened') return 'missing hardened profile';
+  if (meta.isolationMode !== 'hardened') return 'missing hardened isolation mode';
+  if (!isString(meta.resourceId)) return 'missing resource id';
+  if (!isDockerToken(meta.resourceId)) return 'invalid resource id';
+  if (!isString(meta.image) || !/^sha256:[0-9a-f]{64}$/.test(meta.image))
+    return 'missing immutable image id';
+  if (!isString(meta.workspacePath)) return 'missing workspace path';
+  if (meta.agentArtifactsDir !== AGENT_ARTIFACTS_DIR) return 'unexpected artifact root';
+  const expected = expectedManagedNames(meta.resourceId);
+  if (meta.containerName !== expected.containerName) return 'unexpected container name';
+  if (!isString(meta.containerId)) return 'missing container id';
+  if (meta.containerId !== expected.containerName && !isDockerToken(meta.containerId))
+    return 'invalid container id';
+  if (meta.ownerRunId !== undefined && !isDockerToken(meta.ownerRunId))
+    return 'invalid owner run id';
+  if (meta.volume !== expected.workspaceVolume) return 'unexpected legacy volume alias';
+  if (meta.workspaceVolume !== expected.workspaceVolume) return 'unexpected workspace volume';
+  if (meta.homeVolume !== expected.homeVolume) return 'unexpected home volume';
+  if (meta.artifactsVolume !== expected.artifactsVolume) return 'unexpected artifact volume';
+  const resourceLimitError = validateResourceLimits(meta.resourceLimits);
+  if (resourceLimitError) return resourceLimitError;
+  return validateEgressMetadata(meta, expected);
+}
+
+function validateResourceLimits(limits: unknown): string | undefined {
+  if (!limits || typeof limits !== 'object') return 'missing frozen resource limits';
+  const record = limits as Partial<ContainerResourceLimits>;
+  if (record.policyVersion !== RESOURCE_LIMIT_POLICY_VERSION)
+    return 'unsupported resource limit policy';
+  if (record.agentCpus !== AGENT_CPUS) return 'unexpected agent cpu limit';
+  if (record.controllerHelperCpus !== CONTROLLER_HELPER_CPUS)
+    return 'unexpected controller helper cpu limit';
+  if (!Number.isInteger(record.memoryMb) || (record.memoryMb ?? 0) <= 0)
+    return 'invalid frozen memory limit';
+  if (!Number.isInteger(record.pidsLimit) || (record.pidsLimit ?? 0) <= 0)
+    return 'invalid frozen process limit';
+  return undefined;
+}
+
+function validateEgressMetadata(
+  meta: Partial<ContainerEnvMetadata>,
+  expected: ReturnType<typeof expectedManagedNames>
+): string | undefined {
+  const anyEgress = Boolean(
+    meta.egressVolume ||
+    meta.tlsVolume ||
+    meta.tlsValidUntil ||
+    meta.proxyContainerName ||
+    meta.budgetVolume ||
+    meta.budgetPolicyDigest ||
+    meta.proxyBudgetSeedDigest ||
+    meta.egressPolicyB64
+  );
+  if (!anyEgress) return undefined;
+  if (meta.egressVolume !== expected.egressVolume) return 'unexpected egress volume';
+  if (meta.tlsVolume !== expected.tlsVolume) return 'unexpected TLS material volume';
+  if (!isValidIsoDate(meta.tlsValidUntil)) return 'invalid TLS expiry timestamp';
+  if (meta.proxyContainerName !== expected.proxyContainerName) return 'unexpected proxy name';
+  if (meta.budgetVolume !== expected.budgetVolume) return 'unexpected proxy budget volume';
+  if (!isString(meta.budgetPolicyDigest)) return 'missing proxy budget policy digest';
+  if (!isString(meta.proxyBudgetSeedDigest)) return 'missing proxy budget seed digest';
+  if (!isString(meta.egressPolicyB64)) return 'missing frozen egress policy';
+  try {
+    decodeStrictEgressPolicy(meta.egressPolicyB64);
+  } catch {
+    return 'invalid frozen strict egress policy';
+  }
+  return undefined;
+}
+
+function expectedManagedNames(resourceId: string): {
+  containerName: string;
+  workspaceVolume: string;
+  homeVolume: string;
+  artifactsVolume: string;
+  egressVolume: string;
+  tlsVolume: string;
+  proxyContainerName: string;
+  budgetVolume: string;
+} {
+  const containerName = `archon-${resourceId}`;
+  return {
+    containerName,
+    workspaceVolume: `${containerName}-workspace`,
+    homeVolume: `${containerName}-home`,
+    artifactsVolume: `${containerName}-artifacts`,
+    egressVolume: `${containerName}-egress`,
+    tlsVolume: `${containerName}-egress-tls`,
+    proxyContainerName: `${containerName}-egress-proxy`,
+    budgetVolume: `${containerName}-budget`,
+  };
+}
+
+function collectVolumes(meta: ContainerEnvMetadata): string[] {
+  return [
+    meta.workspaceVolume,
+    meta.homeVolume,
+    meta.artifactsVolume,
+    meta.egressVolume,
+    meta.tlsVolume,
+    meta.budgetVolume,
+  ].filter(isString);
+}
+
+function hasVolumeMount(
+  mounts: unknown,
+  name: string,
+  destination: string,
+  writable: boolean
+): boolean {
+  if (!Array.isArray(mounts)) return false;
+  return mounts.some(mount => {
+    if (!mount || typeof mount !== 'object') return false;
+    const record = mount as Record<string, unknown>;
+    return (
+      record.Type === 'volume' &&
+      record.Name === name &&
+      record.Destination === destination &&
+      record.RW === writable
+    );
+  });
+}
+
+function assertHardenedContainerConfig(config: ContainerBackendConfig): void {
+  if (config.network !== 'none') {
+    throw new Error(
+      `Unsupported hardened container network '${config.network}': agent containers must use network none.`
+    );
+  }
+  if (!Number.isInteger(config.memoryMb) || config.memoryMb <= 0) {
+    throw new Error(
+      'Unsupported hardened container memory limit: memoryMb must be a positive integer.'
+    );
+  }
+  if (!Number.isInteger(config.pidsLimit) || config.pidsLimit <= 0) {
+    throw new Error(
+      'Unsupported hardened container process limit: pidsLimit must be a positive integer.'
+    );
+  }
+}
+
+function buildStrictEgressVolumeScript(): string {
+  return [
+    'set -eu',
+    `chown root:root ${PROXY_PRIVATE_ROOT}`,
+    `chmod 0700 ${PROXY_PRIVATE_ROOT}`,
+    `chown root:root ${PROXY_POLICY_PATH} ${PROXY_LEAF_KEY_PATH} ${PROXY_LEAF_CERT_PATH} ${PROXY_CA_CERT_PATH} ${PROXY_BUDGET_GRANT_PATH} ${PROXY_PROVIDER_POLICIES_PATH}`,
+    `chmod 0400 ${PROXY_POLICY_PATH} ${PROXY_LEAF_KEY_PATH} ${PROXY_LEAF_CERT_PATH} ${PROXY_CA_CERT_PATH} ${PROXY_BUDGET_GRANT_PATH} ${PROXY_PROVIDER_POLICIES_PATH}`,
+    `chown root:root ${EGRESS_SOCKET_ROOT}`,
+    `chmod 0700 ${EGRESS_SOCKET_ROOT}`,
+    `install -o root -g root -m 0444 ${PROXY_CA_CERT_PATH} ${EGRESS_PUBLIC_CA_PATH}`,
+    `chmod 0500 ${PROXY_PRIVATE_ROOT}`,
+    `chown ${AGENT_USER}:${AGENT_USER} ${PROXY_POLICY_PATH} ${PROXY_LEAF_KEY_PATH} ${PROXY_LEAF_CERT_PATH} ${PROXY_CA_CERT_PATH} ${PROXY_BUDGET_GRANT_PATH} ${PROXY_PROVIDER_POLICIES_PATH}`,
+    `chown ${AGENT_USER}:${AGENT_USER} ${PROXY_PRIVATE_ROOT}`,
+    `chown root:root ${PROXY_BUDGET_ROOT}`,
+    `chmod 0700 ${PROXY_BUDGET_ROOT}`,
+    `chown ${AGENT_USER}:${AGENT_USER} ${PROXY_BUDGET_ROOT}`,
+    `chmod 0770 ${EGRESS_SOCKET_ROOT}`,
+    `chown ${AGENT_USER}:${AGENT_USER} ${EGRESS_SOCKET_ROOT}`,
+  ].join('\n');
+}
+
+function buildStrictProxyProbeScript(socketPath: string): string {
+  return [
+    "const net = require('node:net');",
+    `const client = net.createConnection(${JSON.stringify(socketPath)});`,
+    "const request = 'CONNECT archon-readiness.invalid:443 HTTP/1.1\\r\\nHost: archon-readiness.invalid:443\\r\\n\\r\\n';",
+    "let data = '';",
+    'const timer = setTimeout(() => { client.destroy(); process.exit(1); }, 3000);',
+    "client.on('connect', () => client.write(request));",
+    "client.on('data', chunk => { data += chunk.toString('utf8'); if (data.includes('\\r\\n')) client.end(); });",
+    "client.on('error', () => { clearTimeout(timer); process.exit(1); });",
+    "client.on('close', () => { clearTimeout(timer); process.exit(/^HTTP\\/1\\.1 (400|403)\\b/.test(data) ? 0 : 1); });",
+  ].join('\n');
+}
+
+function normalizeStrictEgressResumeMetadata(input: {
+  proxyContainerName: string | undefined;
+  tlsVolume: string | undefined;
+  egressVolume: string | undefined;
+  budgetVolume: string | undefined;
+  tlsValidUntil: string | undefined;
+  policyB64: string | undefined;
+  budgetPolicyDigest: string | undefined;
+  proxyBudgetSeedDigest: string | undefined;
+}): StrictEgressResumeMetadata | undefined {
+  const values = Object.values(input);
+  if (values.every(value => value === undefined)) return undefined;
+  if (!values.every(isString)) {
+    throw new Error('Cannot resume strict egress: frozen proxy metadata is incomplete.');
+  }
+  const metadata = input as StrictEgressResumeMetadata & { proxyBudgetSeedDigest: string };
+  if (!/^[0-9a-f]{64}$/i.test(metadata.proxyBudgetSeedDigest)) {
+    throw new Error('Cannot resume strict egress: proxy budget seed digest is invalid.');
+  }
+  return metadata;
+}
+
+function assertTlsStillValid(value: string): void {
+  if (!isValidIsoDate(value) || Date.parse(value) <= Date.now()) {
+    throw new Error('Cannot resume strict egress: TLS material is expired.');
+  }
+}
+
+function isValidIsoDate(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) && new Date(parsed).toISOString() === value;
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+function resolveOwnerRunId(ownerRunId: string | undefined): string | undefined {
+  if (ownerRunId === undefined) return undefined;
+  if (!isDockerToken(ownerRunId)) {
+    throw new Error(`Invalid ownerRunId '${ownerRunId}': expected a Docker label-safe run id.`);
+  }
+  return ownerRunId;
+}
+
+function ownerRunLabelArgs(ownerRunId: string | undefined): string[] {
+  if (!ownerRunId) return [];
+  return ['--label', `${CONTAINER_LABELS.ownerRunId}=${ownerRunId}`];
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function agentEgressArgs(egressVolume: string | undefined): string[] {
+  if (!egressVolume) return [];
+  return [
+    '-v',
+    `${egressVolume}:${EGRESS_SOCKET_ROOT}:ro`,
+    '-e',
+    `ARCHON_PROXY_SOCKET=${EGRESS_SOCKET_PATH}`,
+    '-e',
+    `ARCHON_PROXY_PORT=${AGENT_PROXY_PORT}`,
+    '-e',
+    `HTTP_PROXY=http://127.0.0.1:${AGENT_PROXY_PORT}`,
+    '-e',
+    `HTTPS_PROXY=http://127.0.0.1:${AGENT_PROXY_PORT}`,
+    '-e',
+    `NODE_EXTRA_CA_CERTS=${EGRESS_PUBLIC_CA_PATH}`,
+    '-e',
+    `CODEX_CA_CERTIFICATE=${EGRESS_PUBLIC_CA_PATH}`,
+    '-e',
+    `SSL_CERT_FILE=${EGRESS_PUBLIC_CA_PATH}`,
+    '-e',
+    'NO_PROXY=localhost,127.0.0.1,::1',
+  ];
+}
+
+function isString(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0;
+}
+
+function isDockerToken(value: unknown): value is string {
+  return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(value);
+}
+
+function parseProxyBudgetStatusOutput(stdout: string): BudgetStatus {
+  const lines = stdout
+    .split('\n')
+    .map(line => line.trim())
+    .filter(Boolean);
+  if (lines.length !== 1) {
+    throw new Error('Proxy budget status output is malformed.');
+  }
+  const envelope = JSON.parse(lines[0]) as Record<string, unknown>;
+  if (envelope.ok !== true || envelope.event !== 'status') {
+    throw new Error('Proxy budget status command failed.');
+  }
+  return readBudgetStatus(envelope.result);
+}
+
+function normalizeVerifiedProxyBudgetStatus(
+  envId: string,
+  status: BudgetStatus,
+  expectedGrant: ProxyBudgetGrant
+): VerifiedProxyBudgetStatus {
+  assertSameGrant(status.grant, expectedGrant);
+  if (status.pendingReservations > 0 || status.unknownReservations > 0) {
+    throw new Error('Proxy budget ledger has pending or unknown reservations.');
+  }
+  if (!status.acceptingReservations) {
+    throw new Error('Proxy budget ledger is not accepting exact reservations.');
+  }
+  return {
+    source: 'controller-proxy-ledger',
+    envId,
+    grant: { ...status.grant },
+    consumed: {
+      input: status.consumedInputTokens,
+      output: status.consumedOutputTokens,
+    },
+    pendingReservations: status.pendingReservations,
+    unknownReservations: status.unknownReservations,
+    acceptingReservations: status.acceptingReservations,
+  };
+}
+
+function readBudgetStatus(value: unknown): BudgetStatus {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('Proxy budget status result is malformed.');
+  }
+  const status = value as BudgetStatus;
+  const grant = readBudgetGrant(status.grant);
+  const consumedInputTokens = readSafeCount(status.consumedInputTokens, 'consumed input tokens');
+  const consumedOutputTokens = readSafeCount(status.consumedOutputTokens, 'consumed output tokens');
+  const consumedTotalTokens = readSafeCount(status.consumedTotalTokens, 'consumed total tokens');
+  const expectedTotal = consumedInputTokens + consumedOutputTokens;
+  if (!Number.isSafeInteger(expectedTotal) || expectedTotal !== consumedTotalTokens) {
+    throw new Error('Proxy budget status totals are malformed.');
+  }
+  return {
+    grant,
+    pendingReservations: readSafeCount(status.pendingReservations, 'pending reservations'),
+    unknownReservations: readSafeCount(status.unknownReservations, 'unknown reservations'),
+    consumedInputTokens,
+    consumedOutputTokens,
+    consumedTotalTokens,
+    remainingInputTokens: readSafeCount(status.remainingInputTokens, 'remaining input tokens'),
+    remainingOutputTokens: readSafeCount(status.remainingOutputTokens, 'remaining output tokens'),
+    remainingTotalTokens: readSafeCount(status.remainingTotalTokens, 'remaining total tokens'),
+    acceptingReservations: readBooleanField(status.acceptingReservations, 'accepting reservations'),
+  };
+}
+
+function readBudgetGrant(value: unknown): ProxyBudgetGrant {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('Proxy budget status grant is malformed.');
+  }
+  const grant = value as ProxyBudgetGrant;
+  if (grant.schema !== 'archon.proxy-budget-grant.v1') {
+    throw new Error('Proxy budget status grant is malformed.');
+  }
+  return {
+    schema: grant.schema,
+    rootChainId: readStringField(grant.rootChainId, 'root chain id'),
+    runId: readStringField(grant.runId, 'run id'),
+    workflowDigest: readStringField(grant.workflowDigest, 'workflow digest'),
+    policyDigest: readStringField(grant.policyDigest, 'policy digest'),
+    deadlineEpochMs: readPositiveSafeCount(grant.deadlineEpochMs, 'deadline'),
+    inputTokenLimit: readSafeCount(grant.inputTokenLimit, 'input token limit'),
+    outputTokenLimit: readSafeCount(grant.outputTokenLimit, 'output token limit'),
+    totalTokenLimit: readSafeCount(grant.totalTokenLimit, 'total token limit'),
+  };
+}
+
+function assertSameGrant(actual: ProxyBudgetGrant, expected: ProxyBudgetGrant): void {
+  if (
+    actual.schema !== expected.schema ||
+    actual.rootChainId !== expected.rootChainId ||
+    actual.runId !== expected.runId ||
+    actual.workflowDigest !== expected.workflowDigest ||
+    actual.policyDigest !== expected.policyDigest ||
+    actual.deadlineEpochMs !== expected.deadlineEpochMs ||
+    actual.inputTokenLimit !== expected.inputTokenLimit ||
+    actual.outputTokenLimit !== expected.outputTokenLimit ||
+    actual.totalTokenLimit !== expected.totalTokenLimit
+  ) {
+    throw new Error('Proxy budget status grant binding drifted.');
+  }
+}
+
+function readStringField(value: unknown, label: string): string {
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new Error(`Proxy budget status ${label} is malformed.`);
+  }
+  return value;
+}
+
+function readBooleanField(value: unknown, label: string): boolean {
+  if (typeof value !== 'boolean') {
+    throw new Error(`Proxy budget status ${label} is malformed.`);
+  }
+  return value;
+}
+
+function readSafeCount(value: unknown, label: string): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`Proxy budget status ${label} is malformed.`);
+  }
+  return value;
+}
+
+function readPositiveSafeCount(value: unknown, label: string): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`Proxy budget status ${label} is malformed.`);
+  }
+  return value;
 }

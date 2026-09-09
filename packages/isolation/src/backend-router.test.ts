@@ -13,8 +13,9 @@ const folderCodebase = {
 };
 
 const containerConfig: ContainerBackendConfig = {
+  profile: 'hardened',
   image: 'archon-runner:test',
-  network: 'bridge',
+  network: 'none',
   memoryMb: 4096,
   pidsLimit: 512,
 };

@@ -1,4 +1,7 @@
 import { describe, test, expect, mock, beforeEach, afterEach, spyOn } from 'bun:test';
+import { execFile } from 'child_process';
+import { randomUUID } from 'crypto';
+import { promisify } from 'util';
 import { createMockLogger } from '../test/mocks/logger';
 
 const mockLogger = createMockLogger();
@@ -19,6 +22,46 @@ mock.module('@anthropic-ai/claude-agent-sdk', () => ({
 import { ClaudeProvider, shouldPassNoEnvFile } from './provider';
 import * as claudeModule from './provider';
 import * as binaryResolver from './binary-resolver';
+
+const execFileAsync = promisify(execFile);
+
+async function docker(args: string[]): Promise<string> {
+  const { stdout } = await execFileAsync('docker', args, {
+    timeout: 15_000,
+    maxBuffer: 1024 * 1024,
+    env: sanitizedDockerEnv(),
+  });
+  return stdout ?? '';
+}
+
+function sanitizedDockerEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  delete env.OPENAI_API_KEY;
+  delete env.CODEX_API_KEY;
+  delete env.ANTHROPIC_API_KEY;
+  delete env.CLAUDE_API_KEY;
+  delete env.CLAUDE_CODE_OAUTH_TOKEN;
+  return env;
+}
+
+async function waitForDockerFile(container: string, path: string): Promise<string> {
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    try {
+      const value = await docker(['exec', container, 'cat', path]);
+      if (value.trim()) return value.trim();
+    } catch {
+      // keep polling until the fake CLI writes the handshake file
+    }
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  throw new Error(`Timed out waiting for ${path} in ${container}`);
+}
+
+async function dockerRunning(container: string): Promise<boolean> {
+  const value = await docker(['inspect', '-f', '{{.State.Running}}', container]);
+  return value.trim() === 'true';
+}
 
 describe('shouldPassNoEnvFile', () => {
   test('returns false when cliPath is undefined (dev mode — SDK 0.2.x resolves a native binary)', () => {
@@ -1054,7 +1097,12 @@ describe('ClaudeProvider', () => {
 
       // Must not throw at resolution time.
       for await (const _ of client.sendQuery('test', '/workspace', undefined, {
-        execContext: { kind: 'container', containerId: 'c-1' },
+        execContext: {
+          kind: 'container',
+          profile: 'hardened',
+          containerId: 'c-1',
+          providerOrigins: [{ provider: 'anthropic', baseUrl: 'https://api.anthropic.test' }],
+        },
       })) {
         // consume
       }
@@ -1069,6 +1117,216 @@ describe('ClaudeProvider', () => {
 
       spy.mockRestore();
     });
+
+    test('pre-aborted container request does not spawn workload or stop an idle run container', async () => {
+      const stopContainerOnAbort = mock(async () => {
+        // not called
+      });
+      client = new ClaudeProvider({ retryBaseDelayMs: 1, stopContainerOnAbort });
+      const abortController = new AbortController();
+      abortController.abort();
+
+      const consume = async (): Promise<void> => {
+        for await (const _ of client.sendQuery('test', '/workspace', undefined, {
+          abortSignal: abortController.signal,
+          execContext: {
+            kind: 'container',
+            profile: 'hardened',
+            containerId: 'c-1',
+            providerOrigins: [{ provider: 'anthropic', baseUrl: 'https://api.anthropic.test' }],
+          },
+        })) {
+          // consume
+        }
+      };
+
+      await expect(consume()).rejects.toThrow('Query aborted');
+      expect(mockQuery).not.toHaveBeenCalled();
+      expect(stopContainerOnAbort).not.toHaveBeenCalled();
+    });
+
+    test('normal container result does not stop the run container', async () => {
+      const stopContainerOnAbort = mock(async () => {
+        // not called
+      });
+      client = new ClaudeProvider({ retryBaseDelayMs: 1, stopContainerOnAbort });
+      const abortController = new AbortController();
+      mockQuery.mockImplementation(async function* () {
+        yield { type: 'result', subtype: 'success', session_id: 'sid-ok' };
+      });
+
+      for await (const _ of client.sendQuery('test', '/workspace', undefined, {
+        abortSignal: abortController.signal,
+        execContext: {
+          kind: 'container',
+          profile: 'hardened',
+          containerId: 'c-1',
+          providerOrigins: [{ provider: 'anthropic', baseUrl: 'https://api.anthropic.test' }],
+        },
+      })) {
+        // consume
+      }
+
+      abortController.abort();
+      expect(stopContainerOnAbort).not.toHaveBeenCalled();
+    });
+
+    test('deadline-triggered container cleanup is awaited and failures surface', async () => {
+      const stopContainerOnAbort = mock(async () => {
+        throw new Error('container stop failed');
+      });
+      client = new ClaudeProvider({ retryBaseDelayMs: 1, stopContainerOnAbort });
+      const original = process.env.ARCHON_CLAUDE_FIRST_EVENT_TIMEOUT_MS;
+      process.env.ARCHON_CLAUDE_FIRST_EVENT_TIMEOUT_MS = '20';
+      mockQuery.mockImplementation(async function* () {
+        await new Promise(() => {});
+        yield { type: 'result', subtype: 'success', session_id: 'never' };
+      });
+
+      const consume = async (): Promise<void> => {
+        for await (const _ of client.sendQuery('test', '/workspace', undefined, {
+          execContext: {
+            kind: 'container',
+            profile: 'hardened',
+            containerId: 'c-1',
+            providerOrigins: [{ provider: 'anthropic', baseUrl: 'https://api.anthropic.test' }],
+          },
+        })) {
+          // consume
+        }
+      };
+
+      try {
+        await expect(consume()).rejects.toThrow('container stop failed');
+        expect(stopContainerOnAbort).toHaveBeenCalledWith(
+          {
+            kind: 'container',
+            profile: 'hardened',
+            containerId: 'c-1',
+            providerOrigins: [{ provider: 'anthropic', baseUrl: 'https://api.anthropic.test' }],
+          },
+          'deadline'
+        );
+      } finally {
+        if (original === undefined) delete process.env.ARCHON_CLAUDE_FIRST_EVENT_TIMEOUT_MS;
+        else process.env.ARCHON_CLAUDE_FIRST_EVENT_TIMEOUT_MS = original;
+      }
+    });
+
+    test.skipIf(process.env.ARCHON_RUN_DOCKER_CLAUDE_ABORT_TEST !== '1')(
+      'real Docker container run fail-stops the owned container on provider abort without stopping siblings',
+      async () => {
+        const image =
+          process.env.ARCHON_CLAUDE_ABORT_TEST_IMAGE ??
+          'sha256:d59e7ffa2fe8e746ad13d0ba06799e3afe386311d6e274c8e9e639b26cc081a0';
+        const suffix = randomUUID();
+        const main = `archon-claude-abort-${suffix}`;
+        const sibling = `archon-claude-sibling-${suffix}`;
+        const fakeCli = [
+          '#!/bin/sh',
+          'echo $$ > /tmp/fake-claude.pid',
+          'sleep 60 &',
+          'echo $! > /tmp/fake-claude.child',
+          'wait',
+        ].join('\n');
+        const launchArgs = (name: string): string[] => [
+          'run',
+          '-d',
+          '--name',
+          name,
+          '--label',
+          'diy.archon.managed=true',
+          '--network',
+          'none',
+          '--cap-drop',
+          'ALL',
+          '--security-opt',
+          'no-new-privileges',
+          '--read-only',
+          '--tmpfs',
+          '/tmp:rw,nosuid,nodev,size=16m,mode=1777',
+          '--entrypoint',
+          'sleep',
+          image,
+          'infinity',
+        ];
+        const previousBin = process.env.ARCHON_CONTAINER_CLAUDE_BIN;
+        const abortController = new AbortController();
+
+        await docker(launchArgs(main));
+        await docker(launchArgs(sibling));
+        try {
+          await docker([
+            'exec',
+            main,
+            'sh',
+            '-c',
+            `cat > /tmp/fake-claude <<'EOF'\n${fakeCli}\nEOF\nchmod 755 /tmp/fake-claude`,
+          ]);
+          process.env.ARCHON_CONTAINER_CLAUDE_BIN = '/bin/sh';
+          mockQuery.mockImplementation(async function* (call: Record<string, unknown>) {
+            const options = call.options as {
+              abortController: AbortController;
+              spawnClaudeCodeProcess: (spawnOptions: {
+                command: string;
+                args: string[];
+                cwd: string;
+                env: NodeJS.ProcessEnv;
+                signal: AbortSignal;
+              }) => {
+                once(event: 'exit', listener: (...args: unknown[]) => void): void;
+              };
+            };
+            const proc = options.spawnClaudeCodeProcess({
+              command: 'claude',
+              args: ['/tmp/fake-claude'],
+              cwd: '/tmp',
+              env: { TERM: 'dumb' },
+              signal: options.abortController.signal,
+            });
+            const pid = await waitForDockerFile(main, '/tmp/fake-claude.pid');
+            const child = await waitForDockerFile(main, '/tmp/fake-claude.child');
+            await docker([
+              'exec',
+              '-u',
+              'archon',
+              main,
+              'sh',
+              '-c',
+              `kill -0 ${pid} && kill -0 ${child}`,
+            ]);
+            abortController.abort();
+            await new Promise<void>(resolve => proc.once('exit', () => resolve()));
+            if (Date.now() < 0) yield { type: 'result', subtype: 'success' };
+            throw new Error('Operation aborted');
+          });
+
+          const consume = async (): Promise<void> => {
+            for await (const _ of client.sendQuery('test', '/tmp', undefined, {
+              abortSignal: abortController.signal,
+              execContext: {
+                kind: 'container',
+                profile: 'hardened',
+                containerId: main,
+                execUser: 'archon',
+              },
+            })) {
+              // consume
+            }
+          };
+
+          await expect(consume()).rejects.toThrow('Query aborted');
+          expect(await dockerRunning(main)).toBe(false);
+          expect(await dockerRunning(sibling)).toBe(true);
+        } finally {
+          if (previousBin === undefined) delete process.env.ARCHON_CONTAINER_CLAUDE_BIN;
+          else process.env.ARCHON_CONTAINER_CLAUDE_BIN = previousBin;
+          await docker(['rm', '-f', main]).catch(() => '');
+          await docker(['rm', '-f', sibling]).catch(() => '');
+        }
+      },
+      60_000
+    );
 
     test('classifies exit code errors as crash and retries up to 3 times', async () => {
       const error = new Error('process exited with code 1');
@@ -1290,6 +1548,294 @@ describe('ClaudeProvider', () => {
       // An explicit empty array is a valid opt-out of ALL setting sources —
       // it must not fall through to the ['project', 'user'] default.
       expect(callArgs.options.settingSources).toEqual([]);
+    });
+
+    test('container execution defaults settingSources to empty', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield { type: 'result', session_id: 'test-session' };
+      });
+
+      for await (const _ of client.sendQuery('test', '/tmp', undefined, {
+        execContext: {
+          kind: 'container',
+          profile: 'hardened',
+          containerId: 'cid-1',
+          providerOrigins: [{ provider: 'anthropic', baseUrl: 'https://api.anthropic.test' }],
+        },
+      })) {
+        // consume
+      }
+
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+      const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+      expect(callArgs.options.settingSources).toEqual([]);
+    });
+
+    test('container execution honors explicit empty settingSources', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield { type: 'result', session_id: 'test-session' };
+      });
+
+      for await (const _ of client.sendQuery('test', '/tmp', undefined, {
+        nodeConfig: { settingSources: [] },
+        execContext: {
+          kind: 'container',
+          profile: 'hardened',
+          containerId: 'cid-1',
+          providerOrigins: [{ provider: 'anthropic', baseUrl: 'https://api.anthropic.test' }],
+        },
+      })) {
+        // consume
+      }
+
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+      const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+      expect(callArgs.options.settingSources).toEqual([]);
+    });
+
+    test('container execution rejects nonempty node settingSources before query', async () => {
+      const consumeGenerator = async (): Promise<void> => {
+        for await (const _ of client.sendQuery('test', '/tmp', undefined, {
+          nodeConfig: { settingSources: ['project'] },
+          execContext: {
+            kind: 'container',
+            profile: 'hardened',
+            containerId: 'cid-1',
+            providerOrigins: [{ provider: 'anthropic', baseUrl: 'https://api.anthropic.test' }],
+          },
+        })) {
+          // consume
+        }
+      };
+
+      await expect(consumeGenerator()).rejects.toThrow(
+        'Claude container execution does not support settingSources'
+      );
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    test('container execution rejects nonempty assistant settingSources before query', async () => {
+      const consumeGenerator = async (): Promise<void> => {
+        for await (const _ of client.sendQuery('test', '/tmp', undefined, {
+          assistantConfig: { settingSources: ['user'] },
+          execContext: {
+            kind: 'container',
+            profile: 'hardened',
+            containerId: 'cid-1',
+            providerOrigins: [{ provider: 'anthropic', baseUrl: 'https://api.anthropic.test' }],
+          },
+        })) {
+          // consume
+        }
+      };
+
+      await expect(consumeGenerator()).rejects.toThrow(
+        'Claude container execution does not support settingSources'
+      );
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    test('container execution rejects MCP config before loading host-expanded config', async () => {
+      const consumeGenerator = async (): Promise<void> => {
+        for await (const _ of client.sendQuery('test', '/tmp', undefined, {
+          nodeConfig: { mcp: 'mcp.json' },
+          execContext: {
+            kind: 'container',
+            profile: 'hardened',
+            containerId: 'cid-1',
+            providerOrigins: [{ provider: 'anthropic', baseUrl: 'https://api.anthropic.test' }],
+          },
+        })) {
+          // consume
+        }
+      };
+
+      await expect(consumeGenerator()).rejects.toThrow(
+        'Claude container execution does not support MCP config'
+      );
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    test('container execution rejects native tools before registering in-process MCP', async () => {
+      const consumeGenerator = async (): Promise<void> => {
+        for await (const _ of client.sendQuery('test', '/tmp', undefined, {
+          nativeTools: [
+            {
+              name: 'manage_run',
+              description: 'controller action',
+              inputSchema: { type: 'object', properties: {} },
+              handler: async () => 'ok',
+            },
+          ],
+          execContext: {
+            kind: 'container',
+            profile: 'hardened',
+            containerId: 'cid-1',
+            providerOrigins: [{ provider: 'anthropic', baseUrl: 'https://api.anthropic.test' }],
+          },
+        })) {
+          // consume
+        }
+      };
+
+      await expect(consumeGenerator()).rejects.toThrow(
+        'Claude container execution does not support native tools'
+      );
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    test('container execution rejects node-supplied hooks before SDK option construction', async () => {
+      const consumeGenerator = async (): Promise<void> => {
+        for await (const _ of client.sendQuery('test', '/tmp', undefined, {
+          nodeConfig: {
+            hooks: { PreToolUse: [{ matcher: '.*', response: { continue: true } }] },
+          },
+          execContext: {
+            kind: 'container',
+            profile: 'hardened',
+            containerId: 'cid-1',
+            providerOrigins: [{ provider: 'anthropic', baseUrl: 'https://api.anthropic.test' }],
+          },
+        })) {
+          // consume
+        }
+      };
+
+      await expect(consumeGenerator()).rejects.toThrow(
+        'Claude container execution does not support node hooks'
+      );
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    test('container execution sanitizes request env before passing SDK options', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield { type: 'result', session_id: 'sid' };
+      });
+
+      for await (const _ of client.sendQuery('test', '/tmp', undefined, {
+        execContext: {
+          kind: 'container',
+          profile: 'hardened',
+          containerId: 'cid-1',
+          providerOrigins: [{ provider: 'anthropic', baseUrl: 'https://api.anthropic.test' }],
+        },
+        env: {
+          CLAUDE_API_KEY: 'sk-cli-source',
+          ANTHROPIC_BASE_URL: 'https://api.anthropic.test',
+          CLAUDE_CODE_DISABLE_1M_CONTEXT: '1',
+          CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: '1',
+          HTTPS_PROXY: 'http://127.0.0.1:18080',
+          NODE_EXTRA_CA_CERTS: '/run/archon/ca.pem',
+          CODEBASE_VAR: 'project-value',
+          ARTIFACTS_DIR: '/tmp/artifacts',
+          HOME: '/Users/sdk',
+          PATH: '/host/bin',
+        },
+      })) {
+        // consume
+      }
+
+      expect(mockQuery).toHaveBeenCalledTimes(1);
+      const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+      const env = callArgs.options.env as Record<string, string>;
+      expect(env.ANTHROPIC_API_KEY).toBe('sk-cli-source');
+      expect(env.ANTHROPIC_BASE_URL).toBe('https://api.anthropic.test');
+      expect(env.CLAUDE_CODE_DISABLE_1M_CONTEXT).toBe('1');
+      expect(env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS).toBe('1');
+      expect(env.HTTPS_PROXY).toBeUndefined();
+      expect(env.NODE_EXTRA_CA_CERTS).toBeUndefined();
+      expect(env.TERM).toBe('dumb');
+      expect(env.CLAUDE_API_KEY).toBeUndefined();
+      expect(env.CODEBASE_VAR).toBeUndefined();
+      expect(env.ARTIFACTS_DIR).toBeUndefined();
+      expect(env.HOME).toBeUndefined();
+      expect(env.PATH).toBeUndefined();
+    });
+
+    test('container execution rejects off-policy Anthropic base URL before query', async () => {
+      const consumeGenerator = async (): Promise<void> => {
+        for await (const _ of client.sendQuery('test', '/tmp', undefined, {
+          execContext: {
+            kind: 'container',
+            profile: 'hardened',
+            containerId: 'cid-1',
+            providerOrigins: [{ provider: 'anthropic', baseUrl: 'https://api.anthropic.test' }],
+          },
+          env: { ANTHROPIC_BASE_URL: 'https://evil.example' },
+        })) {
+          // consume
+        }
+      };
+
+      await expect(consumeGenerator()).rejects.toThrow(
+        'Claude container execution ANTHROPIC_BASE_URL does not match sealed provider origin'
+      );
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    test('container execution rejects missing Anthropic provider origin before query', async () => {
+      const consumeGenerator = async (): Promise<void> => {
+        for await (const _ of client.sendQuery('test', '/tmp', undefined, {
+          execContext: {
+            kind: 'container',
+            profile: 'hardened',
+            containerId: 'cid-1',
+          },
+          env: { ANTHROPIC_API_KEY: 'sk-test' },
+        })) {
+          // consume
+        }
+      };
+
+      await expect(consumeGenerator()).rejects.toThrow(
+        'Claude container execution requires exactly one sealed Anthropic provider origin'
+      );
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    test('container execution rejects duplicate Anthropic provider origins before query', async () => {
+      const consumeGenerator = async (): Promise<void> => {
+        for await (const _ of client.sendQuery('test', '/tmp', undefined, {
+          execContext: {
+            kind: 'container',
+            profile: 'hardened',
+            containerId: 'cid-1',
+            providerOrigins: [
+              { provider: 'anthropic', baseUrl: 'https://api.anthropic.test' },
+              { provider: 'claude', baseUrl: 'https://api.claude.test' },
+            ],
+          },
+          env: { ANTHROPIC_API_KEY: 'sk-test' },
+        })) {
+          // consume
+        }
+      };
+
+      await expect(consumeGenerator()).rejects.toThrow(
+        'Claude container execution requires exactly one sealed Anthropic provider origin'
+      );
+      expect(mockQuery).not.toHaveBeenCalled();
+    });
+
+    test('container execution rejects explicit dangerous request env before query', async () => {
+      const consumeGenerator = async (): Promise<void> => {
+        for await (const _ of client.sendQuery('test', '/tmp', undefined, {
+          execContext: {
+            kind: 'container',
+            profile: 'hardened',
+            containerId: 'cid-1',
+            providerOrigins: [{ provider: 'anthropic', baseUrl: 'https://api.anthropic.test' }],
+          },
+          env: { AWS_SECRET_ACCESS_KEY: 'aws-secret' },
+        })) {
+          // consume
+        }
+      };
+
+      await expect(consumeGenerator()).rejects.toThrow(
+        'Claude container execution does not allow request env key AWS_SECRET_ACCESS_KEY'
+      );
+      expect(mockQuery).not.toHaveBeenCalled();
     });
 
     test('passes env from requestOptions into SDK options', async () => {

@@ -12,6 +12,10 @@ import type {
   WriteBackFinalizeResult,
   WriteBackApplySummary,
 } from '@archon/providers/types';
+import type { ArtifactSnapshotResult } from './container/artifact-snapshot';
+import type { TrustedProviderBudgetPolicy } from './egress/provider-budget-contract';
+import type { ProxyBudgetGrant } from './egress/proxy-budget-ledger';
+import type { StrictHttpGrant } from './egress/strict-https-proxy';
 
 // Re-exported so isolation consumers can source the execution-context contract
 // (and the write-back result shapes) from `@archon/isolation` alongside the
@@ -431,6 +435,10 @@ export interface BackendPrepareRequest {
     name: string;
     kind: 'repo' | 'folder';
   };
+  /** Controller run id known before isolation row stamping; used only for resource provenance. */
+  ownerRunId?: string;
+  /** Controller-prepared, committed-input directory to seed hardened containers. */
+  seed?: { kind: 'directory'; path: string; allowGitMetadata?: boolean };
 }
 
 /**
@@ -440,10 +448,24 @@ export interface BackendPrepareRequest {
  * `isolation_environments` row when the backend created one (container backend,
  * Phase B); in-place runs create no row and leave it undefined.
  */
+
+export interface TrustedContainerArtifactSnapshot {
+  /** Controller-created per-run artifact volume. Never accept this from agent output. */
+  workspaceVolume: string;
+  /** Pinned immutable image id used by the controller-owned snapshot reader. */
+  image: string;
+  /** Stable run/resource identity for labels and diagnostics. */
+  resourceId: string;
+}
+
 export interface PreparedEnv {
   cwd: string;
   execContext: ExecutionContext;
   envId?: string;
+  /** In-container directory where untrusted agents may write run artifacts. */
+  agentArtifactsDir?: string;
+  /** Trusted controller metadata for exporting the artifact volume after writers stop. */
+  artifactSnapshot?: TrustedContainerArtifactSnapshot;
   /**
    * Overlay mount mode that actually took effect (container backend). `native`
    * grants CAP_SYS_ADMIN, which lets in-container root remount the read-only lower
@@ -481,7 +503,37 @@ export interface IIsolationBackend {
    * loudly when the un-applied work is gone (volume deleted) rather than silently
    * restarting from an empty overlay. Container-only.
    */
-  resumeEnv?(envId: string): Promise<PreparedEnv>;
+  resumeEnv?(
+    envId: string,
+    binding?: {
+      egressPolicyB64: string | undefined;
+      image: string;
+      ownerRunId: string;
+      proxyBudgetSeedDigest?: string;
+    }
+  ): Promise<PreparedEnv>;
+
+  /**
+   * Stop all owned writers and export diagnostic agent artifacts from the
+   * dedicated artifact volume into a fresh controller-owned directory.
+   * Container-only; advisory evidence, not release authority.
+   */
+  snapshotArtifacts?(envId: string, destinationDir: string): Promise<ArtifactSnapshotResult>;
+
+  /**
+   * Controller-verified proxy budget status for hardened egress runs. The backend
+   * must validate stored environment metadata, resource ownership, image/egress
+   * policy, and proxy budget seed binding before returning ledger consumption.
+   */
+  readProxyBudgetStatus?(
+    envId: string,
+    binding: {
+      egressPolicyB64: string;
+      image: string;
+      ownerRunId: string;
+      proxyBudgetSeedDigest: string;
+    }
+  ): Promise<VerifiedProxyBudgetStatus>;
 
   /**
    * Inspect the finished run's overlay diff and report whether a write-back
@@ -511,15 +563,53 @@ export interface IIsolationBackend {
  * contract so both the CLI (which builds it from config) and the backend (which
  * consumes it) share one shape.
  */
+export interface RestrictedEgressPolicyConfig {
+  /** Exact hostname allowlist; IP literals are rejected. */
+  targets: { host: string; port: number }[];
+  /** Required decrypted-HTTPS grants for every target. */
+  httpGrants: StrictHttpGrant[];
+  /** Optional CONNECT establishment timeout. */
+  connectTimeoutMs?: number;
+  /** Optional DNS lookup timeout. */
+  dnsTimeoutMs?: number;
+  /** Optional idle socket timeout. */
+  idleTimeoutMs?: number;
+  /** Optional maximum tunnel lifetime. */
+  maxTunnelMs?: number;
+  /** Optional concurrent connection cap. */
+  maxConcurrentConnections?: number;
+}
+
 export interface ContainerBackendConfig {
+  /** Only supported profile. Reject any future/legacy profile until implemented. */
+  profile: 'hardened';
   /** Runner image tag, e.g. `archon-runner:0.5.0`. */
   image: string;
-  /** Container network mode. `none` for no egress; `bridge` for default NAT. */
-  network: 'bridge' | 'none';
+  /** Container network mode. Hardened agent containers must stay `none`. */
+  network: 'none';
   /** Hard memory cap in MiB (`docker run --memory <n>m`). */
   memoryMb: number;
   /** Process cap (`docker run --pids-limit <n>`), a fork-bomb guard. */
   pidsLimit: number;
+  /** Optional controller-pinned CONNECT allowlist served over a Unix socket volume. */
+  egressPolicy?: RestrictedEgressPolicyConfig;
+  /** Controller-authenticated provider budget authority for hardened proxy egress. */
+  proxyBudget?: HardenedProxyBudgetSeed;
+}
+
+export interface HardenedProxyBudgetSeed {
+  grant: ProxyBudgetGrant;
+  providerPolicies: readonly TrustedProviderBudgetPolicy[];
+}
+
+export interface VerifiedProxyBudgetStatus {
+  source: 'controller-proxy-ledger';
+  envId: string;
+  grant: ProxyBudgetGrant;
+  consumed: { input: number; output: number };
+  pendingReservations: number;
+  unknownReservations: number;
+  acceptingReservations: boolean;
 }
 
 /**
@@ -532,4 +622,5 @@ export const CONTAINER_LABELS = {
   managed: 'diy.archon.managed',
   codebaseId: 'diy.archon.codebase-id',
   envId: 'diy.archon.env-id',
+  ownerRunId: 'diy.archon.owner-run-id',
 } as const;

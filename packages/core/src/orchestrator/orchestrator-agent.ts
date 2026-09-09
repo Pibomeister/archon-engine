@@ -52,6 +52,7 @@ import type {
   WorkflowSource,
 } from '@archon/workflows/schemas/workflow';
 import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
+import { isGuardedWorkflowRun } from '@archon/workflows/workflow-pinning';
 import { isPerUserGitHubEnabled } from '../github-auth/config';
 import { getDecryptedAccessToken } from '../db/user-github-token-store';
 import { isPerUserProviderKeysEnabled } from '../credentials/config';
@@ -1219,7 +1220,8 @@ export async function handleMessage(
       conversationId
     );
 
-    // Natural-language approval routing — if a workflow is paused in this
+    // Legacy natural-language approval routing — guarded runs require explicit decisions.
+    // If a legacy workflow is paused in this
     // conversation awaiting a human gate, treat any non-slash message as the
     // approval response. A paused run whose gate is already resolved
     // (metadata.approval.resolved set — approved/rejected and awaiting
@@ -1248,6 +1250,14 @@ export async function handleMessage(
             conversationId,
             'A workflow is paused but its approval context is missing. ' +
               `Use \`/workflow approve ${pausedRun.id}\` or \`/workflow reject ${pausedRun.id}\`.`
+          );
+          return;
+        }
+
+        if (isGuardedWorkflowRun(pausedRun)) {
+          await platform.sendMessage(
+            conversationId,
+            `This guarded run requires an explicit human decision. Resolve run ${pausedRun.id} using its operator approval controls or an explicit /workflow approve or /workflow reject command. This message did not approve the gate.`
           );
           return;
         }

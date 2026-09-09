@@ -16,6 +16,7 @@ import type {
   ApprovalContext,
   LoopGateRunMetadata,
 } from '@archon/workflows/schemas/workflow-run';
+import { isGuardedWorkflowRun } from '@archon/workflows/workflow-pinning';
 import * as workflowDb from '../db/workflows';
 import * as workflowNodeSessionDb from '../db/workflow-node-sessions';
 
@@ -51,7 +52,7 @@ export interface RejectionOperationResult {
   codebaseId: string | null;
   /** Internal DB UUID — resolve via getConversationById() to get platform_conversation_id. */
   conversationId: string;
-  /** true = run cancelled; false = transitioning to failed for retry (has onRejectPrompt) */
+  /** true = run cancelled; false = paused for legacy rework or writeback discard */
   cancelled: boolean;
   /** true when cancelled specifically because max rejection attempts were reached */
   maxAttemptsReached: boolean;
@@ -437,7 +438,8 @@ export async function approveWorkflow(
 /**
  * Reject a paused workflow run.
  *
- * If `onRejectPrompt` is set and under max attempts, the run stays 'paused'
+ * Guarded normal gates cancel on rejection: frozen approval inputs cannot be reworked
+ * in the same run. Legacy gates with `onRejectPrompt` under max attempts stay 'paused'
  * with the rejection staged on the approval context (`resolved: 'rejected'`,
  * #2075) — the resume machinery picks it up and runs the on_reject rework.
  * Otherwise, cancels the run.
@@ -510,23 +512,19 @@ export async function rejectWorkflow(
   }
 
   const rejectReason = reason ?? 'Rejected';
-  const currentCount = (run.metadata.rejection_count as number | undefined) ?? 0;
-  const maxAttempts = approval?.onRejectMaxAttempts ?? 3;
-  // `!= null` (not `!== undefined`): pauseWorkflowRun now explicit-nulls this field
-  // on every pause when the gate has no on_reject (L1 dialect-parity reset), so a
-  // null must read as "not configured" exactly like an absent key.
-  const onRejectConfigured = approval?.onRejectPrompt != null;
-  const maxAttemptsReached = onRejectConfigured && currentCount + 1 >= maxAttempts;
-  // The on_reject rework is staged (run stays 'paused') only when a prompt is
-  // set AND we're under the attempt cap; every other case cancels the run.
-  const willStageRework = onRejectConfigured && !maxAttemptsReached;
+  const { currentCount, maxAttemptsReached, freshGuardedRunRequired, willStageRework } =
+    rejectionDisposition(run, approval);
 
   // The audit event is identical for all three reject outcomes; the CAS writes it
   // in the SAME transaction as the resolution (#2146).
   const rejectionEvent: workflowDb.GateResolutionEvent = {
     event_type: 'approval_received',
     step_name: approval?.nodeId ?? 'unknown',
-    data: { decision: 'rejected', reason: rejectReason },
+    data: {
+      decision: 'rejected',
+      reason: rejectReason,
+      ...(freshGuardedRunRequired ? { fresh_guarded_run_required: true } : {}),
+    },
   };
 
   // Compare-and-swap resolution guard — a concurrent second reject loses here
@@ -569,6 +567,29 @@ export async function rejectWorkflow(
     maxAttemptsReached,
     writeBack: false,
   };
+}
+
+function rejectionDisposition(
+  run: WorkflowRun,
+  approval: ApprovalContext | undefined
+): {
+  currentCount: number;
+  maxAttemptsReached: boolean;
+  freshGuardedRunRequired: boolean;
+  willStageRework: boolean;
+} {
+  const currentCount = (run.metadata.rejection_count as number | undefined) ?? 0;
+  const maxAttempts = approval?.onRejectMaxAttempts ?? 3;
+  // `!= null` (not `!== undefined`): pauseWorkflowRun now explicit-nulls this field
+  // on every pause when the gate has no on_reject (L1 dialect-parity reset), so a
+  // null must read as "not configured" exactly like an absent key.
+  const onRejectConfigured = approval?.onRejectPrompt != null;
+  const maxAttemptsReached = onRejectConfigured && currentCount + 1 >= maxAttempts;
+  // The on_reject rework is staged (run stays 'paused') only when a prompt is
+  // set AND we're under the attempt cap; every other case cancels the run.
+  const freshGuardedRunRequired = isGuardedWorkflowRun(run);
+  const willStageRework = onRejectConfigured && !maxAttemptsReached && !freshGuardedRunRequired;
+  return { currentCount, maxAttemptsReached, freshGuardedRunRequired, willStageRework };
 }
 
 /**
