@@ -5,6 +5,64 @@
  * without leaking sensitive information
  */
 
+const RATE_LIMIT_MARKERS = ['rate limit', 'hit your limit', 'usage limit', 'session limit'];
+const CLAUDE_OAUTH_MARKERS = [
+  'refresh token',
+  'could not be refreshed',
+  'log out and sign in',
+  'OAuth token has expired',
+  'sign-in has expired',
+];
+const AUTH_MARKERS = ['API key', 'authentication_error', 'authentication error', '401'];
+const SENSITIVE_MARKERS = ['password', 'token', 'secret', 'key='];
+
+function includesAny(message: string, markers: readonly string[]): boolean {
+  return markers.some(marker => message.includes(marker));
+}
+
+function isRateLimitMessage(message: string): boolean {
+  const lower = message.toLowerCase();
+  return includesAny(lower, RATE_LIMIT_MARKERS);
+}
+
+function extractResetClause(message: string): string | undefined {
+  // Anchor on · (Claude format: "... · resets 4:50pm (UTC)"); stop at · or newline so "p.m." isn't truncated.
+  // The no-· fallback also drops any follow-on sentence (period + capital letter), so shapes like
+  // "Claude session limit reached — resets 3:20pm (UTC). Abandon this run…" yield just the reset clause.
+  return (
+    /·\s*(resets[^·\n]*)/i.exec(message)?.[1]?.trim() ??
+    /resets[^·\n]*/i
+      .exec(message)?.[0]
+      ?.replace(/\.\s+[A-Z][\s\S]*$/, '')
+      .trim()
+  );
+}
+
+function formatRateLimitMessage(message: string): string {
+  const reset = extractResetClause(message);
+  return `⚠️ AI usage limit reached${reset ? ` (${reset})` : ''}. Please wait and try again.`;
+}
+
+function isClaudeOauthError(message: string): boolean {
+  return includesAny(message, CLAUDE_OAUTH_MARKERS);
+}
+
+function isProviderNotLoggedIn(message: string): boolean {
+  return includesAny(message, ['Not logged in', 'Please run /login']);
+}
+
+function isCodexAuthError(message: string): boolean {
+  return message.includes('Codex query failed:') && includesAny(message, ['401', 'Unauthorized']);
+}
+
+function isGeneralAuthError(message: string): boolean {
+  return includesAny(message, AUTH_MARKERS);
+}
+
+function isShortSafeMessage(message: string): boolean {
+  return message.length > 0 && message.length < 100 && !includesAny(message, SENSITIVE_MARKERS);
+}
+
 /**
  * Classify an error and return a user-friendly message
  *
@@ -17,35 +75,14 @@ export function classifyAndFormatError(error: Error): string {
   // AI-provider rate-limit / usage-cap classification
   // Broad substrings are intentional: every call site feeds errors from handling
   // an AI conversation turn, so a bare "usage limit" needs no provider prefix.
-  const lower = message.toLowerCase();
-  if (
-    lower.includes('rate limit') ||
-    lower.includes('hit your limit') ||
-    lower.includes('usage limit') ||
-    lower.includes('session limit')
-  ) {
-    // Anchor on · (Claude format: "... · resets 4:50pm (UTC)"); stop at · or newline so "p.m." isn't truncated.
-    // The no-· fallback also drops any follow-on sentence (period + capital letter), so shapes like
-    // "Claude session limit reached — resets 3:20pm (UTC). Abandon this run…" yield just the reset clause.
-    const reset =
-      /·\s*(resets[^·\n]*)/i.exec(message)?.[1]?.trim() ??
-      /resets[^·\n]*/i
-        .exec(message)?.[0]
-        ?.replace(/\.\s+[A-Z][\s\S]*$/, '')
-        .trim();
-    return `⚠️ AI usage limit reached${reset ? ` (${reset})` : ''}. Please wait and try again.`;
+  if (isRateLimitMessage(message)) {
+    return formatRateLimitMessage(message);
   }
 
   // Claude-specific auth errors — OAuth token refresh failures
   // These come from Claude Code subprocess stderr or SDK result subtypes.
   // Recovery: `/login` in-session or `claude logout && claude login` in terminal.
-  if (
-    message.includes('refresh token') ||
-    message.includes('could not be refreshed') ||
-    message.includes('log out and sign in') ||
-    message.includes('OAuth token has expired') ||
-    message.includes('sign-in has expired')
-  ) {
+  if (isClaudeOauthError(message)) {
     return '⚠️ Claude authentication expired. Run `/login` inside Claude Code or `claude logout && claude login` in your terminal.';
   }
 
@@ -58,27 +95,19 @@ export function classifyAndFormatError(error: Error): string {
   // install this means the user hasn't connected a provider yet; on a solo
   // install it means no key / no `claude login`. Name both connect surfaces
   // instead of leaking the raw CLI string (#1983).
-  if (message.includes('Not logged in') || message.includes('Please run /login')) {
+  if (isProviderNotLoggedIn(message)) {
     return '⚠️ Not logged in to the AI provider. Connect a subscription or API key in Settings → Agents, or set credentials in your environment (e.g. `claude /login` or `CLAUDE_API_KEY`).';
   }
 
   // Codex-specific auth errors — 401 retry exhaustion
   // Codex surfaces auth failures as "exceeded retry limit, last status: 401 Unauthorized"
   // Recovery: `codex login` in terminal.
-  if (
-    message.includes('Codex query failed:') &&
-    (message.includes('401') || message.includes('Unauthorized'))
-  ) {
+  if (isCodexAuthError(message)) {
     return '⚠️ Codex authentication error. Run `codex login` in your terminal to re-authenticate.';
   }
 
   // General AI/SDK authentication errors
-  if (
-    message.includes('API key') ||
-    message.includes('authentication_error') ||
-    message.includes('authentication error') ||
-    message.includes('401')
-  ) {
+  if (isGeneralAuthError(message)) {
     return '⚠️ AI service authentication error. Please check your API key or credentials.';
   }
 
@@ -109,14 +138,7 @@ export function classifyAndFormatError(error: Error): string {
 
   // Generic fallback with hint about what failed
   // Only show if message is short and doesn't contain sensitive data
-  if (
-    message.length > 0 &&
-    message.length < 100 &&
-    !message.includes('password') &&
-    !message.includes('token') &&
-    !message.includes('secret') &&
-    !message.includes('key=')
-  ) {
+  if (isShortSafeMessage(message)) {
     return `⚠️ Error: ${message}. Try /reset if issue persists.`;
   }
 

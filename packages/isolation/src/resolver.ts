@@ -25,6 +25,7 @@ import type {
   IsolationEnvironmentRow,
   IsolationWorkflowType,
   IsolationRequest,
+  IsolatedEnvironment,
   WorktreeStatusBreakdown,
   ResolveRequest,
 } from './types';
@@ -102,30 +103,8 @@ export class IsolationResolver {
       return { status: 'none', cwd: '/workspace' };
     }
 
-    // 2b. Folder projects run through the folder-backend seam — no worktree.
-    // The in-place backend (Phase A default) returns the REAL folder path (not
-    // the '/workspace' docker sentinel), so chat/workflows land in the actual
-    // project directory — byte-identical to the pre-seam early-return. Container
-    // selection is a Phase B config concern; the chat path stays in-place for now.
-    //
-    // NOTE (Phase A): only `prepared.cwd` is propagated. `prepared.execContext`
-    // is intentionally DROPPED here because the `IsolationResolution` 'none'
-    // variant carries no execution-context field, so chat/orchestrator callers
-    // (which consume this result) have no channel for it — they run host-only in
-    // Phase A. Phase B, when it wires containerized CHAT, must extend the 'none'
-    // variant with an `execContext` and thread it through the orchestrator; until
-    // then only the CLI workflow path carries execContext (from the backend it
-    // resolves directly).
     if (request.codebase.kind === 'folder') {
-      const folderCodebase = {
-        id: request.codebase.id,
-        defaultCwd: request.codebase.defaultCwd,
-        name: request.codebase.name,
-        kind: 'folder' as const,
-      };
-      const backend = resolveFolderBackend(folderCodebase, { container: false });
-      const prepared = await backend.prepare({ codebase: folderCodebase });
-      return { status: 'none', cwd: prepared.cwd };
+      return this.resolveFolderCodebase(request.codebase);
     }
 
     const codebase = request.codebase;
@@ -140,9 +119,73 @@ export class IsolationResolver {
     // a `blocked` result with an actionable user message; unknown failures
     // propagate so they surface as crashes rather than silent isolation
     // failures.
-    let canonicalPath: RepoPath;
+    const canonicalResult = await this.resolveCanonicalPath(codebase);
+    if (canonicalResult.status === 'blocked') return canonicalResult;
+    const canonicalPath = canonicalResult.canonicalPath;
+
+    // 3. Check for existing environment with same workflow
+    const reusable = await this.resolveReusableEnvironment(
+      codebase,
+      canonicalPath,
+      workflowType,
+      workflowId,
+      baseBranch,
+      hints,
+      request
+    );
+    if (reusable) {
+      return reusable;
+    }
+
+    // 6. Create new environment
+    return this.createNewEnvironment(
+      codebase,
+      workflowType,
+      workflowId,
+      hints,
+      canonicalPath,
+      request.platformType,
+      request.userId,
+      request.gitIdentity
+    );
+  }
+
+  private async resolveFolderCodebase(
+    codebase: NonNullable<ResolveRequest['codebase']>
+  ): Promise<IsolationResolution> {
+    // Folder projects run through the folder-backend seam — no worktree.
+    // The in-place backend (Phase A default) returns the REAL folder path (not
+    // the '/workspace' docker sentinel), so chat/workflows land in the actual
+    // project directory — byte-identical to the pre-seam early-return. Container
+    // selection is a Phase B config concern; the chat path stays in-place for now.
+    //
+    // NOTE (Phase A): only `prepared.cwd` is propagated. `prepared.execContext`
+    // is intentionally DROPPED here because the `IsolationResolution` 'none'
+    // variant carries no execution-context field, so chat/orchestrator callers
+    // (which consume this result) have no channel for it — they run host-only in
+    // Phase A. Phase B, when it wires containerized CHAT, must extend the 'none'
+    // variant with an `execContext` and thread it through the orchestrator; until
+    // then only the CLI workflow path carries execContext (from the backend it
+    // resolves directly).
+    const folderCodebase = {
+      id: codebase.id,
+      defaultCwd: codebase.defaultCwd,
+      name: codebase.name,
+      kind: 'folder' as const,
+    };
+    const backend = resolveFolderBackend(folderCodebase, { container: false });
+    const prepared = await backend.prepare({ codebase: folderCodebase });
+    return { status: 'none', cwd: prepared.cwd };
+  }
+
+  private async resolveCanonicalPath(
+    codebase: NonNullable<ResolveRequest['codebase']>
+  ): Promise<
+    | { status: 'resolved'; canonicalPath: RepoPath }
+    | Extract<IsolationResolution, { status: 'blocked' }>
+  > {
     try {
-      canonicalPath = await getCanonicalRepoPath(codebase.defaultCwd);
+      return { status: 'resolved', canonicalPath: await getCanonicalRepoPath(codebase.defaultCwd) };
     } catch (error) {
       const err = error instanceof Error ? error : new Error(String(error));
       getLog().error(
@@ -155,21 +198,33 @@ export class IsolationResolver {
         'isolation.canonical_repo_path_resolution_failed'
       );
 
-      if (!isKnownIsolationError(err)) {
-        throw err;
-      }
+      if (!isKnownIsolationError(err)) throw err;
 
-      const userMessage = classifyIsolationError(err);
-      return {
-        status: 'blocked',
-        reason: 'creation_failed',
-        userMessage:
-          userMessage +
-          ' Execution blocked to prevent changes to shared codebase. Please resolve the issue and try again.',
-      };
+      return this.creationBlockedResult(classifyIsolationError(err));
     }
+  }
 
-    // 3. Check for existing environment with same workflow
+  private creationBlockedResult(
+    userMessage: string
+  ): Extract<IsolationResolution, { status: 'blocked' }> {
+    return {
+      status: 'blocked',
+      reason: 'creation_failed',
+      userMessage:
+        userMessage +
+        ' Execution blocked to prevent changes to shared codebase. Please resolve the issue and try again.',
+    };
+  }
+
+  private async resolveReusableEnvironment(
+    codebase: NonNullable<ResolveRequest['codebase']>,
+    canonicalPath: RepoPath,
+    workflowType: IsolationWorkflowType,
+    workflowId: string,
+    baseBranch: BranchName | undefined,
+    hints: IsolationHints | undefined,
+    request: ResolveRequest
+  ): Promise<IsolationResolution | null> {
     const reusable = await this.findReusable(
       codebase.id,
       canonicalPath,
@@ -187,36 +242,21 @@ export class IsolationResolver {
       };
     }
 
-    // 4. Check linked issues for sharing
     if (hints?.linkedIssues?.length) {
       const linked = await this.findLinkedIssueEnv(codebase.id, canonicalPath, hints.linkedIssues);
       if (linked) return linked;
     }
 
-    // 5. Try PR branch adoption
-    if (hints?.prBranch) {
-      const adopted = await this.tryBranchAdoption(
-        codebase,
-        canonicalPath,
-        hints,
-        workflowType,
-        workflowId,
-        request.platformType,
-        request.userId
-      );
-      if (adopted) return adopted;
-    }
+    if (!hints?.prBranch) return null;
 
-    // 6. Create new environment
-    return this.createNewEnvironment(
+    return this.tryBranchAdoption(
       codebase,
+      canonicalPath,
+      hints,
       workflowType,
       workflowId,
-      hints,
-      canonicalPath,
       request.platformType,
-      request.userId,
-      request.gitIdentity
+      request.userId
     );
   }
 
@@ -467,6 +507,45 @@ export class IsolationResolver {
     userId: string | undefined,
     gitIdentity: { email: string; name?: string } | undefined
   ): Promise<IsolationResolution> {
+    const isolationRequest = this.buildIsolationRequest(
+      codebase,
+      workflowType,
+      workflowId,
+      hints,
+      canonicalPath,
+      gitIdentity
+    );
+    const createResult = await this.createProviderEnvironment(isolationRequest, codebase);
+    if (createResult.blocked) return createResult.blocked;
+    const isolatedEnv = createResult.env;
+    const env = await this.persistCreatedEnvironment(
+      isolatedEnv,
+      codebase,
+      workflowType,
+      workflowId,
+      hints,
+      canonicalPath,
+      platformType,
+      userId
+    );
+
+    return {
+      status: 'resolved',
+      env,
+      cwd: env.working_path,
+      method: { type: 'created' },
+      ...(isolatedEnv.warnings?.length ? { warnings: isolatedEnv.warnings } : {}),
+    };
+  }
+
+  private buildIsolationRequest(
+    codebase: ResolveRequest['codebase'] & object,
+    workflowType: IsolationWorkflowType,
+    workflowId: string,
+    hints: IsolationHints | undefined,
+    canonicalPath: RepoPath,
+    gitIdentity: { email: string; name?: string } | undefined
+  ): IsolationRequest {
     // Construct request based on workflow type
     const baseRequest = {
       codebaseId: codebase.id,
@@ -477,31 +556,39 @@ export class IsolationResolver {
       gitIdentity,
     };
 
-    let isolationRequest: IsolationRequest;
     if (workflowType === 'pr') {
-      isolationRequest = {
+      return {
         ...baseRequest,
         workflowType: 'pr' as const,
         prBranch: hints?.prBranch ?? toBranchName(`pr-${workflowId}`),
         prSha: hints?.prSha,
         isForkPR: hints?.isForkPR ?? false,
       };
-    } else if (workflowType === 'task') {
-      isolationRequest = {
+    }
+
+    if (workflowType === 'task') {
+      return {
         ...baseRequest,
         workflowType: 'task' as const,
         fromBranch: hints?.fromBranch,
       };
-    } else {
-      isolationRequest = {
-        ...baseRequest,
-        workflowType,
-      };
     }
 
-    let isolatedEnv: Awaited<ReturnType<typeof this.provider.create>>;
+    return {
+      ...baseRequest,
+      workflowType,
+    };
+  }
+
+  private async createProviderEnvironment(
+    isolationRequest: IsolationRequest,
+    codebase: ResolveRequest['codebase'] & object
+  ): Promise<
+    | { env: IsolatedEnvironment; blocked?: never }
+    | { env?: never; blocked: Extract<IsolationResolution, { status: 'blocked' }> }
+  > {
     try {
-      isolatedEnv = await this.provider.create(isolationRequest);
+      return { env: await this.provider.create(isolationRequest) };
     } catch (error) {
       const err = error instanceof Error ? error : new Error(String(error));
 
@@ -522,20 +609,24 @@ export class IsolationResolver {
         'isolation_creation_failed'
       );
 
-      return {
-        status: 'blocked',
-        reason: 'creation_failed',
-        userMessage:
-          userMessage +
-          ' Execution blocked to prevent changes to shared codebase. Please resolve the issue and try again.',
-      };
+      return { blocked: this.creationBlockedResult(userMessage) };
     }
+  }
 
+  private async persistCreatedEnvironment(
+    isolatedEnv: IsolatedEnvironment,
+    codebase: ResolveRequest['codebase'] & object,
+    workflowType: IsolationWorkflowType,
+    workflowId: string,
+    hints: IsolationHints | undefined,
+    canonicalPath: RepoPath,
+    platformType: string,
+    userId: string | undefined
+  ): Promise<IsolationEnvironmentRow> {
     // provider.create() succeeded — worktree exists on disk.
     // If store.create() fails, we must clean up the orphaned worktree.
-    let env: IsolationEnvironmentRow;
     try {
-      env = await this.store.create({
+      return await this.store.create({
         codebase_id: codebase.id,
         workflow_type: workflowType,
         workflow_id: workflowId,
@@ -586,13 +677,5 @@ export class IsolationResolver {
 
       throw err; // Re-throw original store error — this is an unexpected failure
     }
-
-    return {
-      status: 'resolved',
-      env,
-      cwd: env.working_path,
-      method: { type: 'created' },
-      ...(isolatedEnv.warnings?.length ? { warnings: isolatedEnv.warnings } : {}),
-    };
   }
 }

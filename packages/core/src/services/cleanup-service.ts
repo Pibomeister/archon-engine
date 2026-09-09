@@ -333,18 +333,10 @@ export async function removeEnvironment(
   }
 
   // Get canonical repo path from codebase for branch cleanup
-  let canonicalRepoPath: RepoPath | undefined;
-  let configuredRemote: string | undefined;
-  if (env.codebase_id) {
-    const codebase = await codebaseDb.getCodebase(env.codebase_id);
-    canonicalRepoPath = codebase?.default_cwd ? toRepoPath(codebase.default_cwd) : undefined;
-    // Resolve the configured remote only when remote-branch deletion is requested —
-    // that's the one destroy path that pushes to a remote.
-    if (options?.deleteRemoteBranch && codebase?.default_cwd) {
-      const repoConfig = await loadRepoConfig(codebase.default_cwd);
-      configuredRemote = repoConfig.worktree?.remote?.trim() || undefined;
-    }
-  }
+  const { canonicalRepoPath, configuredRemote } = await getDestroyRepoContext(
+    env.codebase_id,
+    options
+  );
 
   // Check if directory exists before attempting removal
   const pathExists = await worktreeExists(toWorktreePath(env.working_path));
@@ -388,18 +380,7 @@ export async function removeEnvironment(
     };
   } catch (error) {
     const err = error as Error & { code?: string; stderr?: string };
-    const errorText = `${err.message} ${err.stderr ?? ''}`;
-
-    // Handle "directory not found" errors gracefully
-    // Be specific: check that the error is about the worktree path, not unrelated paths
-    const isPathNotFoundError =
-      err.code === 'ENOENT' ||
-      (errorText.includes(env.working_path) &&
-        (errorText.includes('No such file or directory') ||
-          errorText.includes('does not exist') ||
-          errorText.includes('is not a working tree')));
-
-    if (isPathNotFoundError) {
+    if (isWorktreePathNotFoundError(err, env.working_path)) {
       await isolationEnvDb.updateStatus(envId, 'destroyed');
       getLog().info({ envId }, 'env_removed_externally');
       return { worktreeRemoved: true, branchDeleted: false, warnings: [] };
@@ -408,6 +389,37 @@ export async function removeEnvironment(
     getLog().error({ err, envId }, 'env_remove_failed');
     throw err;
   }
+}
+
+async function getDestroyRepoContext(
+  codebaseId: string | null,
+  options: RemoveEnvironmentOptions | undefined
+): Promise<{ canonicalRepoPath?: RepoPath; configuredRemote?: string }> {
+  if (!codebaseId) return {};
+
+  const codebase = await codebaseDb.getCodebase(codebaseId);
+  const canonicalRepoPath = codebase?.default_cwd ? toRepoPath(codebase.default_cwd) : undefined;
+  if (!options?.deleteRemoteBranch || !codebase?.default_cwd) return { canonicalRepoPath };
+
+  // Resolve the configured remote only when remote-branch deletion is requested —
+  // that's the one destroy path that pushes to a remote.
+  const repoConfig = await loadRepoConfig(codebase.default_cwd);
+  return { canonicalRepoPath, configuredRemote: repoConfig.worktree?.remote?.trim() || undefined };
+}
+
+function isWorktreePathNotFoundError(
+  err: Error & { code?: string; stderr?: string },
+  workingPath: string
+): boolean {
+  if (err.code === 'ENOENT') return true;
+
+  const errorText = `${err.message} ${err.stderr ?? ''}`;
+  return (
+    errorText.includes(workingPath) &&
+    (errorText.includes('No such file or directory') ||
+      errorText.includes('does not exist') ||
+      errorText.includes('is not a working tree'))
+  );
 }
 
 /**

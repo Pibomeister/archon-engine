@@ -37,7 +37,11 @@ import {
   ConversationNotFoundError,
   isWebAdapter,
 } from '../types';
-import type { IsolationHints, IsolationEnvironmentRow } from '@archon/isolation';
+import type {
+  IsolationHints,
+  IsolationEnvironmentRow,
+  IsolationResolution as ResolverIsolationResolution,
+} from '@archon/isolation';
 import {
   IsolationBlockedError,
   IsolationResolver,
@@ -149,86 +153,17 @@ export async function validateAndResolveIsolation(
 
   switch (result.status) {
     case 'resolved': {
-      // Link env to conversation
-      try {
-        await db.updateConversation(conversation.id, {
-          isolation_env_id: result.env.id,
-          cwd: result.cwd,
-        });
-      } catch (updateError) {
-        const err = toError(updateError);
-        getLog().error(
-          { err, conversationId: conversation.id, isolationEnvId: result.env.id },
-          'isolation_link_failed'
-        );
-        try {
-          await createIsolationStore().updateStatus(result.env.id, 'destroyed');
-        } catch (rollbackError) {
-          getLog().error(
-            { err: toError(rollbackError), isolationEnvId: result.env.id },
-            'isolation_rollback_failed'
-          );
-        }
-        throw err;
-      }
-      // Send contextual messages
-      if (result.method.type === 'linked_issue_reuse') {
-        await platform.sendMessage(
-          conversationId,
-          `Reusing worktree from issue #${String(result.method.issueNumber)}`
-        );
-      }
-      if (result.method.type === 'created' && result.method.autoCleanedCount) {
-        await platform.sendMessage(
-          conversationId,
-          `Cleaned up ${String(result.method.autoCleanedCount)} merged worktree(s) to make room.`
-        );
-      }
-      // Surface any non-fatal warnings from environment creation
-      if (result.warnings && result.warnings.length > 0) {
-        for (const warning of result.warnings) {
-          await platform.sendMessage(conversationId, `Warning: ${warning}`).catch(e => {
-            getLog().error({ err: toError(e), conversationId }, 'isolation_warning_send_failed');
-          });
-        }
-      }
-      return {
-        status: result.method.type === 'existing' ? 'existing' : 'new',
-        cwd: result.cwd,
-        env: result.env,
-      };
+      return handleResolvedIsolation(result, conversation, platform, conversationId);
     }
 
     case 'stale_cleaned': {
-      // Clear stale reference
-      await db.updateConversation(conversation.id, { isolation_env_id: null }).catch(e => {
-        if (!(toError(e) instanceof ConversationNotFoundError)) {
-          getLog().error(
-            { err: toError(e), conversationId: conversation.id },
-            'stale_isolation_clear_failed'
-          );
-        }
-      });
-      const staleMsg = codebase
-        ? 'Detected a stale isolated workspace reference and cleared it. Creating a new isolated workspace now.'
-        : 'Detected a stale isolated workspace reference and cleared it. Continuing without an isolated workspace.';
-      await platform.sendMessage(conversationId, staleMsg).catch(e => {
-        getLog().error({ err: toError(e), conversationId }, 'stale_isolation_notice_failed');
-      });
-      // Retry without existing env (guard against infinite recursion)
-      if (!codebase) return { status: 'none', cwd: conversation.cwd ?? '/workspace', env: null };
-      if (_isRetry) {
-        throw new Error(
-          `Isolation resolution stuck in stale_cleaned loop for conversation ${conversation.id}`
-        );
-      }
-      return validateAndResolveIsolation(
-        { ...conversation, isolation_env_id: null },
+      return handleStaleIsolation(
+        conversation,
         codebase,
         platform,
         conversationId,
         hints,
-        true,
+        _isRetry,
         userId
       );
     }
@@ -243,6 +178,133 @@ export async function validateAndResolveIsolation(
         result.reason
       );
   }
+}
+
+async function handleResolvedIsolation(
+  result: Extract<ResolverIsolationResolution, { status: 'resolved' }>,
+  conversation: Conversation,
+  platform: IPlatformAdapter,
+  conversationId: string
+): Promise<IsolationResolution> {
+  await linkIsolationToConversation(result, conversation);
+  await sendResolvedIsolationMessages(result, platform, conversationId);
+  return {
+    status: result.method.type === 'existing' ? 'existing' : 'new',
+    cwd: result.cwd,
+    env: result.env,
+  };
+}
+
+async function linkIsolationToConversation(
+  result: Extract<ResolverIsolationResolution, { status: 'resolved' }>,
+  conversation: Conversation
+): Promise<void> {
+  try {
+    await db.updateConversation(conversation.id, {
+      isolation_env_id: result.env.id,
+      cwd: result.cwd,
+    });
+  } catch (updateError) {
+    const err = toError(updateError);
+    getLog().error(
+      { err, conversationId: conversation.id, isolationEnvId: result.env.id },
+      'isolation_link_failed'
+    );
+    await rollbackLinkedIsolation(result.env.id);
+    throw err;
+  }
+}
+
+async function rollbackLinkedIsolation(isolationEnvId: string): Promise<void> {
+  try {
+    await createIsolationStore().updateStatus(isolationEnvId, 'destroyed');
+  } catch (rollbackError) {
+    getLog().error({ err: toError(rollbackError), isolationEnvId }, 'isolation_rollback_failed');
+  }
+}
+
+async function sendResolvedIsolationMessages(
+  result: Extract<ResolverIsolationResolution, { status: 'resolved' }>,
+  platform: IPlatformAdapter,
+  conversationId: string
+): Promise<void> {
+  if (result.method.type === 'linked_issue_reuse') {
+    await platform.sendMessage(
+      conversationId,
+      `Reusing worktree from issue #${String(result.method.issueNumber)}`
+    );
+  }
+  if (result.method.type === 'created' && result.method.autoCleanedCount) {
+    await platform.sendMessage(
+      conversationId,
+      `Cleaned up ${String(result.method.autoCleanedCount)} merged worktree(s) to make room.`
+    );
+  }
+  await sendIsolationWarnings(result.warnings, platform, conversationId);
+}
+
+async function sendIsolationWarnings(
+  warnings: readonly string[] | undefined,
+  platform: IPlatformAdapter,
+  conversationId: string
+): Promise<void> {
+  for (const warning of warnings ?? []) {
+    await platform.sendMessage(conversationId, `Warning: ${warning}`).catch(e => {
+      getLog().error({ err: toError(e), conversationId }, 'isolation_warning_send_failed');
+    });
+  }
+}
+
+async function handleStaleIsolation(
+  conversation: Conversation,
+  codebase: Codebase | null,
+  platform: IPlatformAdapter,
+  conversationId: string,
+  hints: IsolationHints | undefined,
+  isRetry: boolean,
+  userId: string | undefined
+): Promise<IsolationResolution> {
+  await clearStaleIsolationReference(conversation);
+  await sendStaleIsolationNotice(codebase, platform, conversationId);
+  if (!codebase) return { status: 'none', cwd: conversation.cwd ?? '/workspace', env: null };
+  if (isRetry) {
+    throw new Error(
+      `Isolation resolution stuck in stale_cleaned loop for conversation ${conversation.id}`
+    );
+  }
+  return validateAndResolveIsolation(
+    { ...conversation, isolation_env_id: null },
+    codebase,
+    platform,
+    conversationId,
+    hints,
+    true,
+    userId
+  );
+}
+
+async function clearStaleIsolationReference(conversation: Conversation): Promise<void> {
+  await db.updateConversation(conversation.id, { isolation_env_id: null }).catch(e => {
+    if (!(toError(e) instanceof ConversationNotFoundError)) {
+      getLog().error(
+        { err: toError(e), conversationId: conversation.id },
+        'stale_isolation_clear_failed'
+      );
+    }
+  });
+}
+
+async function sendStaleIsolationNotice(
+  codebase: Codebase | null,
+  platform: IPlatformAdapter,
+  conversationId: string
+): Promise<void> {
+  const staleMsg = codebase
+    ? 'Detected a stale isolated workspace reference and cleared it. Creating a new isolated workspace now.'
+    : 'Detected a stale isolated workspace reference and cleared it. Continuing without an isolated workspace.';
+  await platform.sendMessage(conversationId, staleMsg).catch(e => {
+    getLog().error({ err: toError(e), conversationId }, 'stale_isolation_notice_failed');
+  });
 }
 
 /**

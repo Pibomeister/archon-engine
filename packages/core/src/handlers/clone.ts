@@ -193,28 +193,7 @@ async function registerRepoAtPath(
       updates.default_branch !== undefined
         ? updates.default_branch
         : (existing.default_branch ?? null);
-    let commandsLoaded = 0;
-    for (const folder of getCommandFolderSearchPaths()) {
-      const commandPath = join(effectiveCwd, folder);
-      try {
-        await access(commandPath);
-      } catch {
-        continue;
-      }
-      const markdownFiles = await findMarkdownFilesRecursive(commandPath);
-      if (markdownFiles.length > 0) {
-        const commands = { ...(await codebaseDb.getCodebaseCommands(existing.id)) };
-        markdownFiles.forEach(({ commandName, relativePath }) => {
-          commands[commandName] = {
-            path: join(folder, relativePath),
-            description: `From ${folder}`,
-          };
-        });
-        await codebaseDb.updateCodebaseCommands(existing.id, commands);
-        commandsLoaded = markdownFiles.length;
-        break;
-      }
-    }
+    const commandsLoaded = await reloadCodebaseCommands(existing.id, effectiveCwd);
 
     return {
       codebaseId: existing.id,
@@ -237,29 +216,7 @@ async function registerRepoAtPath(
   });
 
   // Auto-load commands if found
-  let commandsLoaded = 0;
-  for (const folder of getCommandFolderSearchPaths()) {
-    const commandPath = join(targetPath, folder);
-    try {
-      await access(commandPath);
-    } catch {
-      continue; // Folder doesn't exist, try next
-    }
-    // Command loading errors should NOT be swallowed
-    const markdownFiles = await findMarkdownFilesRecursive(commandPath);
-    if (markdownFiles.length > 0) {
-      const commands = { ...(await codebaseDb.getCodebaseCommands(codebase.id)) };
-      markdownFiles.forEach(({ commandName, relativePath }) => {
-        commands[commandName] = {
-          path: join(folder, relativePath),
-          description: `From ${folder}`,
-        };
-      });
-      await codebaseDb.updateCodebaseCommands(codebase.id, commands);
-      commandsLoaded = markdownFiles.length;
-      break;
-    }
-  }
+  const commandsLoaded = await reloadCodebaseCommands(codebase.id, targetPath);
 
   return {
     codebaseId: codebase.id,
@@ -270,6 +227,32 @@ async function registerRepoAtPath(
     commandCount: commandsLoaded,
     alreadyExisted: false,
   };
+}
+
+async function reloadCodebaseCommands(codebaseId: string, cwd: string): Promise<number> {
+  for (const folder of getCommandFolderSearchPaths()) {
+    const commandPath = join(cwd, folder);
+    try {
+      await access(commandPath);
+    } catch {
+      continue; // Folder doesn't exist, try next
+    }
+    // Command loading errors should NOT be swallowed
+    const markdownFiles = await findMarkdownFilesRecursive(commandPath);
+    if (markdownFiles.length > 0) {
+      const commands = { ...(await codebaseDb.getCodebaseCommands(codebaseId)) };
+      markdownFiles.forEach(({ commandName, relativePath }) => {
+        commands[commandName] = {
+          path: join(folder, relativePath),
+          description: `From ${folder}`,
+        };
+      });
+      await codebaseDb.updateCodebaseCommands(codebaseId, commands);
+      return markdownFiles.length;
+    }
+  }
+
+  return 0;
 }
 
 /**

@@ -574,15 +574,7 @@ function mergeRepoConfig(merged: MergedConfig, repo: RepoConfig): MergedConfig {
     result.remote = repo.worktree.remote.trim();
   }
 
-  // Propagate docs path for $DOCS_DIR substitution in workflow commands
-  if (repo.docs?.path !== undefined) {
-    const trimmed = repo.docs.path.trim();
-    if (trimmed) {
-      result.docsPath = trimmed;
-    } else {
-      getLog().warn({ rawValue: repo.docs.path }, 'config.docs_path_whitespace_ignored');
-    }
-  }
+  mergeRepoDocsConfig(result, repo);
 
   // Propagate per-project env vars from repo config
   if (repo.env) {
@@ -600,6 +592,19 @@ function mergeRepoConfig(merged: MergedConfig, repo: RepoConfig): MergedConfig {
   }
 
   return result;
+}
+
+function mergeRepoDocsConfig(result: MergedConfig, repo: RepoConfig): void {
+  // Propagate docs path for $DOCS_DIR substitution in workflow commands
+  if (repo.docs?.path === undefined) return;
+
+  const trimmed = repo.docs.path.trim();
+  if (trimmed) {
+    result.docsPath = trimmed;
+    return;
+  }
+
+  getLog().warn({ rawValue: repo.docs.path }, 'config.docs_path_whitespace_ignored');
 }
 
 /**
@@ -671,56 +676,7 @@ export async function updateGlobalConfig(
     const current = await loadGlobalConfig(true);
 
     // Deep-merge: only overwrite defined keys
-    const merged: GlobalConfig = { ...current };
-
-    if (updates.botName !== undefined) merged.botName = updates.botName;
-    if (updates.defaultAssistant !== undefined) merged.defaultAssistant = updates.defaultAssistant;
-
-    if (updates.assistants) {
-      merged.assistants = mergeAssistantDefaults(
-        mergeAssistantDefaults(getDefaults().assistants, current.assistants),
-        updates.assistants
-      );
-    }
-
-    if (updates.streaming) {
-      merged.streaming = { ...current.streaming, ...updates.streaming };
-    }
-
-    if (updates.concurrency) {
-      merged.concurrency = { ...current.concurrency, ...updates.concurrency };
-    }
-
-    if (updates.tiers) {
-      // Per-key merge: `null` unsets a tier, a value sets it, and an absent key
-      // (`undefined`) preserves the existing tier — so a single-tier PATCH/CLI
-      // set doesn't wipe the others. Rebuilt fresh (no dynamic delete).
-      const nextTiers: RawTiersConfig = {};
-      for (const tier of TIER_NAMES) {
-        const incoming = updates.tiers[tier];
-        if (incoming === null) continue; // explicit unset → omit
-        if (incoming !== undefined) {
-          nextTiers[tier] = incoming;
-        } else {
-          const existing = current.tiers?.[tier];
-          if (existing) nextTiers[tier] = existing;
-        }
-      }
-      merged.tiers = Object.keys(nextTiers).length > 0 ? nextTiers : undefined;
-    }
-
-    if (updates.aliases) {
-      // Same per-key merge semantics as tiers: `null` unsets, a value sets,
-      // an absent key preserves the existing alias. Rebuilt fresh (no dynamic delete).
-      const nextAliases: RawAliasesConfig = {};
-      for (const [name, entry] of Object.entries(current.aliases ?? {})) {
-        if (updates.aliases[name] === undefined) nextAliases[name] = entry;
-      }
-      for (const [name, entry] of Object.entries(updates.aliases)) {
-        if (entry !== null && entry !== undefined) nextAliases[name] = entry;
-      }
-      merged.aliases = Object.keys(nextAliases).length > 0 ? nextAliases : undefined;
-    }
+    const merged = mergeGlobalConfigUpdate(current, updates);
 
     // Serialize to YAML and write
     const yaml = Bun.YAML.stringify(merged);
@@ -742,6 +698,70 @@ export async function updateGlobalConfig(
 
     throw error;
   }
+}
+
+function mergeGlobalConfigUpdate(
+  current: GlobalConfig,
+  updates: Partial<Omit<GlobalConfig, 'tiers' | 'aliases'>> & {
+    tiers?: TiersPatch;
+    aliases?: AliasesPatch;
+  }
+): GlobalConfig {
+  const merged: GlobalConfig = { ...current };
+
+  if (updates.botName !== undefined) merged.botName = updates.botName;
+  if (updates.defaultAssistant !== undefined) merged.defaultAssistant = updates.defaultAssistant;
+
+  if (updates.assistants) {
+    merged.assistants = mergeAssistantDefaults(
+      mergeAssistantDefaults(getDefaults().assistants, current.assistants),
+      updates.assistants
+    );
+  }
+
+  if (updates.streaming) merged.streaming = { ...current.streaming, ...updates.streaming };
+  if (updates.concurrency) merged.concurrency = { ...current.concurrency, ...updates.concurrency };
+  if (updates.tiers) merged.tiers = mergeTiersPatch(current.tiers, updates.tiers);
+  if (updates.aliases) merged.aliases = mergeAliasesPatch(current.aliases, updates.aliases);
+
+  return merged;
+}
+
+function mergeTiersPatch(
+  current: RawTiersConfig | undefined,
+  updates: TiersPatch
+): RawTiersConfig | undefined {
+  // Per-key merge: `null` unsets a tier, a value sets it, and an absent key
+  // (`undefined`) preserves the existing tier — so a single-tier PATCH/CLI
+  // set doesn't wipe the others. Rebuilt fresh (no dynamic delete).
+  const nextTiers: RawTiersConfig = {};
+  for (const tier of TIER_NAMES) {
+    const incoming = updates[tier];
+    if (incoming === null) continue; // explicit unset → omit
+    if (incoming !== undefined) {
+      nextTiers[tier] = incoming;
+      continue;
+    }
+    const existing = current?.[tier];
+    if (existing) nextTiers[tier] = existing;
+  }
+  return Object.keys(nextTiers).length > 0 ? nextTiers : undefined;
+}
+
+function mergeAliasesPatch(
+  current: RawAliasesConfig | undefined,
+  updates: AliasesPatch
+): RawAliasesConfig | undefined {
+  // Same per-key merge semantics as tiers: `null` unsets, a value sets,
+  // an absent key preserves the existing alias. Rebuilt fresh (no dynamic delete).
+  const nextAliases: RawAliasesConfig = {};
+  for (const [name, entry] of Object.entries(current ?? {})) {
+    if (updates[name] === undefined) nextAliases[name] = entry;
+  }
+  for (const [name, entry] of Object.entries(updates)) {
+    if (entry !== null && entry !== undefined) nextAliases[name] = entry;
+  }
+  return Object.keys(nextAliases).length > 0 ? nextAliases : undefined;
 }
 
 /**

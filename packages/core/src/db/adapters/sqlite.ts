@@ -253,29 +253,50 @@ export class SqliteAdapter implements IDatabase {
     // database missing a failed migration must NOT be stamped as fully applied
     // by this build, or the vintage becomes a wrong answer that gets believed.
     let allApplied = true;
+    if (!this.migrateUsersColumns()) allApplied = false;
+    if (!this.migrateCodebasesColumns()) allApplied = false;
+    if (!this.migrateConversationsColumns()) allApplied = false;
+    if (!this.migrateWorkflowRunsColumns()) allApplied = false;
+    if (!this.migrateSessionsColumns()) allApplied = false;
+    if (!this.migrateMessagesColumns()) allApplied = false;
+    if (!this.migrateIsolationEnvironmentColumns()) allApplied = false;
+    if (!this.migrateUserAiPrefsColumns()) allApplied = false;
+    if (!this.migrateWorkflowEventsColumns()) allApplied = false;
+    if (!this.migrateProviderKeyVendorIds()) allApplied = false;
+    return allApplied;
+  }
+
+  private getColumnNames(tableName: string): Set<string> {
+    const cols = this.db.prepare(`PRAGMA table_info('${tableName}')`).all() as { name: string }[];
+    return new Set(cols.map(c => c.name));
+  }
+
+  private runMigration(label: string, migrate: () => void): boolean {
+    try {
+      migrate();
+      return true;
+    } catch (e: unknown) {
+      getLog().warn({ err: e as Error }, label);
+      return false;
+    }
+  }
+
+  private migrateUsersColumns(): boolean {
     // Users columns. `role` is the web-auth identity seam (default 'admin').
     // Better Auth's own tables are PostgreSQL-only — web auth is never enabled
     // on SQLite — so only the role column is backfilled here.
-    try {
-      const userCols = this.db.prepare("PRAGMA table_info('remote_agent_users')").all() as {
-        name: string;
-      }[];
-      const userColNames = new Set(userCols.map(c => c.name));
+    return this.runMigration('db.sqlite_migration_users_columns_failed', () => {
+      const userColNames = this.getColumnNames('remote_agent_users');
       if (!userColNames.has('role')) {
         this.db.run("ALTER TABLE remote_agent_users ADD COLUMN role TEXT NOT NULL DEFAULT 'admin'");
       }
-    } catch (e: unknown) {
-      getLog().warn({ err: e as Error }, 'db.sqlite_migration_users_columns_failed');
-      allApplied = false;
-    }
+    });
+  }
 
+  private migrateCodebasesColumns(): boolean {
     // Codebases columns
-    try {
-      const codebaseCols = this.db.prepare("PRAGMA table_info('remote_agent_codebases')").all() as {
-        name: string;
-      }[];
-      const codebaseColNames = new Set(codebaseCols.map(c => c.name));
-
+    return this.runMigration('db.sqlite_migration_codebases_columns_failed', () => {
+      const codebaseColNames = this.getColumnNames('remote_agent_codebases');
       if (!codebaseColNames.has('default_branch')) {
         this.db.run('ALTER TABLE remote_agent_codebases ADD COLUMN default_branch TEXT');
       }
@@ -284,18 +305,13 @@ export class SqliteAdapter implements IDatabase {
           "ALTER TABLE remote_agent_codebases ADD COLUMN kind TEXT NOT NULL DEFAULT 'repo'"
         );
       }
-    } catch (e: unknown) {
-      getLog().warn({ err: e as Error }, 'db.sqlite_migration_codebases_columns_failed');
-      allApplied = false;
-    }
+    });
+  }
 
+  private migrateConversationsColumns(): boolean {
     // Conversations columns
-    try {
-      const cols = this.db.prepare("PRAGMA table_info('remote_agent_conversations')").all() as {
-        name: string;
-      }[];
-      const colNames = new Set(cols.map(c => c.name));
-
+    return this.runMigration('db.sqlite_migration_conversations_columns_failed', () => {
+      const colNames = this.getColumnNames('remote_agent_conversations');
       if (!colNames.has('title')) {
         this.db.run('ALTER TABLE remote_agent_conversations ADD COLUMN title TEXT');
       }
@@ -317,18 +333,13 @@ export class SqliteAdapter implements IDatabase {
       this.db.run(
         'CREATE INDEX IF NOT EXISTS idx_conversations_user_id ON remote_agent_conversations(user_id) WHERE user_id IS NOT NULL'
       );
-    } catch (e: unknown) {
-      getLog().warn({ err: e as Error }, 'db.sqlite_migration_conversations_columns_failed');
-      allApplied = false;
-    }
+    });
+  }
 
+  private migrateWorkflowRunsColumns(): boolean {
     // Workflow runs columns
-    try {
-      const wfCols = this.db.prepare("PRAGMA table_info('remote_agent_workflow_runs')").all() as {
-        name: string;
-      }[];
-      const wfColNames = new Set(wfCols.map(c => c.name));
-
+    return this.runMigration('db.sqlite_migration_workflow_runs_columns_failed', () => {
+      const wfColNames = this.getColumnNames('remote_agent_workflow_runs');
       if (!wfColNames.has('parent_conversation_id')) {
         this.db.run(
           'ALTER TABLE remote_agent_workflow_runs ADD COLUMN parent_conversation_id TEXT'
@@ -365,87 +376,61 @@ export class SqliteAdapter implements IDatabase {
       this.db.run(
         'CREATE INDEX IF NOT EXISTS idx_workflow_runs_parent_run ON remote_agent_workflow_runs(parent_run_id) WHERE parent_run_id IS NOT NULL'
       );
-    } catch (e: unknown) {
-      getLog().warn({ err: e as Error }, 'db.sqlite_migration_workflow_runs_columns_failed');
-      allApplied = false;
-    }
+    });
+  }
 
+  private migrateSessionsColumns(): boolean {
     // Sessions columns
-    try {
-      const sessCols = this.db.prepare("PRAGMA table_info('remote_agent_sessions')").all() as {
-        name: string;
-      }[];
-      const sessColNames = new Set(sessCols.map(c => c.name));
-
+    return this.runMigration('db.sqlite_migration_session_columns_failed', () => {
+      const sessColNames = this.getColumnNames('remote_agent_sessions');
       if (!sessColNames.has('ended_reason')) {
         this.db.run('ALTER TABLE remote_agent_sessions ADD COLUMN ended_reason TEXT');
       }
-    } catch (e: unknown) {
-      getLog().warn({ err: e as Error }, 'db.sqlite_migration_session_columns_failed');
-      allApplied = false;
-    }
+    });
+  }
 
+  private migrateMessagesColumns(): boolean {
     // Messages columns
-    try {
-      const cols = this.db.prepare("PRAGMA table_info('remote_agent_messages')").all() as {
-        name: string;
-      }[];
-      const colNames = new Set(cols.map(c => c.name));
+    return this.runMigration('db.sqlite_migration_messages_columns_failed', () => {
+      const colNames = this.getColumnNames('remote_agent_messages');
       if (!colNames.has('user_id')) {
         this.db.run(
           'ALTER TABLE remote_agent_messages ADD COLUMN user_id TEXT REFERENCES remote_agent_users(id) ON DELETE SET NULL'
         );
       }
-    } catch (e: unknown) {
-      getLog().warn({ err: e as Error }, 'db.sqlite_migration_messages_columns_failed');
-      allApplied = false;
-    }
+    });
+  }
 
+  private migrateIsolationEnvironmentColumns(): boolean {
     // Isolation environments columns
-    try {
-      const cols = this.db
-        .prepare("PRAGMA table_info('remote_agent_isolation_environments')")
-        .all() as {
-        name: string;
-      }[];
-      const colNames = new Set(cols.map(c => c.name));
+    return this.runMigration('db.sqlite_migration_isolation_environments_columns_failed', () => {
+      const colNames = this.getColumnNames('remote_agent_isolation_environments');
       if (!colNames.has('created_by_user_id')) {
         this.db.run(
           'ALTER TABLE remote_agent_isolation_environments ADD COLUMN created_by_user_id TEXT REFERENCES remote_agent_users(id) ON DELETE SET NULL'
         );
       }
-    } catch (e: unknown) {
-      getLog().warn(
-        { err: e as Error },
-        'db.sqlite_migration_isolation_environments_columns_failed'
-      );
-      allApplied = false;
-    }
+    });
+  }
 
+  private migrateUserAiPrefsColumns(): boolean {
     // User AI prefs columns. #1998: default_model is the per-user default
     // CHAT model, written atomically with default_provider. The table itself
     // shipped with Phase 3 (#1948), so pre-existing installs need this ALTER —
     // CREATE TABLE IF NOT EXISTS in createSchema() is a no-op for them.
-    try {
-      const cols = this.db.prepare("PRAGMA table_info('remote_agent_user_ai_prefs')").all() as {
-        name: string;
-      }[];
-      const colNames = new Set(cols.map(c => c.name));
+    return this.runMigration('db.sqlite_migration_user_ai_prefs_columns_failed', () => {
+      const colNames = this.getColumnNames('remote_agent_user_ai_prefs');
       if (!colNames.has('default_model')) {
         this.db.run('ALTER TABLE remote_agent_user_ai_prefs ADD COLUMN default_model TEXT');
       }
-    } catch (e: unknown) {
-      getLog().warn({ err: e as Error }, 'db.sqlite_migration_user_ai_prefs_columns_failed');
-      allApplied = false;
-    }
+    });
+  }
 
+  private migrateWorkflowEventsColumns(): boolean {
     // Lifecycle ordering: SQLite timestamps have one-second precision. A trigger
     // assigns a durable, monotonically increasing value for each inserted event.
-    try {
-      const cols = this.db.prepare("PRAGMA table_info('remote_agent_workflow_events')").all() as {
-        name: string;
-      }[];
-      if (!new Set(cols.map(c => c.name)).has('event_order')) {
+    return this.runMigration('db.sqlite_migration_workflow_events_columns_failed', () => {
+      if (!this.getColumnNames('remote_agent_workflow_events').has('event_order')) {
         this.db.run('ALTER TABLE remote_agent_workflow_events ADD COLUMN event_order INTEGER');
       }
       this.db.run(
@@ -466,11 +451,10 @@ export class SqliteAdapter implements IDatabase {
              WHERE rowid = NEW.rowid;
            END`
       );
-    } catch (e: unknown) {
-      getLog().warn({ err: e as Error }, 'db.sqlite_migration_workflow_events_columns_failed');
-      allApplied = false;
-    }
+    });
+  }
 
+  private migrateProviderKeyVendorIds(): boolean {
     // #1955: credential rows are vendor-keyed (claude→anthropic, codex→openai,
     // copilot→github-copilot). Idempotent data fix mirroring
     // migrations/000_combined.sql: where both a legacy and a vendor row exist
@@ -478,7 +462,7 @@ export class SqliteAdapter implements IDatabase {
     // Transactional so a mid-sequence failure can't leave partial renames
     // (matches the Postgres path, which runs inside the schema-apply txn);
     // a failed run is also survivable — reads normalize legacy ids.
-    try {
+    return this.runMigration('db.sqlite_migration_provider_key_vendor_ids_failed', () => {
       this.db.run('BEGIN');
       try {
         this.db.run(
@@ -508,12 +492,7 @@ export class SqliteAdapter implements IDatabase {
         this.db.run('ROLLBACK');
         throw inner;
       }
-    } catch (e: unknown) {
-      getLog().warn({ err: e as Error }, 'db.sqlite_migration_provider_key_vendor_ids_failed');
-      allApplied = false;
-    }
-
-    return allApplied;
+    });
   }
 
   /**
