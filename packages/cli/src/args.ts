@@ -5,6 +5,8 @@ type CliArgOptions = NonNullable<ParseArgsConfig['options']>;
 // The single options map for the top-level CLI parse. Kept in its own module
 // so tests can import it without executing cli.ts (whose import runs main).
 export const cliArgOptions: CliArgOptions = {
+  'factory-provider-offline': { type: 'boolean' },
+  'factory-provider-broker-fd': { type: 'string' },
   cwd: { type: 'string', default: process.cwd() },
   help: { type: 'boolean', short: 'h' },
   branch: { type: 'string', short: 'b' },
@@ -59,6 +61,16 @@ export const cliArgOptions: CliArgOptions = {
   // Repeatable sparse tier/@alias rebinding for one workflow invocation (#2481).
   model: { type: 'string', multiple: true },
   config: { type: 'string' },
+  'command-id': { type: 'string' },
+  'expected-occurrence': { type: 'string' },
+  'expected-evidence-digest': { type: 'string' },
+  'expected-node': { type: 'string' },
+  'expected-invocation': { type: 'string' },
+  'expected-request-digest': { type: 'string' },
+  'expected-lease': { type: 'string' },
+  'response-file': { type: 'string' },
+  'launch-key': { type: 'string' },
+  'launch-payload-digest': { type: 'string' },
   // Private sealed handoff appended by the parent of a detached workflow run.
   'internal-detached-run-config': { type: 'string' },
   // Private handoff: the run row the detached parent created before forking (#2872).

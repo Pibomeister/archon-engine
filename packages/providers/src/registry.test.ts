@@ -29,6 +29,7 @@ function makeMockProvider(id: string): IAgentProvider {
       skills: false,
       agents: false,
       toolRestrictions: false,
+      humanInputRequests: false,
       structuredOutput: false,
       envInjection: false,
       costControl: false,
@@ -122,6 +123,8 @@ describe('registry', () => {
       expect(codexCaps.mcp).toBe(true);
       expect(claudeCaps.hooks).toBe(true);
       expect(codexCaps.hooks).toBe(false);
+      expect(claudeCaps.humanInputRequests).toBe(true);
+      expect(codexCaps.humanInputRequests).toBe(false);
     });
   });
 
@@ -131,6 +134,7 @@ describe('registry', () => {
       expect(caps.sessionFork).toBe(true);
       expect(caps.mcp).toBe(true);
       expect(caps.hooks).toBe(true);
+      expect(caps.humanInputRequests).toBe(true);
       expect(caps.envInjection).toBe(true);
     });
 
@@ -139,6 +143,7 @@ describe('registry', () => {
       expect(caps.sessionFork).toBe(false);
       expect(caps.mcp).toBe(true);
       expect(caps.hooks).toBe(false);
+      expect(caps.humanInputRequests).toBe(false);
       expect(caps.envInjection).toBe(true);
     });
 

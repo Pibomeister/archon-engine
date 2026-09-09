@@ -231,6 +231,60 @@ export interface ResolvedModel {
   id: string;
 }
 
+export type FactoryInvocationOutcome =
+  | 'completed'
+  | 'provider-error'
+  | 'auth-failure'
+  | 'human-input-required'
+  | 'uncertain-termination';
+
+/** Provider-native request for bounded human input. The engine treats this as
+ *  a workflow pause, never as terminal completion, gate approval, or raw stdin. */
+export interface FactoryHumanInputRequest {
+  [key: string]: unknown;
+  type: 'human_input_request';
+  message: string;
+  reason?: string;
+  /** Optional provider session to resume after the bound answer is recorded. */
+  sessionId?: string;
+  /** Optional short choices. Consumers may ignore and accept free text. */
+  choices?: readonly string[];
+  /** Factory-managed identity added by the admitted-provider wrapper. */
+  signal?: FactoryInvocationSignal;
+}
+
+export interface FactoryInvocationSignal {
+  kind: 'factory-invocation-outcome';
+  outcome: FactoryInvocationOutcome;
+  provider: string;
+  invocationId: string;
+  requestDigest: string;
+  leaseId: string;
+  context: {
+    runId: string;
+    nodeId: string;
+    launchId?: string;
+    attemptId?: string;
+    iteration?: number;
+    reask?: number;
+  };
+  usage?: TokenUsage;
+  sessionId?: string;
+  stopReason?: string;
+  errorSubtype?: string;
+  errors?: string[];
+  resumed?: boolean;
+  resolvedModel?: ResolvedModel;
+  humanInput?: {
+    message: string;
+    reason?: string;
+    sessionId?: string;
+    choices?: readonly string[];
+    questions?: readonly unknown[];
+  };
+  occurredAt: string;
+}
+
 /**
  * Message chunk from AI assistant.
  * Discriminated union with per-type required fields for type safety.
@@ -366,6 +420,8 @@ export type MessageChunk =
       outcome: 'success' | 'error' | 'cancelled';
       exitCode?: number;
     }
+  | FactoryHumanInputRequest
+  | { type: 'factory_observation'; signal: FactoryInvocationSignal }
   | { type: 'workflow_dispatch'; workerConversationId: string; workflowName: string };
 
 /**
@@ -620,6 +676,12 @@ export interface NodeConfig {
  * The workflow path additionally passes nodeConfig and assistantConfig.
  */
 export interface SendQueryOptions extends AgentRequestOptions {
+  /** Engine-owned identity for factory-managed provider admission, never YAML. */
+  factoryInvocation?: import('./factory-admission').FactoryInvocationContext;
+  /** Trusted broker writable scope, never accepted from workflow YAML. */
+  factoryScope?: import('./factory-sandbox').FactoryProviderScope;
+  /** Provider-owned proof that its native transport has closed cleanly. */
+  factoryTransportClosed?: () => void;
   /** Raw YAML node config — provider translates internally to SDK-specific options. */
   nodeConfig?: NodeConfig;
   /** Per-provider defaults from .archon/config.yaml assistants section. */
@@ -653,6 +715,11 @@ export interface ProviderCapabilities {
   /** Whether the provider supports inline sub-agent definitions (Claude SDK's options.agents). */
   agents: boolean;
   toolRestrictions: boolean;
+  /**
+   * Whether this provider has a real adapter path that can surface a bounded
+   * human-input request as `MessageChunk.type === 'human_input_request'`.
+   */
+  humanInputRequests: boolean;
   /**
    * Built-in tool-name vocabulary for advisory validation of
    * `allowed_tools`/`denied_tools` entries. When present, workflow validation

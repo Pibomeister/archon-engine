@@ -1,3 +1,5 @@
+import { resolveWithCommand, type GateCommand } from './workflow-commands';
+import { sealGateEvidence } from './gate-evidence';
 /**
  * Database operations for workflow runs
  */
@@ -12,6 +14,7 @@ import type {
   ApprovalContext,
   WorkflowAttentionWaitContext,
   WorkflowWaitContext,
+  FactoryHumanInputContext,
   ScheduledWorkflowResume,
 } from '@archon/workflows/schemas/workflow-run';
 import {
@@ -20,6 +23,9 @@ import {
   scheduledWorkflowResumeSchema,
   workflowWaitStepName,
   workflowWaitContextSchema,
+  factoryHumanInputContextSchema,
+  isFactoryHumanInputContext,
+  FACTORY_HUMAN_INPUT_METADATA_KEY,
   TERMINAL_WORKFLOW_STATUSES,
 } from '@archon/workflows/schemas/workflow-run';
 import type {
@@ -146,6 +152,14 @@ function readScheduledResume(raw: unknown): ScheduledWorkflowResume | null {
   return isScheduledWorkflowResume(scheduled) ? scheduled : null;
 }
 
+function hasUnresolvedFactoryHumanInput(raw: unknown): boolean {
+  const context = normalizeMetadata(raw)[FACTORY_HUMAN_INPUT_METADATA_KEY];
+  return (
+    factoryHumanInputContextSchema.safeParse(context).success &&
+    (context as FactoryHumanInputContext).response === undefined
+  );
+}
+
 /**
  * SQL predicate matching a run whose approval gate is still OPEN: the row is
  * 'paused' AND metadata.approval.resolved is JSON null or absent. Dialect-aware
@@ -162,6 +176,16 @@ function unresolvedGateClause(): string {
       ? "metadata->'approval'->>'resolved'"
       : "json_extract(metadata, '$.approval.resolved')";
   return `status = 'paused' AND ${resolvedExpr} IS NULL`;
+}
+
+function unresolvedFactoryHumanInputClause(): string {
+  return getDatabaseType() === 'postgresql'
+    ? `status = 'paused'
+       AND metadata->'${FACTORY_HUMAN_INPUT_METADATA_KEY}' IS NOT NULL
+       AND metadata->'${FACTORY_HUMAN_INPUT_METADATA_KEY}'->'response' IS NULL`
+    : `status = 'paused'
+       AND json_extract(metadata, '$.${FACTORY_HUMAN_INPUT_METADATA_KEY}') IS NOT NULL
+       AND json_extract(metadata, '$.${FACTORY_HUMAN_INPUT_METADATA_KEY}.response') IS NULL`;
 }
 
 /**
@@ -246,11 +270,14 @@ export interface GateResolutionEvent {
 export async function resolveApprovalGate(
   id: string,
   metadata: Record<string, unknown>,
-  events: GateResolutionEvent[]
+  events: GateResolutionEvent[],
+  command?: GateCommand
 ): Promise<{ resolved: boolean }> {
+  if (command !== undefined && command.runId !== id)
+    throw new Error('Command run id does not match mutation target');
   const dialect = getDialect();
   try {
-    return await getDatabase().withTransaction(async query => {
+    return await resolveWithCommand(command, false, async query => {
       const result = await query(
         `UPDATE remote_agent_workflow_runs
          SET metadata = ${dialect.jsonMerge('metadata', 2)}
@@ -301,11 +328,14 @@ export async function resolveApprovalGate(
 export async function resolveAndCancelApprovalGate(
   id: string,
   events: GateResolutionEvent[],
-  cancellation: WorkflowCancellationEventDetails
+  cancellation: WorkflowCancellationEventDetails,
+  command?: GateCommand
 ): Promise<{ resolved: boolean }> {
+  if (command !== undefined && command.runId !== id)
+    throw new Error('Command run id does not match mutation target');
   const dialect = getDialect();
   try {
-    return await getDatabase().withTransaction(async query => {
+    return await resolveWithCommand(command, true, async query => {
       const result = await query(
         `UPDATE remote_agent_workflow_runs
          SET status = 'cancelled',
@@ -822,6 +852,7 @@ export async function findResumableRun(
        WHERE workflow_name = $1
          AND working_path = $2
          AND ${resumableStatusClause(dialect, 3)}
+         AND NOT (${unresolvedFactoryHumanInputClause()})
        ORDER BY started_at DESC
        LIMIT 1`,
       [workflowName, workingPath, ORPHAN_RESUME_STALE_DAYS]
@@ -865,6 +896,7 @@ export async function findResumableRunByParentConversation(
          AND parent_conversation_id = $2
          AND codebase_id = $3
          AND status IN ('failed', 'paused')
+         AND NOT (${unresolvedFactoryHumanInputClause()})
        ORDER BY CASE WHEN status = 'paused' THEN 0 ELSE 1 END, started_at DESC
        LIMIT 1`,
       [workflowName, parentConversationId, codebaseId]
@@ -930,6 +962,9 @@ export async function resumeWorkflowRun(
         [id]
       );
       const prior = priorRows.rows[0];
+      if (prior?.status === 'paused' && hasUnresolvedFactoryHumanInput(prior.metadata)) {
+        return { rowCount: 0 };
+      }
       if (cursor !== undefined) {
         const priorMetadata = normalizeMetadata(prior?.metadata);
         const cursorMatches =
@@ -1409,31 +1444,59 @@ export async function pauseWorkflowRun(
   extraMetadata?: Record<string, unknown>
 ): Promise<void> {
   try {
-    const result = await pool.query(
-      `UPDATE remote_agent_workflow_runs
-       SET status = 'paused', metadata = ${writeApprovalMetadata(2, 3)}
-       WHERE id = $1 AND status = 'running'`,
-      [
-        id,
-        // Caller-supplied run-level metadata (e.g. `pending_writeback`) rides the SAME
-        // atomic write so there is no window where the run is paused without it (M3).
-        JSON.stringify(extraMetadata ?? {}),
-        // The complete gate context. JSON.stringify drops undefined, and the write
-        // replaces rather than merges, so an optional field the caller left unset is
-        // simply absent — no explicit-null reset list to keep in sync.
-        JSON.stringify(approvalContext),
-      ]
-    );
-    if (result.rowCount === 0) {
-      getLog().warn({ workflowRunId: id }, 'db.workflow_run_pause_no_match');
-      throw new Error(`Workflow run not found or not in running state (id: ${id})`);
-    }
+    await getDatabase().withTransaction(async query => {
+      const row = (
+        await query<WorkflowRun>(
+          `SELECT * FROM remote_agent_workflow_runs WHERE id = $1${rowLockClause()}`,
+          [id]
+        )
+      ).rows[0];
+      if (row?.status !== 'running') {
+        throw new Error(`Workflow run not found or not in running state (id: ${id})`);
+      }
+      const sealed = await sealGateEvidence(
+        query,
+        {
+          ...normalizeWorkflowRun(row),
+          metadata: { ...normalizeWorkflowRun(row).metadata, ...extraMetadata },
+        },
+        approvalContext
+      );
+      const result = await query(
+        `UPDATE remote_agent_workflow_runs
+         SET status = 'paused', metadata = ${writeApprovalMetadata(2, 3)}
+         WHERE id = $1 AND status = 'running'`,
+        [id, JSON.stringify(extraMetadata ?? {}), JSON.stringify(sealed)]
+      );
+      if (result.rowCount === 0)
+        throw new Error(`Workflow run not found or not in running state (id: ${id})`);
+    });
   } catch (error) {
     if (error instanceof Error && error.message.startsWith('Workflow run not found')) throw error;
     const err = error as Error;
     getLog().error({ err, workflowRunId: id }, 'db.workflow_run_pause_failed');
     throw new Error(`Failed to pause workflow run: ${err.message}`);
   }
+}
+
+/** Replace the engine-owned factory human-input object and remove stale wait context. */
+function replaceFactoryHumanInputMetadata(paramIndex: number): string {
+  const value = `$${String(paramIndex)}`;
+  return getDatabaseType() === 'postgresql'
+    ? `jsonb_set(metadata - 'wait', '{${FACTORY_HUMAN_INPUT_METADATA_KEY}}', ${value}::jsonb, true)`
+    : `json_set(json_remove(metadata, '$.wait'), '$.${FACTORY_HUMAN_INPUT_METADATA_KEY}', json(${value}))`;
+}
+
+function factoryHumanInputExpr(field: string): string {
+  return getDatabaseType() === 'postgresql'
+    ? `metadata->'${FACTORY_HUMAN_INPUT_METADATA_KEY}'->>'${field}'`
+    : `json_extract(metadata, '$.${FACTORY_HUMAN_INPUT_METADATA_KEY}.${field}')`;
+}
+
+function factoryHumanInputResponseMissingClause(): string {
+  return getDatabaseType() === 'postgresql'
+    ? `metadata->'${FACTORY_HUMAN_INPUT_METADATA_KEY}'->'response' IS NULL`
+    : `json_extract(metadata, '$.${FACTORY_HUMAN_INPUT_METADATA_KEY}.response') IS NULL`;
 }
 
 /** Pause a running run on a persisted wait condition. */
@@ -1536,6 +1599,169 @@ export async function failPausedAttentionWait(
     const err = dbError as Error;
     getLog().error({ err, workflowRunId: id }, 'db.workflow_attention_notification_fail_error');
     throw new Error(`Failed to fail paused attention wait: ${err.message}`);
+  }
+}
+
+/** Pause a running run on provider-native human input. */
+export async function pauseWorkflowRunForFactoryHumanInput(
+  id: string,
+  context: FactoryHumanInputContext
+): Promise<void> {
+  const parsed = factoryHumanInputContextSchema.parse(context);
+  try {
+    await getDatabase().withTransaction(async query => {
+      const result = await query(
+        `UPDATE remote_agent_workflow_runs
+         SET status = 'paused', metadata = ${replaceFactoryHumanInputMetadata(2)}
+         WHERE id = $1 AND status = 'running'`,
+        [id, JSON.stringify(parsed)]
+      );
+      if ((result.rowCount ?? 0) === 0) {
+        throw new Error(`Workflow run not found or not in running state (id: ${id})`);
+      }
+      await insertWorkflowEvent(query, {
+        workflow_run_id: id,
+        event_type: 'factory_human_input_requested',
+        step_name: parsed.nodeId,
+        data: {
+          invocation_id: parsed.invocationId,
+          request_digest: parsed.requestDigest,
+          lease_id: parsed.leaseId,
+          launch_id: parsed.launchId,
+          attempt_id: parsed.attemptId,
+          message: parsed.message,
+          reason: parsed.reason,
+          session_id: parsed.sessionId,
+          requested_at: parsed.requestedAt,
+        },
+      });
+    });
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('Workflow run not found')) throw error;
+    const err = error as Error;
+    getLog().error({ err, workflowRunId: id }, 'db.workflow_run_factory_human_input_pause_failed');
+    throw new Error(`Failed to pause workflow run for factory human input: ${err.message}`);
+  }
+}
+
+/** Record an exact response for a paused provider-native human-input request. */
+export async function resolveFactoryHumanInput(
+  id: string,
+  context: FactoryHumanInputContext
+): Promise<{ resolved: boolean }> {
+  const parsed = factoryHumanInputContextSchema.parse(context);
+  const dialect = getDialect();
+  try {
+    return await getDatabase().withTransaction(async query => {
+      const result = await query(
+        `UPDATE remote_agent_workflow_runs
+         SET metadata = ${dialect.jsonMerge('metadata', 2)}
+         WHERE id = $1
+           AND status = 'paused'
+           AND ${factoryHumanInputExpr('nodeId')} = $3
+           AND ${factoryHumanInputExpr('invocationId')} = $4
+           AND ${factoryHumanInputExpr('requestDigest')} = $5
+           AND ${factoryHumanInputExpr('leaseId')} = $6
+           AND ${factoryHumanInputResponseMissingClause()}`,
+        [
+          id,
+          JSON.stringify({ [FACTORY_HUMAN_INPUT_METADATA_KEY]: parsed }),
+          parsed.nodeId,
+          parsed.invocationId,
+          parsed.requestDigest,
+          parsed.leaseId,
+        ]
+      );
+      const resolved = (result.rowCount ?? 0) > 0;
+      if (resolved) {
+        await insertWorkflowEvent(query, {
+          workflow_run_id: id,
+          event_type: 'factory_human_input_received',
+          step_name: parsed.nodeId,
+          data: {
+            invocation_id: parsed.invocationId,
+            request_digest: parsed.requestDigest,
+            lease_id: parsed.leaseId,
+            command_id: parsed.response?.commandId,
+            responded_at: parsed.response?.respondedAt,
+          },
+        });
+      }
+      return { resolved };
+    });
+  } catch (error) {
+    const err = error as Error;
+    getLog().error(
+      { err, workflowRunId: id },
+      'db.workflow_run_factory_human_input_resolve_failed'
+    );
+    throw new Error(`Failed to resolve factory human input: ${err.message}`);
+  }
+}
+
+/** Consume one exact factory human-input response for the authorized continuation. */
+export async function consumeFactoryHumanInputResponse(
+  id: string,
+  context: FactoryHumanInputContext
+): Promise<{ consumed: boolean }> {
+  const parsed = factoryHumanInputContextSchema.parse(context);
+  const parsedResponse = parsed.response;
+  if (parsedResponse === undefined) return { consumed: false };
+  try {
+    return await getDatabase().withTransaction(async query => {
+      const row = (
+        await query<{ metadata: unknown }>(
+          `SELECT metadata FROM remote_agent_workflow_runs WHERE id = $1 AND status = 'running'${rowLockClause()}`,
+          [id]
+        )
+      ).rows[0];
+      const metadata = normalizeMetadata(row?.metadata);
+      const stored = metadata[FACTORY_HUMAN_INPUT_METADATA_KEY];
+      if (!isFactoryHumanInputContext(stored) || stored.response === undefined) {
+        return { consumed: false };
+      }
+      const matches =
+        stored.nodeId === parsed.nodeId &&
+        stored.invocationId === parsed.invocationId &&
+        stored.requestDigest === parsed.requestDigest &&
+        stored.leaseId === parsed.leaseId &&
+        stored.iteration === parsed.iteration &&
+        stored.reask === parsed.reask &&
+        stored.response.commandId === parsedResponse.commandId &&
+        stored.response.text === parsedResponse.text &&
+        stored.response.respondedAt === parsedResponse.respondedAt &&
+        stored.response.consumedAt === undefined;
+      if (!matches) return { consumed: false };
+      const consumedAt = new Date().toISOString();
+      metadata[FACTORY_HUMAN_INPUT_METADATA_KEY] = {
+        ...stored,
+        response: { ...stored.response, consumedAt },
+      };
+      await query(
+        `UPDATE remote_agent_workflow_runs SET metadata = $2${getDatabaseType() === 'postgresql' ? '::jsonb' : ''} WHERE id = $1 AND status = 'running'`,
+        [id, JSON.stringify(metadata)]
+      );
+      await insertWorkflowEvent(query, {
+        workflow_run_id: id,
+        event_type: 'factory_human_input_received',
+        step_name: stored.nodeId,
+        data: {
+          invocation_id: stored.invocationId,
+          request_digest: stored.requestDigest,
+          lease_id: stored.leaseId,
+          command_id: stored.response.commandId,
+          consumed_at: consumedAt,
+        },
+      });
+      return { consumed: true };
+    });
+  } catch (error) {
+    const err = error as Error;
+    getLog().error(
+      { err, workflowRunId: id },
+      'db.workflow_run_factory_human_input_consume_failed'
+    );
+    throw new Error(`Failed to consume factory human input: ${err.message}`);
   }
 }
 

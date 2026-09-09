@@ -22,3 +22,6 @@ export function resolveCliExitCode(error: unknown): number {
   }
   return 1;
 }
+
+/** Receipt was already emitted; main must exit unsuccessfully without a second JSON document. */
+export class WorkflowCommandRejectedError extends Error {}

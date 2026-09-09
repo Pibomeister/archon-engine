@@ -45,6 +45,8 @@ import type {
   ProviderCapabilities,
   NodeConfig,
 } from '../types';
+import { factoryClaudeScope } from '../factory-sandbox';
+import { createFactoryClaudeTransport } from './factory-transport';
 import { parseClaudeConfig } from './config';
 import { CLAUDE_CAPABILITIES } from './capabilities';
 import { buildContainerSpawn } from './container-spawn';
@@ -1001,12 +1003,66 @@ async function* streamClaudeMessages(
         if (block.type === 'text' && block.text) {
           yield { type: 'assistant', content: block.text };
         } else if (block.type === 'tool_use' && block.name) {
+          const toolInput = block.input ?? {};
           yield {
             type: 'tool',
             toolName: block.name,
-            toolInput: block.input ?? {},
+            toolInput,
             ...(block.id !== undefined ? { toolCallId: block.id } : {}),
           };
+          if (block.name === 'AskUserQuestion') {
+            const input = toolInput;
+            const questions = Array.isArray(input.questions)
+              ? input.questions.filter(
+                  (item): item is Record<string, unknown> =>
+                    item !== null && typeof item === 'object' && !Array.isArray(item)
+                )
+              : [];
+            const questionTexts = questions
+              .map(item => {
+                const header =
+                  typeof item.header === 'string' && item.header.trim().length > 0
+                    ? `${item.header.trim()}: `
+                    : '';
+                return typeof item.question === 'string' && item.question.trim().length > 0
+                  ? `${header}${item.question.trim()}`
+                  : '';
+              })
+              .filter(Boolean);
+            const question =
+              questionTexts.length > 0
+                ? questionTexts.join('\n')
+                : typeof input.question === 'string' && input.question.trim().length > 0
+                  ? input.question
+                  : typeof input.prompt === 'string' && input.prompt.trim().length > 0
+                    ? input.prompt
+                    : 'Claude requested human input.';
+            const optionLabels = questions.flatMap(item =>
+              Array.isArray(item.options)
+                ? item.options
+                    .map(choice =>
+                      choice !== null &&
+                      typeof choice === 'object' &&
+                      !Array.isArray(choice) &&
+                      typeof (choice as { label?: unknown }).label === 'string'
+                        ? (choice as { label: string }).label
+                        : undefined
+                    )
+                    .filter((choice): choice is string => choice !== undefined)
+                : []
+            );
+            const legacyOptions = Array.isArray(input.options)
+              ? input.options.filter((choice): choice is string => typeof choice === 'string')
+              : [];
+            const options = optionLabels.length > 0 ? optionLabels : legacyOptions;
+            yield {
+              type: 'human_input_request',
+              message: question,
+              reason: 'claude_ask_user_question',
+              ...(options.length > 0 ? { choices: options } : {}),
+              ...(questions.length > 0 ? { questions } : {}),
+            };
+          }
         }
       }
     } else if (event.type === 'system') {
@@ -1426,6 +1482,9 @@ export class ClaudeProvider implements IAgentProvider {
     resumeSessionId?: string,
     requestOptions?: SendQueryOptions
   ): AsyncGenerator<MessageChunk> {
+    const factoryTransport = requestOptions?.factoryTransportClosed
+      ? createFactoryClaudeTransport()
+      : undefined;
     let lastError: Error | undefined;
     const assistantDefaults = parseClaudeConfig(requestOptions?.assistantConfig ?? {});
 
@@ -1540,9 +1599,14 @@ export class ClaudeProvider implements IAgentProvider {
         getLog().debug({ cwd, attempt }, 'starting_new_session');
       }
 
+      if (requestOptions?.factoryScope)
+        Object.assign(options, factoryClaudeScope(requestOptions.factoryScope, cwd));
+      if (factoryTransport) options.spawnClaudeCodeProcess = factoryTransport.spawn;
+      let factoryQuery: ReturnType<typeof query> | undefined;
       try {
         // 4. Run query with first-event timeout protection
         const rawEvents = query({ prompt, options });
+        factoryQuery = rawEvents;
         const timeoutMs = getFirstEventTimeoutMs();
         const diagnostics = buildFirstEventHangDiagnostics(
           options.env as Record<string, string>,
@@ -1554,12 +1618,28 @@ export class ClaudeProvider implements IAgentProvider {
         // Claude resumes-or-errors: an invalid resume id throws (and is
         // retried/surfaced), so reaching the result stream means the prior
         // session was restored. Hence `true` whenever a resume was requested.
-        yield* withResumedOutcome(
+        let terminalResult: Extract<MessageChunk, { type: 'result' }> | undefined;
+        for await (const chunk of withResumedOutcome(
           streamClaudeMessages(events, toolResultQueue),
           resumedOutcome(resumeSessionId, true)
-        );
+        )) {
+          if (factoryTransport && chunk.type === 'result') terminalResult = chunk;
+          else yield chunk;
+        }
+        if (factoryTransport) {
+          rawEvents.close();
+          await factoryTransport.waitForClosed();
+          requestOptions?.factoryTransportClosed?.();
+          if (terminalResult) yield terminalResult;
+        }
         return;
       } catch (error) {
+        if (factoryTransport) {
+          factoryQuery?.close();
+          // A retry stays inside the same exclusive lease only after the
+          // previous native child is confirmed closed. Otherwise quarantine.
+          await factoryTransport.waitForClosed();
+        }
         const err = error as Error;
         const { enrichedError, errorClass, shouldRetry } = classifyAndEnrichError(
           err,

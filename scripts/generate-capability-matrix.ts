@@ -57,6 +57,7 @@ const AXES: readonly { key: keyof ProviderCapabilities; label: string }[] = [
   { key: 'skills', label: 'Skills (`skills:`)' },
   { key: 'agents', label: 'Inline sub-agents (`agents:`)' },
   { key: 'toolRestrictions', label: 'Tool restrictions (`allowed_tools`/`denied_tools`)' },
+  { key: 'humanInputRequests', label: 'Human-input requests (`human_input_request`)' },
   { key: 'structuredOutput', label: 'Structured output (`output_format`)' },
   { key: 'envInjection', label: 'Env injection (`env:`)' },
   { key: 'costControl', label: 'Cost control (`maxBudgetUsd`)' },

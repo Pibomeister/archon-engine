@@ -406,7 +406,12 @@ export async function listActiveWorkflowNodeIds(
 export async function getDagResumeSnapshot(workflowRunId: string): Promise<{
   completedNodeOutputs: Map<
     string,
-    { output: string; structuredOutput?: unknown; declaredFields?: readonly string[] }
+    {
+      output: string;
+      structuredOutput?: unknown;
+      iteration?: number;
+      declaredFields?: readonly string[];
+    }
   >;
   fanOutSnapshots: Map<string, readonly FanOutInstanceSnapshot[]>;
   unresolvedNodeStarts: Set<string>;
@@ -533,6 +538,7 @@ export async function getDagResumeSnapshot(workflowRunId: string): Promise<{
         ...(data.structured_output !== undefined
           ? { structuredOutput: data.structured_output }
           : {}),
+        ...(Number.isInteger(data.iteration) ? { iteration: data.iteration as number } : {}),
         ...(declaredFields !== undefined ? { declaredFields } : {}),
       });
     }

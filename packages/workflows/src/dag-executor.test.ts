@@ -222,6 +222,9 @@ function createMockStore(): MockWorkflowStore {
     pauseWorkflowRun: mock<IWorkflowStore['pauseWorkflowRun']>(
       async (_id, _approvalContext, _extraMetadata) => {}
     ),
+    pauseWorkflowRunForFactoryHumanInput: mock(async (_id, _context) => {}),
+    resolveFactoryHumanInput: mock(async (_id, _context) => ({ resolved: true })),
+    consumeFactoryHumanInputResponse: mock(async (_id, _context) => ({ consumed: true })),
     pauseWorkflowRunForWait: mock<NonNullable<IWorkflowStore['pauseWorkflowRunForWait']>>(
       async (_id, _waitContext) => {}
     ),
@@ -316,6 +319,7 @@ const mockClaudeCapabilities = () => ({
   skills: true,
   agents: true,
   toolRestrictions: true,
+  humanInputRequests: false,
   structuredOutput: 'enforced' as const,
   envInjection: true,
   costControl: true,
@@ -22722,6 +22726,7 @@ describe('executeDagWorkflow -- loop_group node', () => {
 
     const workflow = {
       name: 'lg-resume',
+      description: 'Loop group resume fixture.',
       nodes: [
         {
           id: 'refine',
@@ -33525,5 +33530,809 @@ describe('executeDagWorkflow -- side effects survive a failed terminal write', (
     expect(emitted).toContain('workflow_failed');
     const sent = platform.sendMessage.mock.calls.map(c => c[1]);
     expect(sent.some(m => m.includes('completed with failures'))).toBe(true);
+  });
+});
+
+describe('executeDagWorkflow -- factory human input pause/resume', () => {
+  let testDir: string;
+
+  beforeEach(async () => {
+    testDir = join(
+      tmpdir(),
+      `dag-factory-human-input-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    await mkdir(testDir, { recursive: true });
+  });
+
+  afterEach(async () => {
+    await removeTempTree(testDir);
+  });
+
+  const workflow = ready({
+    name: 'factory-human-input',
+    description: 'Mechanical test workflow for factory human input pause/resume.',
+    nodes: [
+      node('implement', undefined, {
+        source: { kind: 'inline', prompt: 'Apply the migration' },
+        provider: 'codex',
+      }),
+    ],
+  } as WorkflowDefinition);
+
+  it('pauses on provider-native human input and resumes with the bound typed answer', async () => {
+    let status: WorkflowRunStatus = 'running';
+    const store = createMockStore();
+    store.getWorkflowRunStatus = mock(async () => status);
+    store.pauseWorkflowRunForFactoryHumanInput = mock(async (_id, _context) => {
+      status = 'paused';
+    });
+    const firstDeps: WorkflowDeps = {
+      store,
+      getAgentProvider: mock(() => ({
+        getType: () => 'codex',
+        getCapabilities: mockCodexCapabilities,
+        async *sendQuery(): AsyncGenerator<MessageChunk> {
+          yield {
+            type: 'human_input_request',
+            message: 'Which migration path should I use?',
+            reason: 'ambiguous migration',
+            sessionId: 'session-before-pause',
+            signal: {
+              kind: 'factory-invocation-outcome',
+              outcome: 'human-input-required',
+              provider: 'codex',
+              invocationId: 'invocation-1',
+              requestDigest: 'request-digest-1',
+              leaseId: 'lease-1',
+              context: {
+                runId: 'factory-run-1',
+                nodeId: 'implement',
+                launchId: 'launch-1',
+                attemptId: 'attempt-1',
+              },
+              sessionId: 'session-before-pause',
+              occurredAt: '2026-09-07T12:00:00.000Z',
+            },
+          } satisfies MessageChunk;
+        },
+      })),
+      loadConfig: mock(async () => minimalConfig),
+    };
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: firstDeps,
+        platform: createMockPlatform(),
+        conversationId: 'conv-factory-human-input',
+        cwd: testDir,
+        workflow: workflow,
+        workflowRun: makeWorkflowRun('factory-run-1'),
+        workflowProvider: 'codex',
+        workflowModel: 'qualified-model',
+        artifactsDir: join(testDir, 'artifacts'),
+        stateDir: join(testDir, 'state'),
+        logDir: join(testDir, 'logs'),
+        baseBranch: 'main',
+        docsDir: 'docs/',
+        config: minimalConfig,
+      })
+    );
+
+    expect(store.pauseWorkflowRunForFactoryHumanInput).toHaveBeenCalledWith(
+      'factory-run-1',
+      expect.objectContaining({
+        version: 'archon.factory-human-input.v1',
+        nodeId: 'implement',
+        invocationId: 'invocation-1',
+        requestDigest: 'request-digest-1',
+        leaseId: 'lease-1',
+        launchId: 'launch-1',
+        attemptId: 'attempt-1',
+        message: 'Which migration path should I use?',
+        reason: 'ambiguous migration',
+        sessionId: 'session-before-pause',
+      })
+    );
+    expect(store.failWorkflowRun).not.toHaveBeenCalled();
+    expect(store.completeWorkflowRun).not.toHaveBeenCalled();
+
+    const seen: { prompt?: string; resume?: string } = {};
+    const resumedStore = createMockStore();
+    resumedStore.getWorkflowRunStatus = mock(async () => 'running');
+    const secondDeps: WorkflowDeps = {
+      store: resumedStore,
+      getAgentProvider: mock(() => ({
+        getType: () => 'codex',
+        getCapabilities: mockCodexCapabilities,
+        async *sendQuery(
+          prompt: string,
+          _cwd: string,
+          resume?: string
+        ): AsyncGenerator<MessageChunk> {
+          seen.prompt = prompt;
+          seen.resume = resume;
+          yield { type: 'assistant', content: 'migration complete' };
+          yield { type: 'result', sessionId: 'session-after-response' };
+        },
+      })),
+      loadConfig: mock(async () => minimalConfig),
+    };
+    const resumedRun = makeWorkflowRun('factory-run-1', {
+      metadata: {
+        factory_human_input: {
+          version: 'archon.factory-human-input.v1',
+          runId: 'factory-run-1',
+          nodeId: 'implement',
+          invocationId: 'invocation-1',
+          requestDigest: 'request-digest-1',
+          leaseId: 'lease-1',
+          launchId: 'launch-1',
+          attemptId: 'attempt-1',
+          message: 'Which migration path should I use?',
+          reason: 'ambiguous migration',
+          sessionId: 'session-before-pause',
+          requestedAt: '2026-09-07T12:00:00.000Z',
+          response: {
+            commandId: 'response-command-1',
+            text: 'Use the additive migration path.',
+            respondedAt: '2026-09-07T12:05:00.000Z',
+          },
+        },
+      },
+    });
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: secondDeps,
+        platform: createMockPlatform(),
+        conversationId: 'conv-factory-human-input',
+        cwd: testDir,
+        workflow: workflow,
+        workflowRun: resumedRun,
+        workflowProvider: 'codex',
+        workflowModel: 'qualified-model',
+        artifactsDir: join(testDir, 'artifacts-2'),
+        stateDir: join(testDir, 'state-2'),
+        logDir: join(testDir, 'logs-2'),
+        baseBranch: 'main',
+        docsDir: 'docs/',
+        config: minimalConfig,
+      })
+    );
+
+    expect(seen.prompt).toContain('Use the additive migration path.');
+    expect(seen.prompt).toContain('Do not treat it as gate approval');
+    expect(seen.resume).toBe('session-before-pause');
+    expect(resumedStore.consumeFactoryHumanInputResponse).toHaveBeenCalledTimes(1);
+    expect(resumedStore.completeWorkflowRun).toHaveBeenCalledTimes(1);
+  });
+
+  it('replays an already-consumed human-input response after a restart before provider admission', async () => {
+    const seen: { prompt?: string; resume?: string } = {};
+    const store = createMockStore();
+    store.getWorkflowRunStatus = mock(async () => 'running');
+    const deps: WorkflowDeps = {
+      store,
+      getAgentProvider: mock(() => ({
+        getType: () => 'codex',
+        getCapabilities: mockCodexCapabilities,
+        async *sendQuery(
+          prompt: string,
+          _cwd: string,
+          resume?: string
+        ): AsyncGenerator<MessageChunk> {
+          seen.prompt = prompt;
+          seen.resume = resume;
+          yield { type: 'assistant', content: 'migration complete after replay' };
+          yield { type: 'result', sessionId: 'session-after-consumed-replay' };
+        },
+      })),
+      loadConfig: mock(async () => minimalConfig),
+    };
+    const resumedRun = makeWorkflowRun('factory-run-consumed-replay', {
+      metadata: {
+        factory_human_input: {
+          version: 'archon.factory-human-input.v1',
+          runId: 'factory-run-consumed-replay',
+          nodeId: 'implement',
+          invocationId: 'invocation-consumed-replay',
+          requestDigest: 'request-digest-consumed-replay',
+          leaseId: 'lease-consumed-replay',
+          launchId: 'launch-consumed-replay',
+          attemptId: 'attempt-consumed-replay',
+          message: 'Which migration path should I use?',
+          reason: 'ambiguous migration',
+          sessionId: 'session-before-consumed-replay',
+          requestedAt: '2026-09-07T12:00:00.000Z',
+          response: {
+            commandId: 'response-command-consumed-replay',
+            text: 'Use the replay-safe migration path.',
+            respondedAt: '2026-09-07T12:05:00.000Z',
+            consumedAt: '2026-09-07T12:05:01.000Z',
+          },
+        },
+      },
+    });
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: deps,
+        platform: createMockPlatform(),
+        conversationId: 'conv-factory-human-input-consumed-replay',
+        cwd: testDir,
+        workflow: workflow,
+        workflowRun: resumedRun,
+        workflowProvider: 'codex',
+        workflowModel: 'qualified-model',
+        artifactsDir: join(testDir, 'artifacts-consumed-replay'),
+        stateDir: join(testDir, 'state-consumed-replay'),
+        logDir: join(testDir, 'logs-consumed-replay'),
+        baseBranch: 'main',
+        docsDir: 'docs/',
+        config: minimalConfig,
+      })
+    );
+
+    expect(seen.prompt).toContain('Use the replay-safe migration path.');
+    expect(seen.resume).toBe('session-before-consumed-replay');
+    expect(store.consumeFactoryHumanInputResponse).not.toHaveBeenCalled();
+    expect(store.completeWorkflowRun).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not treat unsigned provider human input as a factory pause', async () => {
+    const store = createMockStore();
+    store.getWorkflowRunStatus = mock(async () => 'running');
+    const platform = createMockPlatform();
+    const deps: WorkflowDeps = {
+      store,
+      getAgentProvider: mock(() => ({
+        getType: () => 'codex',
+        getCapabilities: mockCodexCapabilities,
+        async *sendQuery(): AsyncGenerator<MessageChunk> {
+          yield {
+            type: 'human_input_request',
+            message: 'Which target should I use?',
+            reason: 'standalone_provider_question',
+          } satisfies MessageChunk;
+          yield { type: 'assistant', content: 'continuing without factory pause' };
+          yield { type: 'result', sessionId: 'session-standalone' };
+        },
+      })),
+      loadConfig: mock(async () => minimalConfig),
+    };
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: deps,
+        platform: platform,
+        conversationId: 'conv-standalone-human-input',
+        cwd: testDir,
+        workflow: workflow,
+        workflowRun: makeWorkflowRun('standalone-human-input-run'),
+        workflowProvider: 'codex',
+        workflowModel: 'qualified-model',
+        artifactsDir: join(testDir, 'artifacts-standalone'),
+        stateDir: join(testDir, 'state-standalone'),
+        logDir: join(testDir, 'logs-standalone'),
+        baseBranch: 'main',
+        docsDir: 'docs/',
+        config: minimalConfig,
+      })
+    );
+
+    expect(store.pauseWorkflowRunForFactoryHumanInput).not.toHaveBeenCalled();
+    expect(store.failWorkflowRun).not.toHaveBeenCalled();
+    expect(store.completeWorkflowRun).toHaveBeenCalledTimes(1);
+    expect(
+      platform.sendMessage.mock.calls.some(([, message]) =>
+        message.includes('not admitted through the factory control plane')
+      )
+    ).toBe(true);
+  });
+
+  it('pauses a loop occurrence with exact iteration and reask identity', async () => {
+    const loopWorkflow = ready({
+      name: 'factory-loop-human-input',
+      description: 'Mechanical loop test workflow for factory human input.',
+      nodes: [
+        {
+          id: 'implement',
+          kind: 'loop',
+          loop: {
+            fresh_context: false,
+            prompt: 'Iterate on the migration',
+            until: 'DONE',
+            max_iterations: 2,
+          },
+        },
+      ],
+    } as WorkflowDefinition);
+    let status: WorkflowRunStatus = 'running';
+    const store = createMockStore();
+    store.getWorkflowRunStatus = mock(async () => status);
+    store.pauseWorkflowRunForFactoryHumanInput = mock(async (_id, _context) => {
+      status = 'paused';
+    });
+    const deps: WorkflowDeps = {
+      store,
+      getAgentProvider: mock(() => ({
+        getType: () => 'codex',
+        getCapabilities: mockCodexCapabilities,
+        async *sendQuery(): AsyncGenerator<MessageChunk> {
+          yield {
+            type: 'human_input_request',
+            message: 'Which migration path should I use?',
+            reason: 'loop ambiguity',
+            sessionId: 'loop-session-before-pause',
+            signal: {
+              kind: 'factory-invocation-outcome',
+              outcome: 'human-input-required',
+              provider: 'codex',
+              invocationId: 'loop-invocation-1',
+              requestDigest: 'loop-request-digest-1',
+              leaseId: 'loop-lease-1',
+              context: {
+                runId: 'factory-loop-run-1',
+                nodeId: 'implement',
+                launchId: 'loop-launch-1',
+                attemptId: 'loop-attempt-1',
+                iteration: 1,
+                reask: 0,
+              },
+              sessionId: 'loop-session-before-pause',
+              occurredAt: '2026-09-07T12:00:00.000Z',
+            },
+          } satisfies MessageChunk;
+        },
+      })),
+      loadConfig: mock(async () => minimalConfig),
+    };
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: deps,
+        platform: createMockPlatform(),
+        conversationId: 'conv-factory-loop-human-input',
+        cwd: testDir,
+        workflow: loopWorkflow,
+        workflowRun: makeWorkflowRun('factory-loop-run-1'),
+        workflowProvider: 'codex',
+        workflowModel: 'qualified-model',
+        artifactsDir: join(testDir, 'artifacts-loop'),
+        stateDir: join(testDir, 'state-loop'),
+        logDir: join(testDir, 'logs-loop'),
+        baseBranch: 'main',
+        docsDir: 'docs/',
+        config: minimalConfig,
+      })
+    );
+
+    expect(store.pauseWorkflowRunForFactoryHumanInput).toHaveBeenCalledWith(
+      'factory-loop-run-1',
+      expect.objectContaining({
+        nodeId: 'implement',
+        invocationId: 'loop-invocation-1',
+        requestDigest: 'loop-request-digest-1',
+        iteration: 1,
+        reask: 0,
+        sessionId: 'loop-session-before-pause',
+      })
+    );
+    expect(store.failWorkflowRun).not.toHaveBeenCalled();
+  });
+
+  it('injects a loop human-input response only into its matching occurrence', async () => {
+    const loopWorkflow = ready({
+      name: 'factory-loop-human-input-resume',
+      description: 'Mechanical loop resume test workflow for factory human input.',
+      nodes: [
+        {
+          id: 'implement',
+          kind: 'loop',
+          loop: {
+            fresh_context: false,
+            prompt: 'Iterate on the migration',
+            until: 'DONE',
+            max_iterations: 2,
+          },
+        },
+      ],
+    } as WorkflowDefinition);
+    const seen: string[] = [];
+    const resumes: (string | undefined)[] = [];
+    const store = createMockStore();
+    store.getWorkflowRunStatus = mock(async () => 'running');
+    const deps: WorkflowDeps = {
+      store,
+      getAgentProvider: mock(() => ({
+        getType: () => 'codex',
+        getCapabilities: mockCodexCapabilities,
+        async *sendQuery(
+          prompt: string,
+          _cwd: string,
+          resume?: string
+        ): AsyncGenerator<MessageChunk> {
+          seen.push(prompt);
+          resumes.push(resume);
+          yield {
+            type: 'assistant',
+            content: seen.length === 1 ? 'first iteration' : 'second iteration DONE',
+          };
+          yield { type: 'result', sessionId: `loop-session-${String(seen.length)}` };
+        },
+      })),
+      loadConfig: mock(async () => minimalConfig),
+    };
+    const resumedRun = makeWorkflowRun('factory-loop-run-2', {
+      metadata: {
+        factory_human_input: {
+          version: 'archon.factory-human-input.v1',
+          runId: 'factory-loop-run-2',
+          nodeId: 'implement',
+          invocationId: 'loop-invocation-1',
+          requestDigest: 'loop-request-digest-1',
+          leaseId: 'loop-lease-1',
+          launchId: 'loop-launch-1',
+          attemptId: 'loop-attempt-1',
+          iteration: 1,
+          reask: 0,
+          message: 'Which migration path should I use?',
+          reason: 'loop ambiguity',
+          sessionId: 'loop-session-before-pause',
+          requestedAt: '2026-09-07T12:00:00.000Z',
+          response: {
+            commandId: 'loop-response-command-1',
+            text: 'Use the additive migration path.',
+            respondedAt: '2026-09-07T12:05:00.000Z',
+          },
+        },
+      },
+    });
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: deps,
+        platform: createMockPlatform(),
+        conversationId: 'conv-factory-loop-human-input-resume',
+        cwd: testDir,
+        workflow: loopWorkflow,
+        workflowRun: resumedRun,
+        workflowProvider: 'codex',
+        workflowModel: 'qualified-model',
+        artifactsDir: join(testDir, 'artifacts-loop-resume'),
+        stateDir: join(testDir, 'state-loop-resume'),
+        logDir: join(testDir, 'logs-loop-resume'),
+        baseBranch: 'main',
+        docsDir: 'docs/',
+        config: minimalConfig,
+      })
+    );
+
+    expect(seen).toHaveLength(2);
+    expect(seen[0]).toContain('Use the additive migration path.');
+    expect(seen[1]).not.toContain('Use the additive migration path.');
+    expect(resumes[0]).toBe('loop-session-before-pause');
+    expect(resumes[1]).toBe('loop-session-1');
+    expect(store.consumeFactoryHumanInputResponse).toHaveBeenCalledTimes(1);
+  });
+
+  it('resumes a native loop from its exact later iteration and reask cursor', async () => {
+    const loopWorkflow = ready({
+      name: 'factory-loop-human-input-late-resume',
+      description: 'Factory loop resume keeps the paused iteration/reask cursor.',
+      nodes: [
+        {
+          id: 'implement',
+          kind: 'loop',
+          output_format: {
+            type: 'object',
+            properties: { done: { type: 'boolean' }, note: { type: 'string' } },
+            required: ['done'],
+          },
+          loop: {
+            fresh_context: false,
+            prompt: 'Iterate on the migration',
+            until_field: 'done',
+            max_iterations: 3,
+          },
+        },
+      ],
+    } as WorkflowDefinition);
+    const seen: string[] = [];
+    const resumes: (string | undefined)[] = [];
+    const store = createMockStore();
+    store.getWorkflowRunStatus = mock(async () => 'running');
+    const deps: WorkflowDeps = {
+      store,
+      getAgentProvider: mock(() => ({
+        getType: () => 'codex',
+        getCapabilities: mockCodexCapabilities,
+        async *sendQuery(
+          prompt: string,
+          _cwd: string,
+          resume?: string,
+          _opts?: SendQueryOptions
+        ): AsyncGenerator<MessageChunk> {
+          seen.push(prompt);
+          resumes.push(resume);
+          yield { type: 'assistant', content: '{"done":true,"note":"resolved"}' };
+          yield {
+            type: 'result',
+            sessionId: 'loop-session-after-response',
+            structuredOutput: { done: true, note: 'resolved' },
+          };
+        },
+      })),
+      loadConfig: mock(async () => minimalConfig),
+    };
+    const resumedRun = makeWorkflowRun('factory-loop-run-3', {
+      metadata: {
+        factory_human_input: {
+          version: 'archon.factory-human-input.v1',
+          runId: 'factory-loop-run-3',
+          nodeId: 'implement',
+          invocationId: 'loop-invocation-2',
+          requestDigest: 'loop-request-digest-2',
+          leaseId: 'loop-lease-2',
+          launchId: 'loop-launch-2',
+          attemptId: 'loop-attempt-2',
+          iteration: 2,
+          reask: 1,
+          message: 'Which schema correction should I use?',
+          reason: 'loop schema ambiguity',
+          sessionId: 'loop-session-before-late-pause',
+          requestedAt: '2026-09-07T12:00:00.000Z',
+          response: {
+            commandId: 'loop-response-command-2',
+            text: 'Use the normalized status enum.',
+            respondedAt: '2026-09-07T12:05:00.000Z',
+          },
+        },
+      },
+    });
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: deps,
+        platform: createMockPlatform(),
+        conversationId: 'conv-factory-loop-human-input-late-resume',
+        cwd: testDir,
+        workflow: loopWorkflow,
+        workflowRun: resumedRun,
+        workflowProvider: 'codex',
+        workflowModel: 'qualified-model',
+        artifactsDir: join(testDir, 'artifacts-loop-late-resume'),
+        stateDir: join(testDir, 'state-loop-late-resume'),
+        logDir: join(testDir, 'logs-loop-late-resume'),
+        baseBranch: 'main',
+        docsDir: 'docs/',
+        config: minimalConfig,
+      })
+    );
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toContain('Use the normalized status enum.');
+    expect(seen[0]).toContain('previous response did not match the required output schema');
+    expect(resumes).toEqual(['loop-session-before-late-pause']);
+    expect(store.consumeFactoryHumanInputResponse).toHaveBeenCalledWith(
+      'factory-loop-run-3',
+      expect.objectContaining({ nodeId: 'implement', iteration: 2, reask: 1 })
+    );
+    expect(store.consumeFactoryHumanInputResponse).toHaveBeenCalledTimes(1);
+    expect(store.completeWorkflowRun).toHaveBeenCalledTimes(1);
+  });
+
+  it('resumes a loop_group native child pause at its exact iteration without replaying completed siblings', async () => {
+    const groupedWorkflow = ready({
+      name: 'factory-loop-group-late-human-input-resume',
+      description: 'Factory loop_group resume keeps the paused child iteration cursor.',
+      nodes: [
+        {
+          id: 'review',
+          kind: 'loop_group',
+          loop_group: {
+            max_iterations: 3,
+            until: 'DONE',
+            fresh_context: false,
+            nodes: [
+              {
+                id: 'prepare',
+                kind: 'exec',
+                runtime: 'sh',
+                script:
+                  'count_file="$STATE_DIR/prepare-count"; n=$(cat "$count_file" 2>/dev/null || echo 0); n=$((n+1)); printf "%s" "$n" > "$count_file"; echo prepared',
+                depends_on: [],
+              },
+              {
+                id: 'implement',
+                kind: 'agent',
+                source: { kind: 'inline', prompt: 'Use prepared state: $prepare.output' },
+                provider: 'codex',
+                depends_on: ['prepare'],
+              },
+            ],
+          },
+        },
+      ],
+    } as WorkflowDefinition);
+    const stateDir = join(testDir, 'state-loop-group-late-resume');
+    await mkdir(stateDir, { recursive: true });
+    await writeFile(join(stateDir, 'prepare-count'), '1');
+    const seen: { prompt?: string; resume?: string } = {};
+    const store = createMockStore();
+    store.getWorkflowRunStatus = mock(async () => 'running');
+    store.getDagResumeSnapshot = mock(async () => ({
+      completedNodeOutputs: new Map([
+        ['review.prepare', { output: 'prepared', iteration: 2 }],
+        ['review.implement', { output: 'iteration 1 unfinished', iteration: 1 }],
+      ]),
+      fanOutSnapshots: new Map(),
+      unresolvedNodeStarts: new Set(),
+      tokens: { input: 0, output: 0 },
+      costUsd: 0,
+    }));
+    const deps: WorkflowDeps = {
+      store,
+      getAgentProvider: mock(() => ({
+        getType: () => 'codex',
+        getCapabilities: mockCodexCapabilities,
+        async *sendQuery(
+          prompt: string,
+          _cwd: string,
+          resume?: string
+        ): AsyncGenerator<MessageChunk> {
+          seen.prompt = prompt;
+          seen.resume = resume;
+          yield { type: 'assistant', content: 'DONE' };
+          yield { type: 'result', sessionId: 'group-child-session-after-response' };
+        },
+      })),
+      loadConfig: mock(async () => minimalConfig),
+    };
+    const resumedRun = makeWorkflowRun('factory-loop-group-run-2', {
+      metadata: {
+        factory_human_input: {
+          version: 'archon.factory-human-input.v1',
+          runId: 'factory-loop-group-run-2',
+          nodeId: 'review.implement',
+          invocationId: 'group-invocation-2',
+          requestDigest: 'group-request-digest-2',
+          leaseId: 'group-lease-2',
+          launchId: 'group-launch-2',
+          attemptId: 'group-attempt-2',
+          iteration: 2,
+          message: 'Which review path should I use?',
+          reason: 'paused on iteration 2 after prepare',
+          sessionId: 'group-session-before-late-pause',
+          requestedAt: '2026-09-07T12:00:00.000Z',
+          response: {
+            commandId: 'group-response-command-2',
+            text: 'Continue with the already prepared iteration 2 state.',
+            respondedAt: '2026-09-07T12:05:00.000Z',
+          },
+        },
+      },
+    });
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: deps,
+        platform: createMockPlatform(),
+        conversationId: 'conv-factory-loop-group-late-human-input-resume',
+        cwd: testDir,
+        workflow: groupedWorkflow,
+        workflowRun: resumedRun,
+        workflowProvider: 'codex',
+        workflowModel: 'qualified-model',
+        artifactsDir: join(testDir, 'artifacts-loop-group-late-resume'),
+        stateDir: stateDir,
+        logDir: join(testDir, 'logs-loop-group-late-resume'),
+        baseBranch: 'main',
+        docsDir: 'docs/',
+        config: minimalConfig,
+      })
+    );
+
+    expect(await readFile(join(stateDir, 'prepare-count'), 'utf8')).toBe('1');
+    expect(seen.prompt).toContain('Use prepared state: prepared');
+    expect(seen.prompt).toContain('Continue with the already prepared iteration 2 state.');
+    expect(seen.resume).toBe('group-session-before-late-pause');
+    expect(store.consumeFactoryHumanInputResponse).toHaveBeenCalledWith(
+      'factory-loop-group-run-2',
+      expect.objectContaining({ nodeId: 'review.implement', iteration: 2 })
+    );
+    expect(store.completeWorkflowRun).toHaveBeenCalledTimes(1);
+  });
+
+  it('namespaces factory human-input responses for duplicate loop_group child ids', async () => {
+    const groupedWorkflow = ready({
+      name: 'factory-loop-group-namespaced-human-input',
+      description: 'Factory responses bind to the persisted loop_group child step name.',
+      nodes: [
+        {
+          id: 'review',
+          kind: 'loop_group',
+          loop_group: {
+            max_iterations: 1,
+            until: 'DONE',
+            nodes: [
+              {
+                id: 'implement',
+                kind: 'agent',
+                source: { kind: 'inline', prompt: 'Review pass' },
+                provider: 'codex',
+              },
+            ],
+          },
+        },
+      ],
+    } as WorkflowDefinition);
+    const seen: string[] = [];
+    const store = createMockStore();
+    store.getWorkflowRunStatus = mock(async () => 'running');
+    const deps: WorkflowDeps = {
+      store,
+      getAgentProvider: mock(() => ({
+        getType: () => 'codex',
+        getCapabilities: mockCodexCapabilities,
+        async *sendQuery(prompt: string): AsyncGenerator<MessageChunk> {
+          seen.push(prompt);
+          yield { type: 'assistant', content: 'DONE' };
+          yield { type: 'result', sessionId: 'group-child-session' };
+        },
+      })),
+      loadConfig: mock(async () => minimalConfig),
+    };
+    const resumedRun = makeWorkflowRun('factory-loop-group-run-1', {
+      metadata: {
+        factory_human_input: {
+          version: 'archon.factory-human-input.v1',
+          runId: 'factory-loop-group-run-1',
+          nodeId: 'review.implement',
+          invocationId: 'group-invocation-1',
+          requestDigest: 'group-request-digest-1',
+          leaseId: 'group-lease-1',
+          launchId: 'group-launch-1',
+          attemptId: 'group-attempt-1',
+          iteration: 1,
+          message: 'Which review path should I use?',
+          reason: 'duplicate child id requires namespace',
+          sessionId: 'group-session-before-pause',
+          requestedAt: '2026-09-07T12:00:00.000Z',
+          response: {
+            commandId: 'group-response-command-1',
+            text: 'Use the security review path.',
+            respondedAt: '2026-09-07T12:05:00.000Z',
+          },
+        },
+      },
+    });
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: deps,
+        platform: createMockPlatform(),
+        conversationId: 'conv-factory-loop-group-human-input-resume',
+        cwd: testDir,
+        workflow: groupedWorkflow,
+        workflowRun: resumedRun,
+        workflowProvider: 'codex',
+        workflowModel: 'qualified-model',
+        artifactsDir: join(testDir, 'artifacts-loop-group-resume'),
+        stateDir: join(testDir, 'state-loop-group-resume'),
+        logDir: join(testDir, 'logs-loop-group-resume'),
+        baseBranch: 'main',
+        docsDir: 'docs/',
+        config: minimalConfig,
+      })
+    );
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toContain('Use the security review path.');
+    expect(store.consumeFactoryHumanInputResponse).toHaveBeenCalledWith(
+      'factory-loop-group-run-1',
+      expect.objectContaining({ nodeId: 'review.implement' })
+    );
+    expect(store.consumeFactoryHumanInputResponse).toHaveBeenCalledTimes(1);
   });
 });
