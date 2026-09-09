@@ -970,10 +970,44 @@ async function collectCodexAuth(): Promise<CodexTokens | null> {
   };
 }
 
+interface AssistantSelection {
+  hasClaude: boolean;
+  hasCodex: boolean;
+  hasPi: boolean;
+}
+
+interface CollectedAssistantAuth extends AssistantSelection {
+  claudeAuthType?: 'global' | 'apiKey' | 'oauthToken';
+  claudeApiKey?: string;
+  claudeOauthToken?: string;
+  claudeBinaryPath?: string;
+  codexTokens?: CodexTokens;
+  piModel?: string;
+  piApiKey?: string;
+  piApiKeyEnvVar?: string;
+}
+
 /**
  * Collect AI assistant configuration
  */
 async function collectAIConfig(): Promise<SetupConfig['ai']> {
+  const selection = await collectAssistantSelection();
+  const availableSelection = await filterUnavailableAssistants(selection);
+
+  if (!availableSelection.hasClaude && !availableSelection.hasCodex && !availableSelection.hasPi) {
+    log.warning('No AI assistant selected. You can add one later by running `archon setup` again.');
+    return noAssistantConfig();
+  }
+
+  const auth = await collectSelectedAssistantAuth(availableSelection);
+  const selectedProviders = selectedProviderIds(auth);
+  const defaultAssistant = await chooseDefaultAssistant(selectedProviders);
+  const defaultModel = await maybeCollectDefaultModel(selectedProviders, defaultAssistant);
+
+  return buildAiConfig(auth, defaultAssistant, defaultModel, selectedProviders.length > 0);
+}
+
+async function collectAssistantSelection(): Promise<AssistantSelection> {
   const assistants = await multiselect({
     message: 'Which AI assistant(s) will you use? (↑↓ navigate, space select, enter confirm)',
     options: [
@@ -993,35 +1027,74 @@ async function collectAIConfig(): Promise<SetupConfig['ai']> {
     process.exit(0);
   }
 
-  let hasClaude = assistants.includes('claude');
-  let hasCodex = assistants.includes('codex');
-  let hasPi = assistants.includes('pi');
+  return {
+    hasClaude: assistants.includes('claude'),
+    hasCodex: assistants.includes('codex'),
+    hasPi: assistants.includes('pi'),
+  };
+}
 
-  // Check if selected CLI tools are installed
+async function filterUnavailableAssistants(
+  selection: AssistantSelection
+): Promise<AssistantSelection> {
+  let { hasClaude, hasCodex } = selection;
+  const { hasPi } = selection;
+
   if (hasClaude && !isCommandAvailable('claude')) {
-    note(CLI_INSTALL_INSTRUCTIONS.claude.instructions, 'Claude Code Not Found');
-    const continueWithoutClaude = await confirm({
-      message: 'Continue setup without Claude?',
-      initialValue: false,
-    });
-    if (isCancel(continueWithoutClaude)) {
-      cancel('Setup cancelled.');
-      process.exit(0);
-    }
-    if (!continueWithoutClaude) {
-      cancel('Please install Claude Code and run setup again.');
-      process.exit(0);
-    }
-    hasClaude = false;
+    hasClaude = await shouldContinueWithoutClaude();
   }
 
   if (hasCodex && !isCommandAvailable('codex')) {
-    // On non-macOS platforms, npm is the only install method and requires Node.js 18+
-    if (process.platform !== 'darwin') {
-      const nodeVersion = getNodeVersion();
-      if (!nodeVersion) {
-        note(
-          `Node.js is required to install Codex CLI via npm.
+    hasCodex = await shouldContinueWithoutCodex();
+  }
+
+  return { hasClaude, hasCodex, hasPi };
+}
+
+async function shouldContinueWithoutClaude(): Promise<boolean> {
+  note(CLI_INSTALL_INSTRUCTIONS.claude.instructions, 'Claude Code Not Found');
+  const continueWithoutClaude = await confirm({
+    message: 'Continue setup without Claude?',
+    initialValue: false,
+  });
+  if (isCancel(continueWithoutClaude)) {
+    cancel('Setup cancelled.');
+    process.exit(0);
+  }
+  if (!continueWithoutClaude) {
+    cancel('Please install Claude Code and run setup again.');
+    process.exit(0);
+  }
+  return false;
+}
+
+async function shouldContinueWithoutCodex(): Promise<boolean> {
+  const nodeAllowsCodexInstall = await ensureNodeAllowsCodexInstall();
+  if (!nodeAllowsCodexInstall) return false;
+
+  note(CLI_INSTALL_INSTRUCTIONS.codex.instructions, 'Codex CLI Not Found');
+  const continueWithoutCodex = await confirm({
+    message: 'Continue setup without Codex?',
+    initialValue: false,
+  });
+  if (isCancel(continueWithoutCodex)) {
+    cancel('Setup cancelled.');
+    process.exit(0);
+  }
+  if (!continueWithoutCodex) {
+    cancel('Please install Codex CLI and run setup again.');
+    process.exit(0);
+  }
+  return false;
+}
+
+async function ensureNodeAllowsCodexInstall(): Promise<boolean> {
+  if (process.platform === 'darwin') return true;
+
+  const nodeVersion = getNodeVersion();
+  if (!nodeVersion) {
+    note(
+      `Node.js is required to install Codex CLI via npm.
 
 Install Node.js 18 or later from:
     https://nodejs.org/
@@ -1031,24 +1104,15 @@ Or use a version manager like nvm:
     nvm install 18
 
 After installing Node.js, run 'archon setup' again.`,
-          'Node.js Not Found'
-        );
-        const continueWithoutCodex = await confirm({
-          message: 'Continue setup without Codex?',
-          initialValue: false,
-        });
-        if (isCancel(continueWithoutCodex)) {
-          cancel('Setup cancelled.');
-          process.exit(0);
-        }
-        if (!continueWithoutCodex) {
-          cancel('Please install Node.js 18+ and run setup again.');
-          process.exit(0);
-        }
-        hasCodex = false;
-      } else if (nodeVersion.major < 18) {
-        note(
-          `Node.js ${nodeVersion.major}.${nodeVersion.minor}.${nodeVersion.patch} is installed, but Codex CLI requires Node.js 18 or later.
+      'Node.js Not Found'
+    );
+    return confirmContinueWithoutCodex('Please install Node.js 18+ and run setup again.');
+  }
+
+  if (nodeVersion.major >= 18) return true;
+
+  note(
+    `Node.js ${nodeVersion.major}.${nodeVersion.minor}.${nodeVersion.patch} is installed, but Codex CLI requires Node.js 18 or later.
 
 Upgrade Node.js from:
     https://nodejs.org/
@@ -1058,171 +1122,159 @@ Or use a version manager like nvm:
     nvm use 18
 
 After upgrading, run 'archon setup' again.`,
-          'Node.js Version Too Old'
-        );
-        const continueWithoutCodex = await confirm({
-          message: 'Continue setup without Codex?',
-          initialValue: false,
-        });
-        if (isCancel(continueWithoutCodex)) {
-          cancel('Setup cancelled.');
-          process.exit(0);
-        }
-        if (!continueWithoutCodex) {
-          cancel('Please upgrade Node.js to 18+ and run setup again.');
-          process.exit(0);
-        }
-        hasCodex = false;
-      }
-    }
+    'Node.js Version Too Old'
+  );
+  return confirmContinueWithoutCodex('Please upgrade Node.js to 18+ and run setup again.');
+}
 
-    // If we still want Codex (Node check passed or on macOS), show install instructions
-    if (hasCodex) {
-      note(CLI_INSTALL_INSTRUCTIONS.codex.instructions, 'Codex CLI Not Found');
-      const continueWithoutCodex = await confirm({
-        message: 'Continue setup without Codex?',
-        initialValue: false,
-      });
-      if (isCancel(continueWithoutCodex)) {
-        cancel('Setup cancelled.');
-        process.exit(0);
-      }
-      if (!continueWithoutCodex) {
-        cancel('Please install Codex CLI and run setup again.');
-        process.exit(0);
-      }
-      hasCodex = false;
-    }
+async function confirmContinueWithoutCodex(cancelMessage: string): Promise<boolean> {
+  const continueWithoutCodex = await confirm({
+    message: 'Continue setup without Codex?',
+    initialValue: false,
+  });
+  if (isCancel(continueWithoutCodex)) {
+    cancel('Setup cancelled.');
+    process.exit(0);
   }
-
-  if (!hasClaude && !hasCodex && !hasPi) {
-    log.warning('No AI assistant selected. You can add one later by running `archon setup` again.');
-    return {
-      claude: false,
-      codex: false,
-      pi: false,
-      defaultAssistant: getRegisteredProviders().find(p => p.builtIn)?.id ?? 'claude',
-    };
+  if (!continueWithoutCodex) {
+    cancel(cancelMessage);
+    process.exit(0);
   }
+  return false;
+}
 
-  let claudeAuthType: 'global' | 'apiKey' | 'oauthToken' | undefined;
-  let claudeApiKey: string | undefined;
-  let claudeOauthToken: string | undefined;
-  let claudeBinaryPath: string | undefined;
-  let codexTokens: CodexTokens | undefined;
-  let piModel: string | undefined;
-  let piApiKey: string | undefined;
-  let piApiKeyEnvVar: string | undefined;
-
-  // Collect Claude auth if selected
-  if (hasClaude) {
-    const claudeAuth = await collectClaudeAuth();
-    claudeAuthType = claudeAuth.authType;
-    claudeApiKey = claudeAuth.apiKey;
-    claudeOauthToken = claudeAuth.oauthToken;
-    claudeBinaryPath = await collectClaudeBinaryPath();
-  }
-
-  // Collect Codex auth if selected
-  if (hasCodex) {
-    const tokens = await collectCodexAuth();
-    codexTokens = tokens ?? undefined;
-  }
-
-  // Collect Pi config if selected. Pi is bundled, so there's no PATH check —
-  // instead we module-load test it to catch broken compiled builds.
-  if (hasPi) {
-    const piConfig = await collectPiConfig();
-    piModel = piConfig.model;
-    piApiKey = piConfig.apiKey;
-    piApiKeyEnvVar = piConfig.apiKeyEnvVar;
-
-    const piSpin = spinner();
-    piSpin.start('Verifying Pi provider...');
-    const piCheck = await checkPiModule();
-    if (!piCheck.ok) {
-      piSpin.stop('Pi provider check failed (non-fatal)');
-      log.warning(`Pi: ${piCheck.error ?? 'module load failed'}`);
-      const continueWithoutPi = await confirm({
-        message: 'Continue setup without Pi?',
-        initialValue: true,
-      });
-      if (isCancel(continueWithoutPi)) {
-        cancel('Setup cancelled.');
-        process.exit(0);
-      }
-      if (!continueWithoutPi) {
-        cancel('Please check your Archon installation and run setup again.');
-        process.exit(0);
-      }
-      hasPi = false;
-      piModel = undefined;
-      piApiKey = undefined;
-      piApiKeyEnvVar = undefined;
-    } else {
-      piSpin.stop('Pi provider available');
-    }
-  }
-
-  // Determine default assistant — use the registry, but keep setup/auth flows built-in only.
-  // Default to first registered built-in provider rather than hardcoding 'claude'.
-  let defaultAssistant = getRegisteredProviders().find(p => p.builtIn)?.id ?? 'claude';
-
-  // `hasPi` may have been cleared above by a failed module check, so build the
-  // selectedProviders list AFTER the Pi block.
-  const selectedProviders = [
-    ...(hasClaude ? ['claude'] : []),
-    ...(hasCodex ? ['codex'] : []),
-    ...(hasPi ? ['pi'] : []),
-  ];
-
-  if (selectedProviders.length > 1) {
-    const providerChoices = selectedProviders.map(id => {
-      const reg = getRegisteredProviders().find(p => p.id === id);
-      const displayName = reg?.displayName ?? id;
-      return {
-        value: id,
-        label: id === 'claude' ? `${displayName} (Recommended)` : displayName,
-      };
-    });
-
-    const defaultChoice = await select({
-      message: 'Which should be the default AI assistant?',
-      options: providerChoices,
-    });
-
-    if (isCancel(defaultChoice)) {
-      cancel('Setup cancelled.');
-      process.exit(0);
-    }
-
-    defaultAssistant = defaultChoice;
-  } else if (selectedProviders.length === 1) {
-    defaultAssistant = selectedProviders[0];
-  }
-
-  // Optional, skippable default-chat-model step for the default assistant
-  // (#1999). Pi is excluded: its model was already chosen in collectPiConfig
-  // and is written by writeHomePiModelConfig.
-  let defaultModel: string | undefined;
-  if (selectedProviders.length > 0 && defaultAssistant !== 'pi') {
-    defaultModel = await collectDefaultChatModel(defaultAssistant);
-  }
-
+function noAssistantConfig(): SetupConfig['ai'] {
   return {
-    claude: hasClaude,
-    claudeAuthType,
-    claudeApiKey,
-    claudeOauthToken,
-    ...(claudeBinaryPath !== undefined ? { claudeBinaryPath } : {}),
-    codex: hasCodex,
-    codexTokens,
-    pi: hasPi,
-    piModel,
-    piApiKey,
-    piApiKeyEnvVar,
+    claude: false,
+    codex: false,
+    pi: false,
+    defaultAssistant: getRegisteredProviders().find(p => p.builtIn)?.id ?? 'claude',
+  };
+}
+
+async function collectSelectedAssistantAuth(
+  selection: AssistantSelection
+): Promise<CollectedAssistantAuth> {
+  const auth: CollectedAssistantAuth = { ...selection };
+
+  if (auth.hasClaude) {
+    const claudeAuth = await collectClaudeAuth();
+    auth.claudeAuthType = claudeAuth.authType;
+    auth.claudeApiKey = claudeAuth.apiKey;
+    auth.claudeOauthToken = claudeAuth.oauthToken;
+    auth.claudeBinaryPath = await collectClaudeBinaryPath();
+  }
+
+  if (auth.hasCodex) {
+    const tokens = await collectCodexAuth();
+    auth.codexTokens = tokens ?? undefined;
+  }
+
+  if (auth.hasPi) {
+    await collectAndVerifyPiConfig(auth);
+  }
+
+  return auth;
+}
+
+async function collectAndVerifyPiConfig(auth: CollectedAssistantAuth): Promise<void> {
+  const piConfig = await collectPiConfig();
+  auth.piModel = piConfig.model;
+  auth.piApiKey = piConfig.apiKey;
+  auth.piApiKeyEnvVar = piConfig.apiKeyEnvVar;
+
+  const piSpin = spinner();
+  piSpin.start('Verifying Pi provider...');
+  const piCheck = await checkPiModule();
+  if (piCheck.ok) {
+    piSpin.stop('Pi provider available');
+    return;
+  }
+
+  piSpin.stop('Pi provider check failed (non-fatal)');
+  log.warning(`Pi: ${piCheck.error ?? 'module load failed'}`);
+  const continueWithoutPi = await confirm({
+    message: 'Continue setup without Pi?',
+    initialValue: true,
+  });
+  if (isCancel(continueWithoutPi)) {
+    cancel('Setup cancelled.');
+    process.exit(0);
+  }
+  if (!continueWithoutPi) {
+    cancel('Please check your Archon installation and run setup again.');
+    process.exit(0);
+  }
+  auth.hasPi = false;
+  auth.piModel = undefined;
+  auth.piApiKey = undefined;
+  auth.piApiKeyEnvVar = undefined;
+}
+
+function selectedProviderIds(selection: AssistantSelection): string[] {
+  return [
+    ...(selection.hasClaude ? ['claude'] : []),
+    ...(selection.hasCodex ? ['codex'] : []),
+    ...(selection.hasPi ? ['pi'] : []),
+  ];
+}
+
+async function chooseDefaultAssistant(selectedProviders: string[]): Promise<string> {
+  let defaultAssistant = getRegisteredProviders().find(p => p.builtIn)?.id ?? 'claude';
+  if (selectedProviders.length === 1) return selectedProviders[0];
+  if (selectedProviders.length <= 1) return defaultAssistant;
+
+  const providerChoices = selectedProviders.map(id => {
+    const reg = getRegisteredProviders().find(p => p.id === id);
+    const displayName = reg?.displayName ?? id;
+    return {
+      value: id,
+      label: id === 'claude' ? `${displayName} (Recommended)` : displayName,
+    };
+  });
+
+  const defaultChoice = await select({
+    message: 'Which should be the default AI assistant?',
+    options: providerChoices,
+  });
+
+  if (isCancel(defaultChoice)) {
+    cancel('Setup cancelled.');
+    process.exit(0);
+  }
+
+  defaultAssistant = defaultChoice;
+  return defaultAssistant;
+}
+
+async function maybeCollectDefaultModel(
+  selectedProviders: string[],
+  defaultAssistant: string
+): Promise<string | undefined> {
+  if (selectedProviders.length === 0 || defaultAssistant === 'pi') return undefined;
+  return collectDefaultChatModel(defaultAssistant);
+}
+
+function buildAiConfig(
+  auth: CollectedAssistantAuth,
+  defaultAssistant: string,
+  defaultModel: string | undefined,
+  hasSelectedProviders: boolean
+): SetupConfig['ai'] {
+  return {
+    claude: auth.hasClaude,
+    claudeAuthType: auth.claudeAuthType,
+    claudeApiKey: auth.claudeApiKey,
+    claudeOauthToken: auth.claudeOauthToken,
+    ...(auth.claudeBinaryPath !== undefined ? { claudeBinaryPath: auth.claudeBinaryPath } : {}),
+    codex: auth.hasCodex,
+    codexTokens: auth.codexTokens,
+    pi: auth.hasPi,
+    piModel: auth.piModel,
+    piApiKey: auth.piApiKey,
+    piApiKeyEnvVar: auth.piApiKeyEnvVar,
     defaultAssistant,
-    ...(selectedProviders.length > 0 ? { defaultAssistantSelected: true } : {}),
+    ...(hasSelectedProviders ? { defaultAssistantSelected: true } : {}),
     ...(defaultModel !== undefined ? { defaultModel } : {}),
   };
 }
@@ -1568,111 +1620,141 @@ async function collectBotDisplayName(): Promise<string> {
 export function generateEnvContent(config: SetupConfig): string {
   const lines: string[] = [];
 
-  // Header
+  addEnvHeader(lines);
+  addAiEnv(lines, config.ai);
+  addDefaultAssistantEnv(lines, config.ai.defaultAssistant);
+  addPlatformEnv(lines, config);
+  addBotDisplayNameEnv(lines, config.botDisplayName);
+  addServerEnv(lines);
+  addConcurrencyEnv(lines);
+
+  return lines.join('\n');
+}
+
+function addEnvHeader(lines: string[]): void {
   lines.push('# Archon Configuration');
   lines.push('# Generated by `archon setup`');
   lines.push('');
-
-  // Database
   lines.push('# Database');
   lines.push('# Using SQLite (default) - no DATABASE_URL needed');
   lines.push('# Set DATABASE_URL=postgresql://... to use PostgreSQL instead.');
   lines.push('');
+}
 
-  // AI Assistants
+function addAiEnv(lines: string[], ai: SetupConfig['ai']): void {
   lines.push('# AI Assistants');
-
-  if (config.ai.claude) {
-    if (config.ai.claudeAuthType === 'global') {
-      lines.push('CLAUDE_USE_GLOBAL_AUTH=true');
-    } else if (config.ai.claudeAuthType === 'apiKey' && config.ai.claudeApiKey) {
-      lines.push('CLAUDE_USE_GLOBAL_AUTH=false');
-      lines.push(`CLAUDE_API_KEY=${config.ai.claudeApiKey}`);
-    } else if (config.ai.claudeAuthType === 'oauthToken' && config.ai.claudeOauthToken) {
-      lines.push('CLAUDE_USE_GLOBAL_AUTH=false');
-      lines.push(`CLAUDE_CODE_OAUTH_TOKEN=${config.ai.claudeOauthToken}`);
-    }
-    if (config.ai.claudeBinaryPath) {
-      lines.push(`CLAUDE_BIN_PATH=${config.ai.claudeBinaryPath}`);
-    }
-  } else {
-    lines.push('# Claude not configured');
-  }
+  addClaudeEnv(lines, ai);
   lines.push('');
+  addCodexEnv(lines, ai);
+  addPiEnv(lines, ai);
+}
 
-  if (config.ai.codex && config.ai.codexTokens) {
-    lines.push('# Codex Authentication');
-    lines.push(`CODEX_ID_TOKEN=${config.ai.codexTokens.idToken}`);
-    lines.push(`CODEX_ACCESS_TOKEN=${config.ai.codexTokens.accessToken}`);
-    lines.push(`CODEX_REFRESH_TOKEN=${config.ai.codexTokens.refreshToken}`);
-    lines.push(`CODEX_ACCOUNT_ID=${config.ai.codexTokens.accountId}`);
-    lines.push('');
+function addClaudeEnv(lines: string[], ai: SetupConfig['ai']): void {
+  if (!ai.claude) {
+    lines.push('# Claude not configured');
+    return;
   }
 
-  if (config.ai.pi && config.ai.piApiKey && config.ai.piApiKeyEnvVar) {
+  if (ai.claudeAuthType === 'global') {
+    lines.push('CLAUDE_USE_GLOBAL_AUTH=true');
+  } else if (ai.claudeAuthType === 'apiKey' && ai.claudeApiKey) {
+    lines.push('CLAUDE_USE_GLOBAL_AUTH=false');
+    lines.push(`CLAUDE_API_KEY=${ai.claudeApiKey}`);
+  } else if (ai.claudeAuthType === 'oauthToken' && ai.claudeOauthToken) {
+    lines.push('CLAUDE_USE_GLOBAL_AUTH=false');
+    lines.push(`CLAUDE_CODE_OAUTH_TOKEN=${ai.claudeOauthToken}`);
+  }
+
+  if (ai.claudeBinaryPath) lines.push(`CLAUDE_BIN_PATH=${ai.claudeBinaryPath}`);
+}
+
+function addCodexEnv(lines: string[], ai: SetupConfig['ai']): void {
+  if (!ai.codex || !ai.codexTokens) return;
+
+  lines.push('# Codex Authentication');
+  lines.push(`CODEX_ID_TOKEN=${ai.codexTokens.idToken}`);
+  lines.push(`CODEX_ACCESS_TOKEN=${ai.codexTokens.accessToken}`);
+  lines.push(`CODEX_REFRESH_TOKEN=${ai.codexTokens.refreshToken}`);
+  lines.push(`CODEX_ACCOUNT_ID=${ai.codexTokens.accountId}`);
+  lines.push('');
+}
+
+function addPiEnv(lines: string[], ai: SetupConfig['ai']): void {
+  if (ai.pi && ai.piApiKey && ai.piApiKeyEnvVar) {
     lines.push('# Pi Authentication');
-    lines.push(`${config.ai.piApiKeyEnvVar}=${config.ai.piApiKey}`);
+    lines.push(`${ai.piApiKeyEnvVar}=${ai.piApiKey}`);
     lines.push('');
-  } else if (config.ai.pi) {
+    return;
+  }
+
+  if (ai.pi) {
     lines.push('# Pi configured — set the backend API key manually');
     lines.push('# e.g. ANTHROPIC_API_KEY=sk-ant-...');
     lines.push('');
-  } else {
-    lines.push('# Pi not configured');
-    lines.push('');
+    return;
   }
 
-  // Default AI Assistant
-  lines.push('# Default AI Assistant');
-  lines.push(`DEFAULT_AI_ASSISTANT=${config.ai.defaultAssistant}`);
+  lines.push('# Pi not configured');
   lines.push('');
+}
 
-  // GitHub
-  if (config.platforms.github && config.github) {
-    lines.push('# GitHub');
-    lines.push(`GH_TOKEN=${config.github.token}`);
-    lines.push(`GITHUB_TOKEN=${config.github.token}`);
-    lines.push(`WEBHOOK_SECRET=${config.github.webhookSecret}`);
-    if (config.github.allowedUsers) {
-      lines.push(`GITHUB_ALLOWED_USERS=${config.github.allowedUsers}`);
-    }
-    if (config.github.botMention) {
-      lines.push(`GITHUB_BOT_MENTION=${config.github.botMention}`);
-    }
-    lines.push('');
+function addDefaultAssistantEnv(lines: string[], defaultAssistant: string): void {
+  lines.push('# Default AI Assistant');
+  lines.push(`DEFAULT_AI_ASSISTANT=${defaultAssistant}`);
+  lines.push('');
+}
+
+function addPlatformEnv(lines: string[], config: SetupConfig): void {
+  addGitHubEnv(lines, config);
+  addTelegramEnv(lines, config);
+  addSlackEnv(lines, config);
+}
+
+function addGitHubEnv(lines: string[], config: SetupConfig): void {
+  if (!config.platforms.github || !config.github) return;
+
+  lines.push('# GitHub');
+  lines.push(`GH_TOKEN=${config.github.token}`);
+  lines.push(`GITHUB_TOKEN=${config.github.token}`);
+  lines.push(`WEBHOOK_SECRET=${config.github.webhookSecret}`);
+  if (config.github.allowedUsers) lines.push(`GITHUB_ALLOWED_USERS=${config.github.allowedUsers}`);
+  if (config.github.botMention) lines.push(`GITHUB_BOT_MENTION=${config.github.botMention}`);
+  lines.push('');
+}
+
+function addTelegramEnv(lines: string[], config: SetupConfig): void {
+  if (!config.platforms.telegram || !config.telegram) return;
+
+  lines.push('# Telegram');
+  lines.push(`TELEGRAM_BOT_TOKEN=${config.telegram.botToken}`);
+  if (config.telegram.allowedUserIds) {
+    lines.push(`TELEGRAM_ALLOWED_USER_IDS=${config.telegram.allowedUserIds}`);
   }
+  lines.push('TELEGRAM_STREAMING_MODE=stream');
+  lines.push('');
+}
 
-  // Telegram
-  if (config.platforms.telegram && config.telegram) {
-    lines.push('# Telegram');
-    lines.push(`TELEGRAM_BOT_TOKEN=${config.telegram.botToken}`);
-    if (config.telegram.allowedUserIds) {
-      lines.push(`TELEGRAM_ALLOWED_USER_IDS=${config.telegram.allowedUserIds}`);
-    }
-    lines.push('TELEGRAM_STREAMING_MODE=stream');
-    lines.push('');
+function addSlackEnv(lines: string[], config: SetupConfig): void {
+  if (!config.platforms.slack || !config.slack) return;
+
+  lines.push('# Slack');
+  lines.push(`SLACK_BOT_TOKEN=${config.slack.botToken}`);
+  lines.push(`SLACK_APP_TOKEN=${config.slack.appToken}`);
+  if (config.slack.allowedUserIds) {
+    lines.push(`SLACK_ALLOWED_USER_IDS=${config.slack.allowedUserIds}`);
   }
+  lines.push('SLACK_STREAMING_MODE=batch');
+  lines.push('');
+}
 
-  // Slack
-  if (config.platforms.slack && config.slack) {
-    lines.push('# Slack');
-    lines.push(`SLACK_BOT_TOKEN=${config.slack.botToken}`);
-    lines.push(`SLACK_APP_TOKEN=${config.slack.appToken}`);
-    if (config.slack.allowedUserIds) {
-      lines.push(`SLACK_ALLOWED_USER_IDS=${config.slack.allowedUserIds}`);
-    }
-    lines.push('SLACK_STREAMING_MODE=batch');
-    lines.push('');
-  }
+function addBotDisplayNameEnv(lines: string[], botDisplayName: string): void {
+  if (botDisplayName === 'Archon') return;
+  lines.push('# Bot Display Name');
+  lines.push(`BOT_DISPLAY_NAME=${botDisplayName}`);
+  lines.push('');
+}
 
-  // Bot Display Name
-  if (config.botDisplayName !== 'Archon') {
-    lines.push('# Bot Display Name');
-    lines.push(`BOT_DISPLAY_NAME=${config.botDisplayName}`);
-    lines.push('');
-  }
-
-  // Server
+function addServerEnv(lines: string[]): void {
   // PORT is intentionally omitted: both the Hono server (packages/core/src/utils/port-allocation.ts)
   // and the Vite dev proxy (packages/web/vite.config.ts) default to 3090 when unset, which keeps
   // them in sync. Writing a fixed PORT here risked a mismatch if ~/.archon/.env leaks a PORT that
@@ -1680,12 +1762,11 @@ export function generateEnvContent(config: SetupConfig): string {
   lines.push('# Server');
   lines.push('# PORT=3090  # Default: 3090. Uncomment to override.');
   lines.push('');
+}
 
-  // Concurrency
+function addConcurrencyEnv(lines: string[]): void {
   lines.push('# Concurrency');
   lines.push('MAX_CONCURRENT_CONVERSATIONS=10');
-
-  return lines.join('\n');
 }
 
 /**
@@ -2048,224 +2129,267 @@ export function spawnTerminalWithSetup(repoPath: string): SpawnResult {
 // Main Setup Command
 // =============================================================================
 
+type SetupMode = 'fresh' | 'add' | 'update';
+
+interface SetupRunContext {
+  scope: 'home' | 'project';
+  force: boolean;
+  targetEnvPath: string;
+  existing: ExistingConfig | null;
+  mode: SetupMode;
+}
+
+interface SetupWriteResult {
+  config: SetupConfig;
+  writeResult: ReturnType<typeof writeScopedEnv>;
+}
+
+interface SkillInstallResult {
+  skillInstalledPath: string | null;
+  skillInstalledBase: string | null;
+  projectConfigCreatedPath: string | null;
+}
+
 /**
  * Main setup command entry point
  */
 export async function setupCommand(options: SetupOptions): Promise<void> {
-  // Handle --spawn flag
   if (options.spawn) {
-    console.log('Opening setup wizard in a new terminal window...');
-    const result = spawnTerminalWithSetup(options.repoPath);
-
-    if (result.success) {
-      console.log('Setup wizard opened. Complete the setup in the new terminal window.');
-    } else {
-      console.log('');
-      console.log('Next step: run the setup wizard in a separate terminal.');
-      console.log('');
-      console.log(`    cd ${options.repoPath} && archon setup`);
-      console.log('');
-      console.log(
-        'Come back here and let me know when you finish so I can verify your configuration.'
-      );
-    }
+    handleSpawnSetup(options.repoPath);
     return;
   }
 
-  // Interactive setup flow
   intro('Archon Setup Wizard');
 
-  // Resolve scope + target path up-front so everything downstream (existing-
-  // config check, merge, write) agrees on which file we're touching.
+  const context = await prepareSetupRun(options);
+  const { config, writeResult } = await collectAndWriteSetupConfig(options, context);
+  await writePostEnvDefaults(config);
+  logSetupWriteDetails(writeResult);
+  const skillResult = await maybeInstallSkill(options.repoPath);
+  await maybeConfigureDocsPath(options.repoPath);
+  showSetupSummary(config, writeResult, context.scope, skillResult);
+  await maybeRunDoctor();
+
+  outro('Setup complete!');
+}
+
+function handleSpawnSetup(repoPath: string): void {
+  console.log('Opening setup wizard in a new terminal window...');
+  const result = spawnTerminalWithSetup(repoPath);
+
+  if (result.success) {
+    console.log('Setup wizard opened. Complete the setup in the new terminal window.');
+    return;
+  }
+
+  console.log('');
+  console.log('Next step: run the setup wizard in a separate terminal.');
+  console.log('');
+  console.log(`    cd ${repoPath} && archon setup`);
+  console.log('');
+  console.log('Come back here and let me know when you finish so I can verify your configuration.');
+}
+
+async function prepareSetupRun(options: SetupOptions): Promise<SetupRunContext> {
   const scope: 'home' | 'project' = options.scope ?? 'home';
   const force = options.force ?? false;
   const targetEnvPath = resolveScopedEnvPath(scope, options.repoPath);
 
-  // If a pre-existing <repo>/.env is present, tell the operator once that
-  // archon does NOT manage it — avoids confusion for users upgrading from
-  // versions that used to write there.
-  const legacyRepoEnv = join(options.repoPath, '.env');
-  if (existsSync(legacyRepoEnv)) {
-    log.info(
-      `Note: ${legacyRepoEnv} exists but is not managed by archon.\n` +
-        '      Values there are stripped from the archon process at runtime (safety guard).\n' +
-        '      Put archon env vars in ~/.archon/.env (home scope) or ' +
-        `${join(options.repoPath, '.archon', '.env')} (project scope).`
-    );
-  }
-
-  // Check for existing configuration at the selected scope (not unconditionally
-  // ~/.archon/.env) so the Add/Update/Fresh decision reflects the actual target.
+  logLegacyRepoEnvNotice(options.repoPath);
   const existing = checkExistingConfig(targetEnvPath);
+  const mode = await chooseSetupMode(existing);
 
-  type SetupMode = 'fresh' | 'add' | 'update';
-  let mode: SetupMode = 'fresh';
+  return { scope, force, targetEnvPath, existing, mode };
+}
 
-  if (existing) {
-    const configuredPlatforms: string[] = [];
-    if (existing.platforms.github) configuredPlatforms.push('GitHub');
-    if (existing.platforms.telegram) configuredPlatforms.push('Telegram');
-    if (existing.platforms.slack) configuredPlatforms.push('Slack');
+function logLegacyRepoEnvNotice(repoPath: string): void {
+  const legacyRepoEnv = join(repoPath, '.env');
+  if (!existsSync(legacyRepoEnv)) return;
 
-    const summary = [
-      `Claude: ${existing.hasClaude ? 'Configured' : 'Not configured'}`,
-      `Codex: ${existing.hasCodex ? 'Configured' : 'Not configured'}`,
-      `Pi: ${existing.hasPi ? 'Configured' : 'Not configured'}`,
-      `Platforms: ${configuredPlatforms.length > 0 ? configuredPlatforms.join(', ') : 'None'}`,
-    ].join('\n');
+  log.info(
+    `Note: ${legacyRepoEnv} exists but is not managed by archon.\n` +
+      '      Values there are stripped from the archon process at runtime (safety guard).\n' +
+      '      Put archon env vars in ~/.archon/.env (home scope) or ' +
+      `${join(repoPath, '.archon', '.env')} (project scope).`
+  );
+}
 
-    note(summary, 'Existing Configuration Found');
+async function chooseSetupMode(existing: ExistingConfig | null): Promise<SetupMode> {
+  if (!existing) return 'fresh';
 
-    const modeChoice = await select({
-      message: 'What would you like to do?',
-      options: [
-        { value: 'add', label: 'Add platforms', hint: 'Keep existing config, add new platforms' },
-        { value: 'update', label: 'Update config', hint: 'Modify existing settings' },
-        { value: 'fresh', label: 'Start fresh', hint: 'Replace all configuration' },
-      ],
-    });
+  note(formatExistingConfigSummary(existing), 'Existing Configuration Found');
+  const modeChoice = await select({
+    message: 'What would you like to do?',
+    options: [
+      { value: 'add', label: 'Add platforms', hint: 'Keep existing config, add new platforms' },
+      { value: 'update', label: 'Update config', hint: 'Modify existing settings' },
+      { value: 'fresh', label: 'Start fresh', hint: 'Replace all configuration' },
+    ],
+  });
 
-    if (isCancel(modeChoice)) {
-      cancel('Setup cancelled.');
-      process.exit(0);
-    }
-
-    mode = modeChoice as SetupMode;
+  if (isCancel(modeChoice)) {
+    cancel('Setup cancelled.');
+    process.exit(0);
   }
 
-  // Collect configuration based on mode
+  return modeChoice as SetupMode;
+}
+
+function formatExistingConfigSummary(existing: ExistingConfig): string {
+  const configuredPlatforms: string[] = [];
+  if (existing.platforms.github) configuredPlatforms.push('GitHub');
+  if (existing.platforms.telegram) configuredPlatforms.push('Telegram');
+  if (existing.platforms.slack) configuredPlatforms.push('Slack');
+
+  return [
+    `Claude: ${existing.hasClaude ? 'Configured' : 'Not configured'}`,
+    `Codex: ${existing.hasCodex ? 'Configured' : 'Not configured'}`,
+    `Pi: ${existing.hasPi ? 'Configured' : 'Not configured'}`,
+    `Platforms: ${configuredPlatforms.length > 0 ? configuredPlatforms.join(', ') : 'None'}`,
+  ].join('\n');
+}
+
+async function collectAndWriteSetupConfig(
+  options: SetupOptions,
+  context: SetupRunContext
+): Promise<SetupWriteResult> {
   const s = spinner();
+  const config =
+    context.mode === 'add'
+      ? await collectAddModeConfig(s, context.existing)
+      : await collectFreshSetupConfig();
 
-  let config: SetupConfig;
-
-  if (mode === 'add') {
-    // For 'add' mode, we keep existing and only collect new platforms
-    s.start('Loading existing configuration...');
-
-    // Read existing config values - for simplicity, start with defaults and merge
-    config = {
-      ai: {
-        claude: existing?.hasClaude ?? false,
-        codex: existing?.hasCodex ?? false,
-        pi: existing?.hasPi ?? false,
-        defaultAssistant: getRegisteredProviders().find(p => p.builtIn)?.id ?? 'claude',
-      },
-      platforms: {
-        github: existing?.platforms.github ?? false,
-        telegram: existing?.platforms.telegram ?? false,
-        slack: existing?.platforms.slack ?? false,
-      },
-      botDisplayName: 'Archon',
-    };
-
-    s.stop('Existing configuration loaded');
-
-    // Collect only new platforms
-    log.info('Select additional platforms to configure');
-    const newPlatforms = await collectPlatforms();
-
-    // Merge with existing
-    config.platforms = {
-      github: config.platforms.github || newPlatforms.github,
-      telegram: config.platforms.telegram || newPlatforms.telegram,
-      slack: config.platforms.slack || newPlatforms.slack,
-    };
-
-    // Collect credentials for new platforms only
-    if (newPlatforms.github && !existing?.platforms.github) {
-      config.github = await collectGitHubConfig();
-    }
-    if (newPlatforms.telegram && !existing?.platforms.telegram) {
-      config.telegram = await collectTelegramConfig();
-    }
-    if (newPlatforms.slack && !existing?.platforms.slack) {
-      config.slack = await collectSlackConfig();
-    }
-  } else {
-    const ai = await collectAIConfig();
-    const platforms = await collectPlatforms();
-
-    config = {
-      ai,
-      platforms,
-      botDisplayName: 'Archon',
-    };
-
-    // Collect platform credentials
-    if (platforms.github) {
-      config.github = await collectGitHubConfig();
-    }
-    if (platforms.telegram) {
-      config.telegram = await collectTelegramConfig();
-    }
-    if (platforms.slack) {
-      config.slack = await collectSlackConfig();
-    }
-
-    // Collect bot display name
-    config.botDisplayName = await collectBotDisplayName();
-  }
-
-  // Generate and write configuration. Wrap in try/catch so any fs exception
-  // (permission denied, read-only FS, backup copy failure, etc.) stops the
-  // spinner cleanly and surfaces an actionable error instead of a raw stack
-  // trace after the user has filled out the entire wizard.
   s.start('Writing configuration...');
+  const writeResult = writeSetupEnv(config, options, context, s);
+  s.stop('Configuration written');
 
-  const envContent = generateEnvContent(config);
-  let writeResult: ReturnType<typeof writeScopedEnv>;
+  return { config, writeResult };
+}
+
+async function collectAddModeConfig(
+  s: ReturnType<typeof spinner>,
+  existing: ExistingConfig | null
+): Promise<SetupConfig> {
+  s.start('Loading existing configuration...');
+  const config = initialExistingSetupConfig(existing);
+  s.stop('Existing configuration loaded');
+
+  log.info('Select additional platforms to configure');
+  const newPlatforms = await collectPlatforms();
+  config.platforms = mergeSelectedPlatforms(config.platforms, newPlatforms);
+  await collectNewPlatformCredentials(config, newPlatforms, existing);
+  return config;
+}
+
+function initialExistingSetupConfig(existing: ExistingConfig | null): SetupConfig {
+  return {
+    ai: {
+      claude: existing?.hasClaude ?? false,
+      codex: existing?.hasCodex ?? false,
+      pi: existing?.hasPi ?? false,
+      defaultAssistant: getRegisteredProviders().find(p => p.builtIn)?.id ?? 'claude',
+    },
+    platforms: {
+      github: existing?.platforms.github ?? false,
+      telegram: existing?.platforms.telegram ?? false,
+      slack: existing?.platforms.slack ?? false,
+    },
+    botDisplayName: 'Archon',
+  };
+}
+
+function mergeSelectedPlatforms(
+  current: SetupConfig['platforms'],
+  selected: SetupConfig['platforms']
+): SetupConfig['platforms'] {
+  return {
+    github: current.github || selected.github,
+    telegram: current.telegram || selected.telegram,
+    slack: current.slack || selected.slack,
+  };
+}
+
+async function collectNewPlatformCredentials(
+  config: SetupConfig,
+  newPlatforms: SetupConfig['platforms'],
+  existing: ExistingConfig | null
+): Promise<void> {
+  if (newPlatforms.github && !existing?.platforms.github)
+    config.github = await collectGitHubConfig();
+  if (newPlatforms.telegram && !existing?.platforms.telegram) {
+    config.telegram = await collectTelegramConfig();
+  }
+  if (newPlatforms.slack && !existing?.platforms.slack) config.slack = await collectSlackConfig();
+}
+
+async function collectFreshSetupConfig(): Promise<SetupConfig> {
+  const ai = await collectAIConfig();
+  const platforms = await collectPlatforms();
+  const config: SetupConfig = { ai, platforms, botDisplayName: 'Archon' };
+
+  await collectSelectedPlatformCredentials(config, platforms);
+  config.botDisplayName = await collectBotDisplayName();
+  return config;
+}
+
+async function collectSelectedPlatformCredentials(
+  config: SetupConfig,
+  platforms: SetupConfig['platforms']
+): Promise<void> {
+  if (platforms.github) config.github = await collectGitHubConfig();
+  if (platforms.telegram) config.telegram = await collectTelegramConfig();
+  if (platforms.slack) config.slack = await collectSlackConfig();
+}
+
+function writeSetupEnv(
+  config: SetupConfig,
+  options: SetupOptions,
+  context: SetupRunContext,
+  s: ReturnType<typeof spinner>
+): ReturnType<typeof writeScopedEnv> {
   try {
-    writeResult = writeScopedEnv(envContent, {
-      scope,
+    return writeScopedEnv(generateEnvContent(config), {
+      scope: context.scope,
       repoPath: options.repoPath,
-      force,
+      force: context.force,
     });
   } catch (error) {
     s.stop('Failed to write configuration');
     const err = error as NodeJS.ErrnoException;
     const code = err.code ? ` (${err.code})` : '';
-    cancel(`Could not write ${targetEnvPath}${code}: ${err.message}`);
+    cancel(`Could not write ${context.targetEnvPath}${code}: ${err.message}`);
     process.exit(1);
   }
+}
 
-  s.stop('Configuration written');
-
-  // Pi model ref lives in ~/.archon/config.yaml, not the .env file, because
-  // it's a structured user preference rather than a secret.
-  if (config.ai.pi && config.ai.piModel) {
-    try {
-      writeHomePiModelConfig(config.ai.piModel);
-    } catch (err) {
-      // Non-fatal: env write already succeeded, so the user can hand-edit
-      // ~/.archon/config.yaml later. Surface the error so it's not silent.
-      const e = err as NodeJS.ErrnoException;
-      const code = e.code ? ` (${e.code})` : '';
-      log.warning(`Could not write Pi model config: ${e.message}${code}`);
-      getLog().warn({ err: e }, 'setup.pi_model_config_write_failed');
-    }
-  }
-
-  // Default assistant (+ optional chat model) → ~/.archon/config.yaml through
-  // the SAME install-scope write path as `archon ai default <provider>
-  // [<model>]` (#1998/#1999). Must run AFTER the Pi block above:
-  // writeHomePiModelConfig refuses to append once an `assistants:` block
-  // exists, and updateGlobalConfig can materialize one — the merge-write here
-  // preserves whatever the Pi writer produced.
+async function writePostEnvDefaults(config: SetupConfig): Promise<void> {
+  writePiModelConfig(config.ai);
   await writeInstallDefaults(config.ai);
+}
 
-  // Tell the operator exactly what happened — especially that <repo>/.env was
-  // NOT touched, because prior versions wrote there and this is the biggest
-  // behavior change for returning users.
+function writePiModelConfig(ai: SetupConfig['ai']): void {
+  if (!ai.pi || !ai.piModel) return;
+
+  try {
+    writeHomePiModelConfig(ai.piModel);
+  } catch (err) {
+    const e = err as NodeJS.ErrnoException;
+    const code = e.code ? ` (${e.code})` : '';
+    log.warning(`Could not write Pi model config: ${e.message}${code}`);
+    getLog().warn({ err: e }, 'setup.pi_model_config_write_failed');
+  }
+}
+
+function logSetupWriteDetails(writeResult: ReturnType<typeof writeScopedEnv>): void {
   if (writeResult.preservedKeys.length > 0) {
     log.info(
       `Preserved ${writeResult.preservedKeys.length} existing value(s) (use --force to overwrite): ${writeResult.preservedKeys.join(', ')}`
     );
   }
-  if (writeResult.backupPath) {
-    log.info(`Backup written to ${writeResult.backupPath}`);
-  }
+  if (writeResult.backupPath) log.info(`Backup written to ${writeResult.backupPath}`);
+}
 
-  // Offer to install the Archon skill
+async function maybeInstallSkill(repoPath: string): Promise<SkillInstallResult> {
   const shouldCopySkill = await confirm({
     message: 'Install the Archon skill in your project? (recommended)',
     initialValue: true,
@@ -2276,134 +2400,104 @@ export async function setupCommand(options: SetupOptions): Promise<void> {
     process.exit(0);
   }
 
-  let skillInstalledPath: string | null = null;
-  let skillInstalledBase: string | null = null;
-  let projectConfigCreatedPath: string | null = null;
-
-  if (shouldCopySkill) {
-    const skillTargetRaw = await text({
-      message: 'Project path to install the skill:',
-      defaultValue: options.repoPath,
-      placeholder: options.repoPath,
-    });
-
-    if (isCancel(skillTargetRaw)) {
-      cancel('Setup cancelled.');
-      process.exit(0);
-    }
-
-    s.start('Installing Archon skill...');
-    try {
-      await copyArchonSkill(skillTargetRaw);
-    } catch (err) {
-      s.stop('Archon skill installation failed');
-      cancel(`Could not install skill: ${(err as NodeJS.ErrnoException).message}`);
-      process.exit(1);
-    }
-    s.stop('Archon skill installed');
-    skillInstalledBase = skillTargetRaw;
-    skillInstalledPath = join(skillTargetRaw, '.claude', 'skills', 'archon');
-
-    const bootstrapResult = bootstrapProjectConfig(skillTargetRaw);
-    if (bootstrapResult.state === 'created') {
-      log.info(`Created project config: ${bootstrapResult.path}`);
-      projectConfigCreatedPath = bootstrapResult.path;
-    } else if (bootstrapResult.state === 'failed') {
-      // Non-fatal — log so silent permission errors don't masquerade as a
-      // successful setup. The user can hand-create the file later.
-      log.warn(`Could not create ${bootstrapResult.path}: ${bootstrapResult.error}`);
-    }
+  if (!shouldCopySkill) {
+    return { skillInstalledPath: null, skillInstalledBase: null, projectConfigCreatedPath: null };
   }
 
-  // Optional: configure docs directory
+  const skillTargetRaw = await text({
+    message: 'Project path to install the skill:',
+    defaultValue: repoPath,
+    placeholder: repoPath,
+  });
+
+  if (isCancel(skillTargetRaw)) {
+    cancel('Setup cancelled.');
+    process.exit(0);
+  }
+
+  return installSkillAtPath(skillTargetRaw);
+}
+
+async function installSkillAtPath(skillTargetRaw: string): Promise<SkillInstallResult> {
+  const s = spinner();
+  s.start('Installing Archon skill...');
+  try {
+    await copyArchonSkill(skillTargetRaw);
+  } catch (err) {
+    s.stop('Archon skill installation failed');
+    cancel(`Could not install skill: ${(err as NodeJS.ErrnoException).message}`);
+    process.exit(1);
+  }
+  s.stop('Archon skill installed');
+
+  const projectConfigCreatedPath = bootstrapSkillProjectConfig(skillTargetRaw);
+  return {
+    skillInstalledBase: skillTargetRaw,
+    skillInstalledPath: join(skillTargetRaw, '.claude', 'skills', 'archon'),
+    projectConfigCreatedPath,
+  };
+}
+
+function bootstrapSkillProjectConfig(skillTargetRaw: string): string | null {
+  const bootstrapResult = bootstrapProjectConfig(skillTargetRaw);
+  if (bootstrapResult.state === 'created') {
+    log.info(`Created project config: ${bootstrapResult.path}`);
+    return bootstrapResult.path;
+  }
+  if (bootstrapResult.state === 'failed') {
+    log.warn(`Could not create ${bootstrapResult.path}: ${bootstrapResult.error}`);
+  }
+  return null;
+}
+
+async function maybeConfigureDocsPath(repoPath: string): Promise<void> {
   const wantsDocsPath = await confirm({
     message: 'Configure a non-default docs directory? (default: docs/)',
     initialValue: false,
   });
 
-  if (!isCancel(wantsDocsPath) && wantsDocsPath) {
-    const docsPath = await text({
-      message: 'Where are your project docs? (relative to repo root)',
-      placeholder: 'docs/',
-    });
+  if (isCancel(wantsDocsPath) || !wantsDocsPath) return;
 
-    if (!isCancel(docsPath) && typeof docsPath === 'string' && docsPath.trim()) {
-      try {
-        const archonDir = join(options.repoPath, '.archon');
-        mkdirSync(archonDir, { recursive: true });
-        const configPath = join(archonDir, 'config.yaml');
-        const existing = existsSync(configPath) ? readFileSync(configPath, 'utf-8') : '';
-        if (!existing.includes('docs:')) {
-          const escaped = docsPath.trim().replace(/"/g, '\\"');
-          writeFileSync(configPath, existing + `\ndocs:\n  path: "${escaped}"\n`);
-        } else {
-          note(
-            `A "docs:" key already exists in ${configPath}.\nEdit it manually to set path: ${docsPath.trim()}`,
-            'Docs path not written'
-          );
-        }
-      } catch (err) {
-        cancel(`Could not write docs config: ${(err as NodeJS.ErrnoException).message}`);
-        process.exit(1);
-      }
+  const docsPath = await text({
+    message: 'Where are your project docs? (relative to repo root)',
+    placeholder: 'docs/',
+  });
+
+  if (isCancel(docsPath) || typeof docsPath !== 'string' || !docsPath.trim()) return;
+  writeDocsConfig(repoPath, docsPath.trim());
+}
+
+function writeDocsConfig(repoPath: string, docsPath: string): void {
+  try {
+    const archonDir = join(repoPath, '.archon');
+    mkdirSync(archonDir, { recursive: true });
+    const configPath = join(archonDir, 'config.yaml');
+    const existing = existsSync(configPath) ? readFileSync(configPath, 'utf-8') : '';
+    if (!existing.includes('docs:')) {
+      const escaped = docsPath.replace(/"/g, '\\"');
+      writeFileSync(configPath, existing + `\ndocs:\n  path: "${escaped}"\n`);
+      return;
     }
+    note(
+      `A "docs:" key already exists in ${configPath}.\nEdit it manually to set path: ${docsPath}`,
+      'Docs path not written'
+    );
+  } catch (err) {
+    cancel(`Could not write docs config: ${(err as NodeJS.ErrnoException).message}`);
+    process.exit(1);
   }
+}
 
-  // Summary
-  const configuredPlatforms: string[] = [];
-  if (config.platforms.github) configuredPlatforms.push('GitHub');
-  if (config.platforms.telegram) configuredPlatforms.push('Telegram');
-  if (config.platforms.slack) configuredPlatforms.push('Slack');
-
-  const aiConfigured: string[] = [];
-  if (config.ai.claude) {
-    const authMethod =
-      config.ai.claudeAuthType === 'global'
-        ? 'global auth'
-        : config.ai.claudeAuthType === 'apiKey'
-          ? 'API key'
-          : 'OAuth token';
-    aiConfigured.push(`Claude (${authMethod})`);
-  }
-  if (config.ai.codex && config.ai.codexTokens) {
-    aiConfigured.push('Codex');
-  }
-  if (config.ai.pi) {
-    aiConfigured.push(config.ai.piApiKey ? `Pi (${config.ai.piApiKeyEnvVar})` : 'Pi');
-  }
-
-  const summaryLines = [
-    `AI: ${aiConfigured.length > 0 ? aiConfigured.join(', ') : 'None configured'}`,
-    `Default: ${config.ai.defaultAssistant}${config.ai.defaultModel ? ` (chat model: ${config.ai.defaultModel})` : ''}`,
-    `Platforms: ${configuredPlatforms.length > 0 ? configuredPlatforms.join(', ') : 'None (CLI + skill only)'}`,
-    '',
-    `File written (${scope} scope):`,
-    `  ${writeResult.targetPath}`,
-  ];
-
-  if (config.platforms.github && config.github) {
-    summaryLines.push('');
-    summaryLines.push('GitHub Webhook Setup:');
-    summaryLines.push(`  Secret: ${config.github.webhookSecret}`);
-    summaryLines.push('  Add this secret to your GitHub webhook configuration');
-  }
-
-  if (skillInstalledPath && skillInstalledBase) {
-    const codexInstalledPath = join(skillInstalledBase, '.agents', 'skills', 'archon');
-    summaryLines.push('');
-    summaryLines.push('Archon skill installed:');
-    summaryLines.push(`  ${skillInstalledPath}  (Claude Code)`);
-    summaryLines.push(`  ${codexInstalledPath}  (Codex)`);
-    if (projectConfigCreatedPath) {
-      summaryLines.push('');
-      summaryLines.push('Project config created:');
-      summaryLines.push(`  ${projectConfigCreatedPath}`);
-    }
-  }
-
-  note(summaryLines.join('\n'), 'Configuration Complete');
-
-  // Additional options note
+function showSetupSummary(
+  config: SetupConfig,
+  writeResult: ReturnType<typeof writeScopedEnv>,
+  scope: 'home' | 'project',
+  skillResult: SkillInstallResult
+): void {
+  note(
+    buildSetupSummary(config, writeResult, scope, skillResult).join('\n'),
+    'Configuration Complete'
+  );
   note(
     'Other settings you can customize in ~/.archon/.env:\n' +
       '  - PORT (default: 3090)\n' +
@@ -2412,7 +2506,6 @@ export async function setupCommand(options: SetupOptions): Promise<void> {
       'These defaults work well for most users.',
     'Additional Options'
   );
-
   note(
     'To update Archon:\n' +
       '  Homebrew:  brew upgrade coleam00/archon/archon\n' +
@@ -2420,7 +2513,76 @@ export async function setupCommand(options: SetupOptions): Promise<void> {
       '  Docker:    docker pull ghcr.io/coleam00/archon:latest',
     'Update Instructions'
   );
+}
 
+function buildSetupSummary(
+  config: SetupConfig,
+  writeResult: ReturnType<typeof writeScopedEnv>,
+  scope: 'home' | 'project',
+  skillResult: SkillInstallResult
+): string[] {
+  const summaryLines = [
+    `AI: ${formatConfiguredAi(config.ai)}`,
+    `Default: ${config.ai.defaultAssistant}${config.ai.defaultModel ? ` (chat model: ${config.ai.defaultModel})` : ''}`,
+    `Platforms: ${formatConfiguredPlatforms(config.platforms)}`,
+    '',
+    `File written (${scope} scope):`,
+    `  ${writeResult.targetPath}`,
+  ];
+
+  appendGitHubSummary(summaryLines, config);
+  appendSkillSummary(summaryLines, skillResult);
+  return summaryLines;
+}
+
+function formatConfiguredAi(ai: SetupConfig['ai']): string {
+  const aiConfigured: string[] = [];
+  if (ai.claude) aiConfigured.push(`Claude (${formatClaudeAuthMethod(ai.claudeAuthType)})`);
+  if (ai.codex && ai.codexTokens) aiConfigured.push('Codex');
+  if (ai.pi) aiConfigured.push(ai.piApiKey ? `Pi (${ai.piApiKeyEnvVar})` : 'Pi');
+  return aiConfigured.length > 0 ? aiConfigured.join(', ') : 'None configured';
+}
+
+function formatClaudeAuthMethod(authType: SetupConfig['ai']['claudeAuthType']): string {
+  if (authType === 'global') return 'global auth';
+  if (authType === 'apiKey') return 'API key';
+  return 'OAuth token';
+}
+
+function formatConfiguredPlatforms(platforms: SetupConfig['platforms']): string {
+  const configuredPlatforms: string[] = [];
+  if (platforms.github) configuredPlatforms.push('GitHub');
+  if (platforms.telegram) configuredPlatforms.push('Telegram');
+  if (platforms.slack) configuredPlatforms.push('Slack');
+  return configuredPlatforms.length > 0
+    ? configuredPlatforms.join(', ')
+    : 'None (CLI + skill only)';
+}
+
+function appendGitHubSummary(summaryLines: string[], config: SetupConfig): void {
+  if (!config.platforms.github || !config.github) return;
+  summaryLines.push('');
+  summaryLines.push('GitHub Webhook Setup:');
+  summaryLines.push(`  Secret: ${config.github.webhookSecret}`);
+  summaryLines.push('  Add this secret to your GitHub webhook configuration');
+}
+
+function appendSkillSummary(summaryLines: string[], skillResult: SkillInstallResult): void {
+  if (!skillResult.skillInstalledPath || !skillResult.skillInstalledBase) return;
+
+  const codexInstalledPath = join(skillResult.skillInstalledBase, '.agents', 'skills', 'archon');
+  summaryLines.push('');
+  summaryLines.push('Archon skill installed:');
+  summaryLines.push(`  ${skillResult.skillInstalledPath}  (Claude Code)`);
+  summaryLines.push(`  ${codexInstalledPath}  (Codex)`);
+  if (skillResult.projectConfigCreatedPath) {
+    summaryLines.push('');
+    summaryLines.push('Project config created:');
+    summaryLines.push(`  ${skillResult.projectConfigCreatedPath}`);
+  }
+}
+
+async function maybeRunDoctor(): Promise<void> {
   const runDoctor = await confirm({
     message: 'Run `archon doctor` now to verify your setup?',
     initialValue: true,
@@ -2429,6 +2591,4 @@ export async function setupCommand(options: SetupOptions): Promise<void> {
     const { doctorCommand } = await import('./doctor');
     await doctorCommand();
   }
-
-  outro('Setup complete!');
 }

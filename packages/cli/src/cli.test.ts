@@ -4,23 +4,129 @@
  * Note: These tests focus on argument parsing logic.
  * Full integration tests would require mocking the database and commands.
  */
-import { describe, it, expect } from 'bun:test';
+import { afterEach, describe, it, expect } from 'bun:test';
 import { parseArgs } from 'util';
 import * as git from '@archon/git';
-import { spawnSync } from 'node:child_process';
+import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+const cliPath = join(import.meta.dir, 'cli.ts');
+const ownedTempRoots: string[] = [];
+
+afterEach(() => {
+  for (const root of ownedTempRoots.splice(0)) {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+function createOwnedTempDir(prefix: string): string {
+  const root = mkdtempSync(join(tmpdir(), prefix));
+  ownedTempRoots.push(root);
+  return root;
+}
+
+function isolatedCliEnv(): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    HOME: createOwnedTempDir('archon-cli-home-'),
+    XDG_CONFIG_HOME: createOwnedTempDir('archon-cli-xdg-'),
+    ARCHON_HOME: createOwnedTempDir('archon-cli-archon-home-'),
+    ARCHON_TELEMETRY_DISABLED: '1',
+    DO_NOT_TRACK: '1',
+    DATABASE_URL: '',
+    OPENAI_API_KEY: '',
+    GEMINI_API_KEY: '',
+  };
+}
+
+function spawnCli(args: string[], cwd = process.cwd()): SpawnSyncReturns<string> {
+  return spawnSync(process.execPath, [cliPath, ...args], {
+    cwd,
+    env: isolatedCliEnv(),
+    encoding: 'utf8',
+  });
+}
+
+function createWorkflowRepo(): string {
+  const repo = createOwnedTempDir('archon-cli-repo-');
+  const init = spawnSync('git', ['init', '-q'], { cwd: repo, encoding: 'utf8' });
+  expect(init.status).toBe(0);
+  mkdirSync(join(repo, '.archon', 'workflows'), { recursive: true });
+  writeFileSync(
+    join(repo, '.archon', 'workflows', 'assist.yaml'),
+    [
+      'name: assist',
+      'description: Assist',
+      'nodes:',
+      '  - id: done',
+      '    type: prompt',
+      '    prompt: done',
+      '',
+    ].join('\n')
+  );
+  return repo;
+}
+
 describe('CLI help output', () => {
   it('lists the workflow resume command', () => {
-    const result = spawnSync(process.execPath, [join(import.meta.dir, 'cli.ts'), '--help'], {
-      encoding: 'utf8',
-    });
+    const result = spawnCli(['--help']);
 
     expect(result.status).toBe(0);
     expect(result.stdout).toContain(
       'workflow resume <run-id>   Resume a failed or paused run from completed nodes'
     );
+  });
+});
+
+describe('CLI entrypoint subprocess behavior', () => {
+  it('rejects mutually exclusive workflow run flags on stderr before running effects', () => {
+    const result = spawnCli(
+      ['workflow', 'run', 'assist', '--branch', 'feature/test', '--no-worktree', 'message'],
+      createWorkflowRepo()
+    );
+
+    expect(result.status).toBe(1);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toBe(
+      [
+        'Error: --branch and --no-worktree are mutually exclusive.',
+        '  --branch creates an isolated worktree (safe).',
+        '  --no-worktree runs directly in your repo (no isolation).',
+        'Use one or the other.',
+        '',
+      ].join('\n')
+    );
+  });
+
+  it('keeps workflow get --json failures machine-readable on stdout only', () => {
+    const result = spawnCli(
+      ['workflow', 'get', 'missing-run-id', '--json', '--cwd', createWorkflowRepo()],
+      process.cwd()
+    );
+
+    expect(result.status).toBe(1);
+    expect(result.stdout).toBe(
+      [
+        '{',
+        '  "ok": false,',
+        '  "runId": "missing-run-id",',
+        '  "error": "not_found"',
+        '}',
+        '',
+      ].join('\n')
+    );
+    expect(result.stderr).toBe('');
+  });
+
+  it('uses --cwd instead of process cwd when validating workflow commands', () => {
+    const missingCwd = join(createOwnedTempDir('archon-cli-cwd-parent-'), 'missing');
+    const result = spawnCli(['workflow', 'list', '--cwd', missingCwd], process.cwd());
+
+    expect(result.status).toBe(1);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toBe(`Error: Directory does not exist: ${missingCwd}\n`);
   });
 });
 

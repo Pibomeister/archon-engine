@@ -239,811 +239,862 @@ function isVersionRequest(args: string[]): boolean {
   return args.some(arg => arg === '--version' || arg === '-V' || arg === '-version');
 }
 
+interface ParsedCliArgs {
+  values: Record<string, unknown>;
+  positionals: string[];
+}
+
+interface CliContext extends ParsedCliArgs {
+  args: string[];
+  cwd: string;
+  command: string | undefined;
+  subcommand: string | undefined;
+  effectiveCwd: string;
+}
+
+const NO_GIT_COMMANDS = [
+  'version',
+  'help',
+  'setup',
+  'chat',
+  'continue',
+  'serve',
+  'skill',
+  'doctor',
+  'telemetry',
+  'auth',
+  'ai',
+];
+
 async function main(): Promise<number> {
   const args = process.argv.slice(2);
-
-  // Anonymous once-per-invocation startup event (self-gates on opt-out).
-  // Emitted before any early return so EVERY invocation — including bare
-  // `archon`, `--help`, and `--version` — is counted, matching the
-  // "once per CLI invocation" contract. Each early-return path below flushes
-  // via shutdownTelemetry(); the main command path flushes in its finally.
   captureArchonStarted({ surface: 'cli' });
 
-  // Handle no arguments - show help and exit successfully
-  if (args.length === 0) {
-    printUsage();
-    await shutdownTelemetry();
-    return 0;
-  }
+  if (args.length === 0) return shutdownAfterUsage();
+  if (isVersionRequest(args)) return runVersionAndShutdown();
 
-  // Version flag aliases bypass option parsing and the git-repo check so
-  // `archon --version` works the same as `archon version` from any directory.
-  if (isVersionRequest(args)) {
-    try {
-      await versionCommand();
-      return 0;
-    } finally {
-      await shutdownTelemetry();
-      await closeDb();
-    }
-  }
+  const parsedArgs = await parseCliArgsSafely(args);
+  if (!parsedArgs) return 1;
+  if (parsedArgs.values.help) return shutdownAfterUsage();
 
-  // Parse global options
-  let parsedArgs: { values: Record<string, unknown>; positionals: string[] };
-
+  const context = buildCliContext(args, parsedArgs);
   try {
-    parsedArgs = parseArgs({
+    configureCliLogging(context);
+    const marketplaceResult = await maybeRunWorkflowSearch(context);
+    if (marketplaceResult !== undefined) return marketplaceResult;
+    context.effectiveCwd = await resolveEffectiveCwd(context);
+    const result = await dispatchCliCommand(context);
+    if (shouldPrintUpdateNotice(context, result)) {
+      await printUpdateNotice(context.values.quiet as boolean | undefined);
+    }
+    return result;
+  } catch (error) {
+    printCliError(error as Error);
+    return 1;
+  } finally {
+    await shutdownTelemetry();
+    await closeDb();
+  }
+}
+
+async function shutdownAfterUsage(): Promise<number> {
+  printUsage();
+  await shutdownTelemetry();
+  return 0;
+}
+
+async function runVersionAndShutdown(): Promise<number> {
+  try {
+    await versionCommand();
+    return 0;
+  } finally {
+    await shutdownTelemetry();
+    await closeDb();
+  }
+}
+
+async function parseCliArgsSafely(args: string[]): Promise<ParsedCliArgs | null> {
+  try {
+    return parseArgs({
       args,
-      options: {
-        cwd: { type: 'string', default: process.cwd() },
-        help: { type: 'boolean', short: 'h' },
-        branch: { type: 'string', short: 'b' },
-        from: { type: 'string' },
-        'from-branch': { type: 'string' },
-        base: { type: 'string' },
-        'no-worktree': { type: 'boolean' },
-        folder: { type: 'boolean' },
-        container: { type: 'boolean' },
-        resume: { type: 'boolean' },
-        spawn: { type: 'boolean' },
-        quiet: { type: 'boolean', short: 'q' },
-        verbose: { type: 'boolean', short: 'v' },
-        json: { type: 'boolean' },
-        events: { type: 'boolean' },
-        'run-id': { type: 'string' },
-        type: { type: 'string' },
-        data: { type: 'string' },
-        comment: { type: 'string' },
-        reason: { type: 'string' },
-        workflow: { type: 'string' },
-        'no-context': { type: 'boolean' },
-        port: { type: 'string' },
-        'download-only': { type: 'boolean' },
-        scope: { type: 'string' },
-        node: { type: 'string' },
-        yes: { type: 'boolean' },
-        force: { type: 'boolean' },
-        'conversation-id': { type: 'string' },
-        detach: { type: 'boolean' },
-        all: { type: 'boolean' },
-        status: { type: 'string' },
-        limit: { type: 'string' },
-        effort: { type: 'string' },
-        full: { type: 'boolean' },
-      },
+      options: cliParseOptions(),
       allowPositionals: true,
-      strict: false, // Allow unknown flags to pass through
+      strict: false,
     });
   } catch (error) {
     const err = error as Error;
     console.error(`Error parsing arguments: ${err.message}`);
     printUsage();
     await shutdownTelemetry();
-    return 1;
+    return null;
   }
+}
 
-  const { values, positionals } = parsedArgs;
-  const cwdValue = values.cwd;
+function cliParseOptions(): NonNullable<Parameters<typeof parseArgs>[0]>['options'] {
+  return {
+    cwd: { type: 'string', default: process.cwd() },
+    help: { type: 'boolean', short: 'h' },
+    branch: { type: 'string', short: 'b' },
+    from: { type: 'string' },
+    'from-branch': { type: 'string' },
+    base: { type: 'string' },
+    'no-worktree': { type: 'boolean' },
+    folder: { type: 'boolean' },
+    container: { type: 'boolean' },
+    resume: { type: 'boolean' },
+    spawn: { type: 'boolean' },
+    quiet: { type: 'boolean', short: 'q' },
+    verbose: { type: 'boolean', short: 'v' },
+    json: { type: 'boolean' },
+    events: { type: 'boolean' },
+    'run-id': { type: 'string' },
+    type: { type: 'string' },
+    data: { type: 'string' },
+    comment: { type: 'string' },
+    reason: { type: 'string' },
+    workflow: { type: 'string' },
+    'no-context': { type: 'boolean' },
+    port: { type: 'string' },
+    'download-only': { type: 'boolean' },
+    scope: { type: 'string' },
+    node: { type: 'string' },
+    yes: { type: 'boolean' },
+    force: { type: 'boolean' },
+    'conversation-id': { type: 'string' },
+    detach: { type: 'boolean' },
+    all: { type: 'boolean' },
+    status: { type: 'string' },
+    limit: { type: 'string' },
+    effort: { type: 'string' },
+    full: { type: 'boolean' },
+  };
+}
+
+function buildCliContext(args: string[], parsedArgs: ParsedCliArgs): CliContext {
+  const cwdValue = parsedArgs.values.cwd;
   const cwd = resolve(typeof cwdValue === 'string' ? cwdValue : process.cwd());
-  const branchName = values.branch as string | undefined;
-  const fromBranch =
-    (values.from as string | undefined) ?? (values['from-branch'] as string | undefined);
-  const baseBranch = values.base as string | undefined;
-  const noWorktree = values['no-worktree'] as boolean | undefined;
-  const folderFlag = values.folder as boolean | undefined;
-  const containerFlag = values.container as boolean | undefined;
-  const resumeFlag = values.resume as boolean | undefined;
-  const spawnFlag = values.spawn as boolean | undefined;
+  return {
+    args,
+    values: parsedArgs.values,
+    positionals: parsedArgs.positionals,
+    cwd,
+    command: parsedArgs.positionals[0],
+    subcommand: parsedArgs.positionals[1],
+    effectiveCwd: cwd,
+  };
+}
+
+function configureCliLogging(context: CliContext): void {
+  const { values, command } = context;
   const jsonFlag = values.json as boolean | undefined;
-  const detachFlag = values.detach as boolean | undefined;
-  // Handle help flag
-  if (values.help) {
-    printUsage();
-    await shutdownTelemetry();
-    return 0;
-  }
+  const isInteractiveCommand =
+    command === 'setup' || command === 'doctor' || command === 'telemetry';
+  const suppressByDefault = isInteractiveCommand && !values.verbose && !isVerboseBoot();
+  if (jsonFlag) setLogLevel('silent');
+  else if (values.quiet || suppressByDefault) setLogLevel('warn');
+  else if (values.verbose) setLogLevel('debug');
+}
 
-  // Get command and subcommand
-  const command = positionals[0];
-  const subcommand = positionals[1];
-
-  // Commands that don't require git repo validation
-  const noGitCommands = [
-    'version',
-    'help',
-    'setup',
-    'chat',
-    'continue',
-    'serve',
-    'skill',
-    'doctor',
-    'telemetry',
-    'auth',
-    'ai',
-  ];
-  const requiresGitRepo = !noGitCommands.includes(command ?? '');
-
+async function maybeRunWorkflowSearch(context: CliContext): Promise<number | undefined> {
+  if (context.command !== 'workflow' || context.subcommand !== 'search') return undefined;
   try {
-    // setup/doctor/telemetry default to warn to avoid Pino info JSON interleaving with their human-readable output; lazy loggers pick up this level at first creation
-    const isInteractiveCommand =
-      command === 'setup' || command === 'doctor' || command === 'telemetry';
-    const suppressByDefault = isInteractiveCommand && !values.verbose && !isVerboseBoot();
-    // --json must keep stdout to EXACTLY the machine-readable payload. Pino's
-    // default destination is stdout, so even one warn/error line would precede
-    // the JSON and break JSON.parse for a consuming agent. Silence logs entirely
-    // (not just lower to 'warn' — warnings still print at that level): every
-    // --json command surfaces failures inside its own { ok: false } envelope, so
-    // no diagnostic the caller needs is lost.
-    if (jsonFlag) {
-      setLogLevel('silent');
-    } else if (values.quiet || suppressByDefault) {
-      setLogLevel('warn');
-    } else if (values.verbose) {
-      setLogLevel('debug');
-    }
-
-    // Note: orphaned run cleanup moved to `workflow cleanup` command only.
-    // Running it on every CLI startup killed parallel workflow runs (all
-    // 'running' status rows were marked failed by each new process).
-
-    // Marketplace search doesn't need a git repo — handle before git validation
-    if (command === 'workflow' && subcommand === 'search') {
-      const query = positionals[2];
-      try {
-        await workflowSearchCommand(query, jsonFlag);
-      } catch (error) {
-        const err = error as Error;
-        console.error(`Error: ${err.message}`);
-        return 1;
-      }
-      return 0;
-    }
-
-    // Validate working directory exists
-    let effectiveCwd = cwd;
-    if (requiresGitRepo) {
-      if (!existsSync(cwd)) {
-        console.error(`Error: Directory does not exist: ${cwd}`);
-        return 1;
-      }
-
-      // Validate git repository and resolve to root
-      const repoRoot = await git.findRepoRoot(cwd);
-      if (repoRoot) {
-        // Use repo root as working directory (handles subdirectory case)
-        effectiveCwd = repoRoot;
-      } else {
-        // Not a git repo. It may still be a registered FOLDER project (a
-        // multi-repo root or plain ops folder). Consult the DB before rejecting.
-        // Canonicalize symlinks first so the lookup matches the realpath'd
-        // default_cwd that registration stores: process.cwd() resolves symlinks,
-        // but an explicit --cwd does not, so realpath here covers both. (cwd is
-        // already validated to exist above; fall back to cwd if realpath fails.)
-        let realCwd = cwd;
-        try {
-          realCwd = realpathSync(cwd);
-        } catch {
-          // keep the resolved cwd
-        }
-        // The DB may be unreachable. A lookup failure must NOT crash pre-dispatch
-        // (workflow/isolation commands still need to surface a clear error rather
-        // than a stack trace) — capture it and, if connection-shaped, report
-        // "database unavailable" instead of the misleading "not a git repository".
-        let folderCodebase: { default_cwd: string; kind: 'repo' | 'folder' } | null = null;
-        let gateLookupError: Error | null = null;
-        try {
-          const codebaseDb = await import('@archon/core/db/codebases');
-          folderCodebase =
-            (await codebaseDb.findCodebaseByDefaultCwd(realCwd)) ??
-            (await codebaseDb.findCodebaseByPathPrefix(realCwd));
-        } catch (dbError) {
-          gateLookupError = dbError as Error;
-          getLog().warn(
-            { err: gateLookupError, cwd: realCwd },
-            'cli.folder_project_gate_lookup_failed'
-          );
-        }
-
-        const looksLikeConnectionError = (e: Error): boolean => {
-          const m = e.message.toLowerCase();
-          return m.includes('econnrefused') || m.includes('etimedout') || m.includes('connect');
-        };
-
-        if (folderCodebase?.kind === 'folder') {
-          // Registered folder project — run in place at its root.
-          effectiveCwd = folderCodebase.default_cwd;
-        } else if (folderFlag && command === 'workflow' && subcommand === 'run') {
-          // First-use `workflow run --folder` from an unregistered non-git dir:
-          // let it through so the run command registers the folder project.
-          effectiveCwd = realCwd;
-        } else if (gateLookupError && looksLikeConnectionError(gateLookupError)) {
-          // A DB outage would otherwise be mis-reported as "not a git repository".
-          console.error(
-            'Error: Could not verify project registration — the database is unavailable.'
-          );
-          console.error(`  ${gateLookupError.message}`);
-          console.error(
-            '  Check that your database is running (or DATABASE_URL is set), then retry.'
-          );
-          return 1;
-        } else {
-          console.error('Error: Not in a git repository.');
-          console.error('The Archon CLI must be run from within a git repository.');
-          console.error('Either navigate to a git repo or use --cwd to specify one.');
-          console.error(
-            'Or register this folder as a project: run with --folder, or use /register-project in chat.'
-          );
-          return 1;
-        }
-      }
-    }
-
-    switch (command) {
-      case 'version':
-        await versionCommand();
-        break;
-
-      case 'help':
-        printUsage();
-        break;
-
-      case 'chat': {
-        const chatMessage = positionals.slice(1).join(' ');
-        if (!chatMessage) {
-          console.error('Usage: archon chat <message>');
-          return 1;
-        }
-        await chatCommand(chatMessage);
-        break;
-      }
-
-      case 'setup': {
-        const rawScope = values.scope as string | undefined;
-        if (rawScope !== undefined && rawScope !== 'home' && rawScope !== 'project') {
-          console.error(`Error: Invalid --scope: "${rawScope}". Must be "home" or "project".`);
-          return 1;
-        }
-        const scope: 'home' | 'project' = rawScope ?? 'home';
-        const forceFlag = (values.force as boolean | undefined) ?? false;
-        // For --scope project, resolve to the git repo root so running from a
-        // subdirectory writes to <repo-root>/.archon/.env (what loadArchonEnv
-        // reads at boot) — not <subdir>/.archon/.env.
-        let repoPath = cwd;
-        if (scope === 'project') {
-          const repoRoot = await git.findRepoRoot(cwd);
-          if (!repoRoot) {
-            console.error('Error: --scope project requires running from inside a git repository.');
-            console.error('Run from the repo root, pass --cwd <repo>, or use --scope home.');
-            return 1;
-          }
-          repoPath = repoRoot;
-        }
-        await setupCommand({ spawn: spawnFlag, repoPath, scope, force: forceFlag });
-        break;
-      }
-
-      case 'workflow':
-        switch (subcommand) {
-          case 'list':
-            await workflowListCommand(effectiveCwd, jsonFlag);
-            break;
-
-          case 'run': {
-            const workflowName = positionals[2];
-            if (!workflowName) {
-              console.error('Usage: archon workflow run <name> [message]');
-              return 1;
-            }
-            const userMessage = positionals.slice(3).join(' ') || '';
-            if (branchName !== undefined && noWorktree) {
-              console.error(
-                'Error: --branch and --no-worktree are mutually exclusive.\n' +
-                  '  --branch creates an isolated worktree (safe).\n' +
-                  '  --no-worktree runs directly in your repo (no isolation).\n' +
-                  'Use one or the other.'
-              );
-              return 1;
-            }
-            if (noWorktree && fromBranch !== undefined) {
-              console.error(
-                'Error: --from/--from-branch has no effect with --no-worktree.\n' +
-                  'Remove --from or drop --no-worktree.'
-              );
-              return 1;
-            }
-            if (noWorktree && baseBranch !== undefined) {
-              console.error(
-                'Error: --base has no effect with --no-worktree.\n' +
-                  'Remove --base or drop --no-worktree.'
-              );
-              return 1;
-            }
-            if (resumeFlag && branchName !== undefined) {
-              console.error(
-                'Error: --resume and --branch are mutually exclusive.\n' +
-                  '  --resume reuses the existing worktree from the failed run.\n' +
-                  '  Remove --branch when using --resume.'
-              );
-              return 1;
-            }
-            const options = {
-              branchName,
-              fromBranch,
-              baseBranch,
-              noWorktree,
-              folder: folderFlag,
-              container: containerFlag,
-              resume: resumeFlag,
-              quiet: values.quiet as boolean | undefined,
-              verbose: values.verbose as boolean | undefined,
-              // Stable scope for persist_session across separate CLI invocations. Without
-              // it each run gets a fresh conversation UUID, so persisted sessions never
-              // resume between runs (they only resume within chat/REST, which reuse a
-              // conversation). Pass the same id on each run to opt into cross-run resume.
-              conversationId: values['conversation-id'] as string | undefined,
-              detach: detachFlag,
-              json: jsonFlag,
-            };
-            await workflowRunCommand(effectiveCwd, workflowName, userMessage, options);
-            break;
-          }
-
-          case 'status':
-            await workflowStatusCommand(
-              jsonFlag,
-              values.verbose as boolean | undefined,
-              values.events as boolean | undefined
-            );
-            break;
-
-          case 'get': {
-            const getRunId = positionals[2];
-            if (!getRunId) {
-              console.error('Usage: archon workflow get <run-id> [--json] [--verbose] [--events]');
-              return 1;
-            }
-            // Propagate the command's exit code so `get <id> && ...` and CI
-            // pipelines see a non-zero status when the run is missing.
-            return await workflowGetCommand(
-              getRunId,
-              jsonFlag,
-              values.verbose as boolean | undefined,
-              effectiveCwd,
-              values.events as boolean | undefined
-            );
-          }
-
-          case 'runs': {
-            const rawLimit = values.limit as string | undefined;
-            let limit: number | undefined;
-            if (rawLimit !== undefined) {
-              limit = Number(rawLimit);
-              if (!Number.isInteger(limit) || limit < 1) {
-                console.error(`Error: --limit must be a positive integer, got '${rawLimit}'.`);
-                return 1;
-              }
-            }
-            await workflowRunsCommand(effectiveCwd, {
-              json: jsonFlag,
-              all: values.all as boolean | undefined,
-              status: values.status as string | undefined,
-              limit,
-            });
-            break;
-          }
-
-          case 'resume': {
-            const resumeRunId = positionals[2];
-            if (!resumeRunId) {
-              console.error('Usage: archon workflow resume <run-id>');
-              return 1;
-            }
-            await workflowResumeCommand(resumeRunId, jsonFlag, effectiveCwd);
-            break;
-          }
-
-          case 'abandon': {
-            const abandonRunId = positionals[2];
-            if (!abandonRunId) {
-              console.error('Usage: archon workflow abandon <run-id>');
-              return 1;
-            }
-            await workflowAbandonCommand(abandonRunId, jsonFlag, effectiveCwd);
-            break;
-          }
-
-          case 'approve': {
-            const approveRunId = positionals[2];
-            if (!approveRunId) {
-              console.error('Usage: archon workflow approve <run-id> [comment]');
-              return 1;
-            }
-            // Accept comment as positional args (everything after run ID) or --comment flag.
-            // Explicit empty→undefined conversion (not `|| undefined`): "no comment" must
-            // reach approveWorkflow as undefined so a signal-bearing interactive-loop gate
-            // finalizes instead of re-running (#2074, loop_feedback_given).
-            const rawApproveComment =
-              (values.comment as string | undefined) || positionals.slice(3).join(' ');
-            const approveComment = rawApproveComment.length > 0 ? rawApproveComment : undefined;
-            await workflowApproveCommand(approveRunId, approveComment, jsonFlag, effectiveCwd);
-            break;
-          }
-
-          case 'reject': {
-            const rejectRunId = positionals[2];
-            if (!rejectRunId) {
-              console.error('Usage: archon workflow reject <run-id> [reason]');
-              return 1;
-            }
-            const rawRejectReason =
-              (values.reason as string | undefined) || positionals.slice(3).join(' ');
-            const rejectReason = rawRejectReason.length > 0 ? rawRejectReason : undefined;
-            await workflowRejectCommand(rejectRunId, rejectReason, jsonFlag, effectiveCwd);
-            break;
-          }
-
-          case 'cleanup': {
-            const days = positionals[2] ? Number(positionals[2]) : 7;
-            if (Number.isNaN(days) || days < 0) {
-              console.error('Usage: archon workflow cleanup [days]');
-              console.error('  days: delete terminal runs older than N days (default: 7)');
-              return 1;
-            }
-            await workflowCleanupCommand(days);
-            break;
-          }
-
-          case 'reset-sessions': {
-            const workflowName = positionals[2];
-            const extras = positionals.slice(3);
-            if (!workflowName) {
-              console.error(
-                'Usage: archon workflow reset-sessions <workflow-name> [--scope <key>] [--node <id>] [--yes] [--json]'
-              );
-              console.error(
-                '  Without --scope: deletes persisted sessions across ALL scopes (requires --yes).'
-              );
-              return 1;
-            }
-            // Reject extra positionals — this is a destructive command and silently
-            // dropping `archon workflow reset-sessions wf planner` (likely intent: filter to
-            // node "planner") to a cross-scope wipe would be a foot-gun.
-            if (extras.length > 0) {
-              console.error(
-                'Usage: archon workflow reset-sessions <workflow-name> [--scope <key>] [--node <id>] [--yes] [--json]'
-              );
-              console.error(
-                `Error: unexpected positional argument(s): ${extras.join(' ')}. Use --node <id> to filter by node.`
-              );
-              return 1;
-            }
-            await workflowResetSessionsCommand(workflowName, {
-              scope: values.scope as string | undefined,
-              node: values.node as string | undefined,
-              yes: values.yes as boolean | undefined,
-              json: jsonFlag,
-            });
-            break;
-          }
-
-          case 'event': {
-            const action = positionals[2];
-            if (action !== 'emit') {
-              if (action === undefined) {
-                console.error('Missing workflow event subcommand');
-              } else {
-                console.error(`Unknown workflow event subcommand: ${action}`);
-              }
-              console.error('Available: emit');
-              return 1;
-            }
-            const runId = values['run-id'] as string | undefined;
-            const eventType = values.type as string | undefined;
-            if (!runId) {
-              console.error(
-                'Usage: archon workflow event emit --run-id <uuid> --type <event-type>'
-              );
-              console.error('Error: --run-id is required');
-              return 1;
-            }
-            if (!eventType) {
-              console.error(
-                'Usage: archon workflow event emit --run-id <uuid> --type <event-type>'
-              );
-              console.error('Error: --type is required');
-              return 1;
-            }
-            if (!isValidEventType(eventType)) {
-              console.error(`Error: unknown event type: ${eventType}`);
-              console.error(`Valid types: ${WORKFLOW_EVENT_TYPES.join(', ')}`);
-              return 1;
-            }
-            let eventData: Record<string, unknown> | undefined;
-            const rawData = values.data as string | undefined;
-            if (rawData) {
-              try {
-                eventData = JSON.parse(rawData) as Record<string, unknown>;
-              } catch {
-                console.warn(
-                  `Warning: --data is not valid JSON — event will be emitted without data payload: ${rawData}`
-                );
-              }
-            }
-            await workflowEventEmitCommand(runId, eventType, eventData);
-            break;
-          }
-
-          case 'install': {
-            const installSlug = positionals[2];
-            if (!installSlug) {
-              console.error('Usage: archon workflow install <slug> [--force]');
-              return 1;
-            }
-            const forceFlag = values.force as boolean | undefined;
-            await workflowInstallCommand(installSlug, effectiveCwd, forceFlag);
-            break;
-          }
-
-          default:
-            if (subcommand === undefined) {
-              console.error('Missing workflow subcommand');
-            } else {
-              console.error(`Unknown workflow subcommand: ${subcommand}`);
-            }
-            console.error(
-              'Available: list, run, status, get, runs, resume, abandon, approve, reject, cleanup, event, search, install'
-            );
-            return 1;
-        }
-        break;
-
-      case 'isolation':
-        switch (subcommand) {
-          case 'list':
-            await isolationListCommand();
-            break;
-
-          case 'cleanup': {
-            // Check for --merged flag in remaining args
-            const mergedFlag = args.includes('--merged') || positionals.includes('--merged');
-            if (mergedFlag) {
-              const includeClosed = args.includes('--include-closed');
-              await isolationCleanupMergedCommand({ includeClosed });
-            } else {
-              const days = parseInt(positionals[2] ?? '7', 10);
-              await isolationCleanupCommand(days);
-            }
-            break;
-          }
-
-          default:
-            if (subcommand === undefined) {
-              console.error('Missing isolation subcommand');
-            } else {
-              console.error(`Unknown isolation subcommand: ${subcommand}`);
-            }
-            console.error('Available: list, cleanup');
-            return 1;
-        }
-        break;
-
-      case 'validate':
-        switch (subcommand) {
-          case 'workflows': {
-            const validateName = positionals[2];
-            return await validateWorkflowsCommand(effectiveCwd, validateName, jsonFlag);
-          }
-
-          case 'commands': {
-            const validateName = positionals[2];
-            return await validateCommandsCommand(effectiveCwd, validateName, jsonFlag);
-          }
-
-          default:
-            if (subcommand === undefined) {
-              console.error('Missing validate target');
-            } else {
-              console.error(`Unknown validate target: ${subcommand}`);
-            }
-            console.error('Available: workflows, commands');
-            return 1;
-        }
-
-      case 'complete': {
-        const branches = positionals.slice(1);
-        if (branches.length === 0) {
-          console.error('Usage: archon complete <branch-name> [branch2 ...]');
-          return 1;
-        }
-        const forceFlag = args.includes('--force');
-        await isolationCompleteCommand(branches, { force: forceFlag, deleteRemote: true });
-        break;
-      }
-
-      case 'continue': {
-        const continueBranch = positionals[1];
-        if (!continueBranch) {
-          console.error('Usage: archon continue <branch> [--workflow <name>] "instruction"');
-          return 1;
-        }
-        const continueMessage = positionals.slice(2).join(' ') || '';
-        const continueWorkflow = values.workflow as string | undefined;
-        const noContextFlag = values['no-context'] as boolean | undefined;
-        await continueCommand(continueBranch, continueMessage, {
-          workflow: continueWorkflow,
-          noContext: noContextFlag,
-        });
-        break;
-      }
-
-      case 'serve': {
-        const servePort = values.port !== undefined ? Number(values.port) : undefined;
-        const downloadOnly = Boolean(values['download-only']);
-        return await serveCommand({ port: servePort, downloadOnly });
-      }
-
-      case 'doctor': {
-        return await doctorCommand(undefined, Boolean(values.full));
-      }
-
-      case 'auth': {
-        switch (subcommand) {
-          case 'github':
-            return await authGithubCommand();
-          default:
-            if (subcommand === undefined) {
-              console.error('Missing auth subcommand');
-            } else {
-              console.error(`Unknown auth subcommand: ${subcommand}`);
-            }
-            console.error('Available: github');
-            return 1;
-        }
-      }
-
-      case 'ai': {
-        switch (subcommand) {
-          case 'key': {
-            const action = positionals[2];
-            if (action !== 'set') {
-              console.error('Usage: archon ai key set <provider>');
-              return 1;
-            }
-            return await aiKeySetCommand(positionals[3]);
-          }
-          case 'list':
-            return await aiListCommand();
-          case 'logout':
-            return await aiLogoutCommand(positionals[2]);
-          case 'login':
-            return await aiLoginCommand(positionals[2]);
-          case 'tier': {
-            const action = positionals[2];
-            const scopeFlag = values.scope as string | undefined;
-            switch (action) {
-              case 'set':
-                return await aiTierSetCommand(
-                  positionals[3],
-                  positionals[4],
-                  positionals[5],
-                  values.effort as string | undefined,
-                  scopeFlag
-                );
-              case 'list':
-                return await aiTierListCommand(jsonFlag);
-              case 'unset':
-                return await aiTierUnsetCommand(positionals[3], scopeFlag);
-              default:
-                console.error(
-                  'Usage: archon ai tier set <small|medium|large> <provider> <model> [--effort <e>] [--scope user|install] | tier list [--json] | tier unset <tier> [--scope user|install]'
-                );
-                return 1;
-            }
-          }
-          case 'alias': {
-            const action = positionals[2];
-            const scopeFlag = values.scope as string | undefined;
-            switch (action) {
-              case 'set':
-                return await aiAliasSetCommand(
-                  positionals[3],
-                  positionals[4],
-                  positionals[5],
-                  values.effort as string | undefined,
-                  scopeFlag
-                );
-              case 'list':
-                return await aiAliasListCommand(jsonFlag);
-              case 'unset':
-                return await aiAliasUnsetCommand(positionals[3], scopeFlag);
-              default:
-                console.error(
-                  'Usage: archon ai alias set <@name> <provider> <model> [--effort <e>] [--scope user|install] | alias list [--json] | alias unset <@name> [--scope user|install]'
-                );
-                return 1;
-            }
-          }
-          case 'default':
-            return await aiDefaultCommand(
-              positionals[2],
-              positionals[3],
-              values.scope as string | undefined
-            );
-          default:
-            if (subcommand === undefined) {
-              console.error('Missing ai subcommand');
-            } else {
-              console.error(`Unknown ai subcommand: ${subcommand}`);
-            }
-            console.error(
-              'Available: key set <provider>, login <provider>, list, logout <provider>, tier set|list|unset, alias set|list|unset, default <provider> [<model>]'
-            );
-            return 1;
-        }
-      }
-
-      case 'telemetry': {
-        switch (subcommand) {
-          case 'status':
-            return telemetryStatusCommand();
-          case 'reset':
-            return telemetryResetCommand();
-          default:
-            if (subcommand === undefined) {
-              console.error('Missing telemetry subcommand');
-            } else {
-              console.error(`Unknown telemetry subcommand: ${subcommand}`);
-            }
-            console.error('Available: status, reset');
-            return 1;
-        }
-      }
-
-      case 'skill': {
-        switch (subcommand) {
-          case 'install': {
-            // Optional positional path; otherwise install into the resolved cwd.
-            const targetArg = positionals[2];
-            const targetPath = targetArg ? resolve(targetArg) : cwd;
-            return await skillInstallCommand(targetPath);
-          }
-
-          default:
-            if (subcommand === undefined) {
-              console.error('Missing skill subcommand');
-            } else {
-              console.error(`Unknown skill subcommand: ${subcommand}`);
-            }
-            console.error('Available: install');
-            return 1;
-        }
-      }
-
-      default:
-        if (command === undefined) {
-          console.error('Missing command');
-        } else {
-          console.error(`Unknown command: ${command}`);
-        }
-        printUsage();
-        return 1;
-    }
-    await printUpdateNotice(values.quiet as boolean | undefined);
+    await workflowSearchCommand(context.positionals[2], context.values.json as boolean | undefined);
     return 0;
   } catch (error) {
     const err = error as Error;
     console.error(`Error: ${err.message}`);
-    if (process.env.DEBUG) {
-      console.error(err.stack);
-    }
     return 1;
-  } finally {
-    // Flush queued telemetry events before the CLI process exits.
-    // Short-lived CLI commands lose buffered events if shutdown() is skipped.
-    await shutdownTelemetry();
-    // Always close database connection
-    await closeDb();
   }
+}
+
+async function resolveEffectiveCwd(context: CliContext): Promise<string> {
+  if (!requiresGitRepo(context.command)) return context.cwd;
+  if (!existsSync(context.cwd)) {
+    throw new CliUsageError(`Error: Directory does not exist: ${context.cwd}`);
+  }
+
+  const repoRoot = await git.findRepoRoot(context.cwd);
+  if (repoRoot) return repoRoot;
+  return resolveNonGitCwd(context);
+}
+
+function requiresGitRepo(command: string | undefined): boolean {
+  return !NO_GIT_COMMANDS.includes(command ?? '');
+}
+
+class CliUsageError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'CliUsageError';
+  }
+}
+
+async function resolveNonGitCwd(context: CliContext): Promise<string> {
+  const realCwd = realpathIfPossible(context.cwd);
+  const { folderCodebase, gateLookupError } = await lookupFolderCodebaseForGate(realCwd);
+  if (folderCodebase?.kind === 'folder') return folderCodebase.default_cwd;
+  if (context.values.folder && context.command === 'workflow' && context.subcommand === 'run')
+    return realCwd;
+  if (gateLookupError && looksLikeConnectionError(gateLookupError)) {
+    throw new CliUsageError(
+      [
+        'Error: Could not verify project registration — the database is unavailable.',
+        `  ${gateLookupError.message}`,
+        '  Check that your database is running (or DATABASE_URL is set), then retry.',
+      ].join('\n')
+    );
+  }
+  throw new CliUsageError(
+    [
+      'Error: Not in a git repository.',
+      'The Archon CLI must be run from within a git repository.',
+      'Either navigate to a git repo or use --cwd to specify one.',
+      'Or register this folder as a project: run with --folder, or use /register-project in chat.',
+    ].join('\n')
+  );
+}
+
+function realpathIfPossible(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return path;
+  }
+}
+
+async function lookupFolderCodebaseForGate(cwd: string): Promise<{
+  folderCodebase: { default_cwd: string; kind: 'repo' | 'folder' } | null;
+  gateLookupError: Error | null;
+}> {
+  try {
+    const codebaseDb = await import('@archon/core/db/codebases');
+    const folderCodebase =
+      (await codebaseDb.findCodebaseByDefaultCwd(cwd)) ??
+      (await codebaseDb.findCodebaseByPathPrefix(cwd));
+    return { folderCodebase, gateLookupError: null };
+  } catch (dbError) {
+    const gateLookupError = dbError as Error;
+    getLog().warn({ err: gateLookupError, cwd }, 'cli.folder_project_gate_lookup_failed');
+    return { folderCodebase: null, gateLookupError };
+  }
+}
+
+function looksLikeConnectionError(e: Error): boolean {
+  const m = e.message.toLowerCase();
+  return m.includes('econnrefused') || m.includes('etimedout') || m.includes('connect');
+}
+
+function shouldPrintUpdateNotice(context: CliContext, result: number): boolean {
+  if (result !== 0) return false;
+  switch (context.command) {
+    case 'version':
+    case 'help':
+    case 'chat':
+    case 'setup':
+    case 'isolation':
+    case 'complete':
+    case 'continue':
+      return true;
+    case 'workflow':
+      return context.subcommand !== 'get';
+    default:
+      return false;
+  }
+}
+
+async function dispatchCliCommand(context: CliContext): Promise<number> {
+  switch (context.command) {
+    case 'version':
+      await versionCommand();
+      return 0;
+    case 'help':
+      printUsage();
+      return 0;
+    case 'chat':
+      return runChatCommand(context);
+    case 'setup':
+      return runSetupCommand(context);
+    case 'workflow':
+      return runWorkflowCommand(context);
+    case 'isolation':
+      return runIsolationCommand(context);
+    case 'validate':
+      return runValidateCommand(context);
+    case 'complete':
+      return runCompleteCommand(context);
+    case 'continue':
+      return runContinueCommand(context);
+    case 'serve':
+      return serveCommand({
+        port: context.values.port !== undefined ? Number(context.values.port) : undefined,
+        downloadOnly: Boolean(context.values['download-only']),
+      });
+    case 'doctor':
+      return doctorCommand(undefined, Boolean(context.values.full));
+    case 'auth':
+      return runAuthCommand(context);
+    case 'ai':
+      return runAiCommand(context);
+    case 'telemetry':
+      return runTelemetryCommand(context);
+    case 'skill':
+      return runSkillCommand(context);
+    default:
+      printUnknownCommand(context.command);
+      return 1;
+  }
+}
+
+async function runChatCommand(context: CliContext): Promise<number> {
+  const chatMessage = context.positionals.slice(1).join(' ');
+  if (!chatMessage) return printUsageError('Usage: archon chat <message>');
+  await chatCommand(chatMessage);
+  return 0;
+}
+
+async function runSetupCommand(context: CliContext): Promise<number> {
+  const rawScope = context.values.scope as string | undefined;
+  if (rawScope !== undefined && rawScope !== 'home' && rawScope !== 'project') {
+    return printUsageError(`Error: Invalid --scope: "${rawScope}". Must be "home" or "project".`);
+  }
+  const scope: 'home' | 'project' = rawScope ?? 'home';
+  const repoPath = await resolveSetupRepoPath(scope, context.cwd);
+  await setupCommand({
+    spawn: context.values.spawn as boolean | undefined,
+    repoPath,
+    scope,
+    force: (context.values.force as boolean | undefined) ?? false,
+  });
+  return 0;
+}
+
+async function resolveSetupRepoPath(scope: 'home' | 'project', cwd: string): Promise<string> {
+  if (scope === 'home') return cwd;
+  const repoRoot = await git.findRepoRoot(cwd);
+  if (repoRoot) return repoRoot;
+  throw new CliUsageError(
+    [
+      'Error: --scope project requires running from inside a git repository.',
+      'Run from the repo root, pass --cwd <repo>, or use --scope home.',
+    ].join('\n')
+  );
+}
+
+async function runWorkflowCommand(context: CliContext): Promise<number> {
+  switch (context.subcommand) {
+    case 'list':
+      await workflowListCommand(context.effectiveCwd, context.values.json as boolean | undefined);
+      return 0;
+    case 'run':
+      return runWorkflowRunSubcommand(context);
+    case 'status':
+      await workflowStatusCommand(
+        jsonFlag(context),
+        verboseFlag(context),
+        context.values.events as boolean | undefined
+      );
+      return 0;
+    case 'get':
+      return runWorkflowGetSubcommand(context);
+    case 'runs':
+      return runWorkflowRunsSubcommand(context);
+    case 'resume':
+      return runWorkflowIdCommand(context, 'resume');
+    case 'abandon':
+      return runWorkflowIdCommand(context, 'abandon');
+    case 'approve':
+      return runWorkflowApproveSubcommand(context);
+    case 'reject':
+      return runWorkflowRejectSubcommand(context);
+    case 'cleanup':
+      return runWorkflowCleanupSubcommand(context);
+    case 'reset-sessions':
+      return runWorkflowResetSessionsSubcommand(context);
+    case 'event':
+      return runWorkflowEventSubcommand(context);
+    case 'install':
+      return runWorkflowInstallSubcommand(context);
+    default:
+      printUnknownWorkflowSubcommand(context.subcommand);
+      return 1;
+  }
+}
+
+async function runWorkflowRunSubcommand(context: CliContext): Promise<number> {
+  const workflowName = context.positionals[2];
+  if (!workflowName) return printUsageError('Usage: archon workflow run <name> [message]');
+  const invalid = validateWorkflowRunCliFlags(context);
+  if (invalid !== undefined) return invalid;
+  await workflowRunCommand(
+    context.effectiveCwd,
+    workflowName,
+    context.positionals.slice(3).join(' ') || '',
+    {
+      branchName: context.values.branch as string | undefined,
+      fromBranch:
+        (context.values.from as string | undefined) ??
+        (context.values['from-branch'] as string | undefined),
+      baseBranch: context.values.base as string | undefined,
+      noWorktree: context.values['no-worktree'] as boolean | undefined,
+      folder: context.values.folder as boolean | undefined,
+      container: context.values.container as boolean | undefined,
+      resume: context.values.resume as boolean | undefined,
+      quiet: context.values.quiet as boolean | undefined,
+      verbose: verboseFlag(context),
+      conversationId: context.values['conversation-id'] as string | undefined,
+      detach: context.values.detach as boolean | undefined,
+      json: jsonFlag(context),
+    }
+  );
+  return 0;
+}
+
+function validateWorkflowRunCliFlags(context: CliContext): number | undefined {
+  const branchName = context.values.branch as string | undefined;
+  const fromBranch =
+    (context.values.from as string | undefined) ??
+    (context.values['from-branch'] as string | undefined);
+  const baseBranch = context.values.base as string | undefined;
+  const noWorktree = context.values['no-worktree'] as boolean | undefined;
+  if (branchName !== undefined && noWorktree) {
+    return printUsageError(
+      'Error: --branch and --no-worktree are mutually exclusive.\n' +
+        '  --branch creates an isolated worktree (safe).\n' +
+        '  --no-worktree runs directly in your repo (no isolation).\n' +
+        'Use one or the other.'
+    );
+  }
+  if (noWorktree && fromBranch !== undefined) {
+    return printUsageError(
+      'Error: --from/--from-branch has no effect with --no-worktree.\nRemove --from or drop --no-worktree.'
+    );
+  }
+  if (noWorktree && baseBranch !== undefined) {
+    return printUsageError(
+      'Error: --base has no effect with --no-worktree.\nRemove --base or drop --no-worktree.'
+    );
+  }
+  if (context.values.resume && branchName !== undefined) {
+    return printUsageError(
+      'Error: --resume and --branch are mutually exclusive.\n' +
+        '  --resume reuses the existing worktree from the failed run.\n' +
+        '  Remove --branch when using --resume.'
+    );
+  }
+  return undefined;
+}
+
+async function runWorkflowGetSubcommand(context: CliContext): Promise<number> {
+  const runId = context.positionals[2];
+  if (!runId)
+    return printUsageError('Usage: archon workflow get <run-id> [--json] [--verbose] [--events]');
+  return workflowGetCommand(
+    runId,
+    jsonFlag(context),
+    verboseFlag(context),
+    context.effectiveCwd,
+    context.values.events as boolean | undefined
+  );
+}
+
+async function runWorkflowRunsSubcommand(context: CliContext): Promise<number> {
+  const limit = parseWorkflowRunsLimit(context.values.limit as string | undefined);
+  if (limit === 'invalid') return 1;
+  await workflowRunsCommand(context.effectiveCwd, {
+    json: jsonFlag(context),
+    all: context.values.all as boolean | undefined,
+    status: context.values.status as string | undefined,
+    limit,
+  });
+  return 0;
+}
+
+function parseWorkflowRunsLimit(rawLimit: string | undefined): number | undefined | 'invalid' {
+  if (rawLimit === undefined) return undefined;
+  const limit = Number(rawLimit);
+  if (Number.isInteger(limit) && limit >= 1) return limit;
+  console.error(`Error: --limit must be a positive integer, got '${rawLimit}'.`);
+  return 'invalid';
+}
+
+async function runWorkflowIdCommand(
+  context: CliContext,
+  action: 'resume' | 'abandon'
+): Promise<number> {
+  const runId = context.positionals[2];
+  if (!runId) return printUsageError(`Usage: archon workflow ${action} <run-id>`);
+  if (action === 'resume')
+    await workflowResumeCommand(runId, jsonFlag(context), context.effectiveCwd);
+  else await workflowAbandonCommand(runId, jsonFlag(context), context.effectiveCwd);
+  return 0;
+}
+
+async function runWorkflowApproveSubcommand(context: CliContext): Promise<number> {
+  const runId = context.positionals[2];
+  if (!runId) return printUsageError('Usage: archon workflow approve <run-id> [comment]');
+  const rawComment =
+    (context.values.comment as string | undefined) || context.positionals.slice(3).join(' ');
+  await workflowApproveCommand(
+    runId,
+    rawComment.length > 0 ? rawComment : undefined,
+    jsonFlag(context),
+    context.effectiveCwd
+  );
+  return 0;
+}
+
+async function runWorkflowRejectSubcommand(context: CliContext): Promise<number> {
+  const runId = context.positionals[2];
+  if (!runId) return printUsageError('Usage: archon workflow reject <run-id> [reason]');
+  const rawReason =
+    (context.values.reason as string | undefined) || context.positionals.slice(3).join(' ');
+  await workflowRejectCommand(
+    runId,
+    rawReason.length > 0 ? rawReason : undefined,
+    jsonFlag(context),
+    context.effectiveCwd
+  );
+  return 0;
+}
+
+async function runWorkflowCleanupSubcommand(context: CliContext): Promise<number> {
+  const days = context.positionals[2] ? Number(context.positionals[2]) : 7;
+  if (Number.isNaN(days) || days < 0) {
+    console.error('Usage: archon workflow cleanup [days]');
+    console.error('  days: delete terminal runs older than N days (default: 7)');
+    return 1;
+  }
+  await workflowCleanupCommand(days);
+  return 0;
+}
+
+async function runWorkflowResetSessionsSubcommand(context: CliContext): Promise<number> {
+  const workflowName = context.positionals[2];
+  const extras = context.positionals.slice(3);
+  if (!workflowName) return printWorkflowResetSessionsUsage();
+  if (extras.length > 0) return printWorkflowResetSessionsExtraArgs(extras);
+  await workflowResetSessionsCommand(workflowName, {
+    scope: context.values.scope as string | undefined,
+    node: context.values.node as string | undefined,
+    yes: context.values.yes as boolean | undefined,
+    json: jsonFlag(context),
+  });
+  return 0;
+}
+
+function printWorkflowResetSessionsUsage(): number {
+  console.error(
+    'Usage: archon workflow reset-sessions <workflow-name> [--scope <key>] [--node <id>] [--yes] [--json]'
+  );
+  console.error(
+    '  Without --scope: deletes persisted sessions across ALL scopes (requires --yes).'
+  );
+  return 1;
+}
+
+function printWorkflowResetSessionsExtraArgs(extras: string[]): number {
+  console.error(
+    'Usage: archon workflow reset-sessions <workflow-name> [--scope <key>] [--node <id>] [--yes] [--json]'
+  );
+  console.error(
+    `Error: unexpected positional argument(s): ${extras.join(' ')}. Use --node <id> to filter by node.`
+  );
+  return 1;
+}
+
+async function runWorkflowEventSubcommand(context: CliContext): Promise<number> {
+  const action = context.positionals[2];
+  if (action !== 'emit') return printWorkflowEventActionError(action);
+  const runId = context.values['run-id'] as string | undefined;
+  const eventType = context.values.type as string | undefined;
+  if (!runId) return printWorkflowEventRequiredError('--run-id');
+  if (!eventType) return printWorkflowEventRequiredError('--type');
+  if (!isValidEventType(eventType)) {
+    console.error(`Error: unknown event type: ${eventType}`);
+    console.error(`Valid types: ${WORKFLOW_EVENT_TYPES.join(', ')}`);
+    return 1;
+  }
+  await workflowEventEmitCommand(
+    runId,
+    eventType,
+    parseWorkflowEventData(context.values.data as string | undefined)
+  );
+  return 0;
+}
+
+function printWorkflowEventActionError(action: string | undefined): number {
+  console.error(
+    action === undefined
+      ? 'Missing workflow event subcommand'
+      : `Unknown workflow event subcommand: ${action}`
+  );
+  console.error('Available: emit');
+  return 1;
+}
+
+function printWorkflowEventRequiredError(flag: '--run-id' | '--type'): number {
+  console.error('Usage: archon workflow event emit --run-id <uuid> --type <event-type>');
+  console.error(`Error: ${flag} is required`);
+  return 1;
+}
+
+function parseWorkflowEventData(rawData: string | undefined): Record<string, unknown> | undefined {
+  if (!rawData) return undefined;
+  try {
+    return JSON.parse(rawData) as Record<string, unknown>;
+  } catch {
+    console.warn(
+      `Warning: --data is not valid JSON — event will be emitted without data payload: ${rawData}`
+    );
+    return undefined;
+  }
+}
+
+async function runWorkflowInstallSubcommand(context: CliContext): Promise<number> {
+  const slug = context.positionals[2];
+  if (!slug) return printUsageError('Usage: archon workflow install <slug> [--force]');
+  await workflowInstallCommand(
+    slug,
+    context.effectiveCwd,
+    context.values.force as boolean | undefined
+  );
+  return 0;
+}
+
+async function runIsolationCommand(context: CliContext): Promise<number> {
+  switch (context.subcommand) {
+    case 'list':
+      await isolationListCommand();
+      return 0;
+    case 'cleanup':
+      await runIsolationCleanup(context);
+      return 0;
+    default:
+      console.error(
+        context.subcommand === undefined
+          ? 'Missing isolation subcommand'
+          : `Unknown isolation subcommand: ${context.subcommand}`
+      );
+      console.error('Available: list, cleanup');
+      return 1;
+  }
+}
+
+async function runIsolationCleanup(context: CliContext): Promise<void> {
+  const mergedFlag = context.args.includes('--merged') || context.positionals.includes('--merged');
+  if (mergedFlag)
+    await isolationCleanupMergedCommand({
+      includeClosed: context.args.includes('--include-closed'),
+    });
+  else await isolationCleanupCommand(parseInt(context.positionals[2] ?? '7', 10));
+}
+
+async function runValidateCommand(context: CliContext): Promise<number> {
+  switch (context.subcommand) {
+    case 'workflows':
+      return validateWorkflowsCommand(
+        context.effectiveCwd,
+        context.positionals[2],
+        jsonFlag(context)
+      );
+    case 'commands':
+      return validateCommandsCommand(
+        context.effectiveCwd,
+        context.positionals[2],
+        jsonFlag(context)
+      );
+    default:
+      console.error(
+        context.subcommand === undefined
+          ? 'Missing validate target'
+          : `Unknown validate target: ${context.subcommand}`
+      );
+      console.error('Available: workflows, commands');
+      return 1;
+  }
+}
+
+async function runCompleteCommand(context: CliContext): Promise<number> {
+  const branches = context.positionals.slice(1);
+  if (branches.length === 0)
+    return printUsageError('Usage: archon complete <branch-name> [branch2 ...]');
+  await isolationCompleteCommand(branches, {
+    force: context.args.includes('--force'),
+    deleteRemote: true,
+  });
+  return 0;
+}
+
+async function runContinueCommand(context: CliContext): Promise<number> {
+  const branch = context.positionals[1];
+  if (!branch)
+    return printUsageError('Usage: archon continue <branch> [--workflow <name>] "instruction"');
+  await continueCommand(branch, context.positionals.slice(2).join(' ') || '', {
+    workflow: context.values.workflow as string | undefined,
+    noContext: context.values['no-context'] as boolean | undefined,
+  });
+  return 0;
+}
+
+async function runAuthCommand(context: CliContext): Promise<number> {
+  if (context.subcommand === 'github') return authGithubCommand();
+  console.error(
+    context.subcommand === undefined
+      ? 'Missing auth subcommand'
+      : `Unknown auth subcommand: ${context.subcommand}`
+  );
+  console.error('Available: github');
+  return 1;
+}
+
+async function runAiCommand(context: CliContext): Promise<number> {
+  switch (context.subcommand) {
+    case 'key':
+      return runAiKeyCommand(context);
+    case 'list':
+      return aiListCommand();
+    case 'logout':
+      return aiLogoutCommand(context.positionals[2]);
+    case 'login':
+      return aiLoginCommand(context.positionals[2]);
+    case 'tier':
+      return runAiTierCommand(context);
+    case 'alias':
+      return runAiAliasCommand(context);
+    case 'default':
+      return aiDefaultCommand(
+        context.positionals[2],
+        context.positionals[3],
+        context.values.scope as string | undefined
+      );
+    default:
+      console.error(
+        context.subcommand === undefined
+          ? 'Missing ai subcommand'
+          : `Unknown ai subcommand: ${context.subcommand}`
+      );
+      console.error(
+        'Available: key set <provider>, login <provider>, list, logout <provider>, tier set|list|unset, alias set|list|unset, default <provider> [<model>]'
+      );
+      return 1;
+  }
+}
+
+async function runAiKeyCommand(context: CliContext): Promise<number> {
+  if (context.positionals[2] !== 'set')
+    return printUsageError('Usage: archon ai key set <provider>');
+  return aiKeySetCommand(context.positionals[3]);
+}
+
+async function runAiTierCommand(context: CliContext): Promise<number> {
+  const scopeFlag = context.values.scope as string | undefined;
+  switch (context.positionals[2]) {
+    case 'set':
+      return aiTierSetCommand(
+        context.positionals[3],
+        context.positionals[4],
+        context.positionals[5],
+        context.values.effort as string | undefined,
+        scopeFlag
+      );
+    case 'list':
+      return aiTierListCommand(jsonFlag(context));
+    case 'unset':
+      return aiTierUnsetCommand(context.positionals[3], scopeFlag);
+    default:
+      return printUsageError(
+        'Usage: archon ai tier set <small|medium|large> <provider> <model> [--effort <e>] [--scope user|install] | tier list [--json] | tier unset <tier> [--scope user|install]'
+      );
+  }
+}
+
+async function runAiAliasCommand(context: CliContext): Promise<number> {
+  const scopeFlag = context.values.scope as string | undefined;
+  switch (context.positionals[2]) {
+    case 'set':
+      return aiAliasSetCommand(
+        context.positionals[3],
+        context.positionals[4],
+        context.positionals[5],
+        context.values.effort as string | undefined,
+        scopeFlag
+      );
+    case 'list':
+      return aiAliasListCommand(jsonFlag(context));
+    case 'unset':
+      return aiAliasUnsetCommand(context.positionals[3], scopeFlag);
+    default:
+      return printUsageError(
+        'Usage: archon ai alias set <@name> <provider> <model> [--effort <e>] [--scope user|install] | alias list [--json] | alias unset <@name> [--scope user|install]'
+      );
+  }
+}
+
+async function runTelemetryCommand(context: CliContext): Promise<number> {
+  switch (context.subcommand) {
+    case 'status':
+      return telemetryStatusCommand();
+    case 'reset':
+      return telemetryResetCommand();
+    default:
+      console.error(
+        context.subcommand === undefined
+          ? 'Missing telemetry subcommand'
+          : `Unknown telemetry subcommand: ${context.subcommand}`
+      );
+      console.error('Available: status, reset');
+      return 1;
+  }
+}
+
+async function runSkillCommand(context: CliContext): Promise<number> {
+  if (context.subcommand !== 'install') {
+    console.error(
+      context.subcommand === undefined
+        ? 'Missing skill subcommand'
+        : `Unknown skill subcommand: ${context.subcommand}`
+    );
+    console.error('Available: install');
+    return 1;
+  }
+  const targetArg = context.positionals[2];
+  return skillInstallCommand(targetArg ? resolve(targetArg) : context.cwd);
+}
+
+function jsonFlag(context: CliContext): boolean | undefined {
+  return context.values.json as boolean | undefined;
+}
+
+function verboseFlag(context: CliContext): boolean | undefined {
+  return context.values.verbose as boolean | undefined;
+}
+
+function printUsageError(message: string): number {
+  console.error(message);
+  return 1;
+}
+
+function printUnknownWorkflowSubcommand(subcommand: string | undefined): void {
+  console.error(
+    subcommand === undefined
+      ? 'Missing workflow subcommand'
+      : `Unknown workflow subcommand: ${subcommand}`
+  );
+  console.error(
+    'Available: list, run, status, get, runs, resume, abandon, approve, reject, cleanup, event, search, install'
+  );
+}
+
+function printUnknownCommand(command: string | undefined): void {
+  if (command === undefined) console.error('Missing command');
+  else console.error(`Unknown command: ${command}`);
+  printUsage();
+}
+
+function printCliError(err: Error): void {
+  if (err instanceof CliUsageError) console.error(err.message);
+  else console.error(`Error: ${err.message}`);
+  if (process.env.DEBUG) console.error(err.stack);
 }
 
 // Exit explicitly so a lingering handle (DB pool, spawned child, timer) can

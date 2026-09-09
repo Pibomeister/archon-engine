@@ -194,67 +194,74 @@ async function reportNoop(message: string, stateRoot: string): Promise<void> {
   console.log(`Marked ${join(stateRoot, '.initialized')}`);
 }
 
-async function main(): Promise<void> {
-  // The cwd must exist before anything else: `--cwd /typo` otherwise resolves to
-  // the _cwd fallback, finds no legacy state, and reports a confident success
-  // while marking a project directory nobody asked for.
+async function assertDirectoryExists(cwd: string): Promise<void> {
   try {
-    if (!(await stat(CWD)).isDirectory()) {
-      console.error(`Not a directory: ${CWD}`);
+    if (!(await stat(cwd)).isDirectory()) {
+      console.error(`Not a directory: ${cwd}`);
       process.exit(1);
     }
   } catch {
-    console.error(`Directory does not exist: ${CWD}`);
+    console.error(`Directory does not exist: ${cwd}`);
     console.error('Pass an existing project directory with --cwd, or omit it to use the cwd.');
     process.exit(1);
   }
+}
 
-  const { key, anchor, climbed } = await resolveTarget(CWD);
-  const legacyDir = join(anchor, '.archon', 'state');
-  const { stateRoot } = getProjectStoragePaths(key);
-
+function printTarget(
+  anchor: string,
+  cwd: string,
+  climbed: boolean,
+  legacyDir: string,
+  stateRoot: string
+): void {
   console.log(`Project:     ${anchor}`);
   if (climbed) {
-    console.log(`             (invoked from ${CWD}; resolved to the registered project root)`);
+    console.log(`             (invoked from ${cwd}; resolved to the registered project root)`);
   }
   console.log(`Legacy dir:  ${legacyDir}`);
   console.log(`$STATE_DIR:  ${stateRoot}`);
   console.log('');
+}
 
-  // Climbing means the invocation cwd is NOT where we read from. If that cwd has
-  // its own legacy state, migrating the project's and marking would leave the
-  // subdirectory's unmigrated behind a satisfied marker — C5 all over again, one
-  // level down. Ambiguous input gets a refusal, not a guess.
-  if (climbed && (await hasEntries(join(CWD, '.archon', 'state')))) {
-    console.error('Refusing to migrate — two candidate sources, and only one would be moved:');
-    console.error(`  ${join(CWD, '.archon', 'state')}   (the directory you invoked from)`);
-    console.error(`  ${legacyDir}   (the registered project root)`);
-    console.error('');
-    console.error('Re-run with --cwd pointing at exactly the one you mean.');
-    process.exit(2);
-  }
+async function refuseAmbiguousSources(
+  cwd: string,
+  legacyDir: string,
+  climbed: boolean
+): Promise<void> {
+  if (!climbed || !(await hasEntries(join(cwd, '.archon', 'state')))) return;
+  console.error('Refusing to migrate — two candidate sources, and only one would be moved:');
+  console.error(`  ${join(cwd, '.archon', 'state')}   (the directory you invoked from)`);
+  console.error(`  ${legacyDir}   (the registered project root)`);
+  console.error('');
+  console.error('Re-run with --cwd pointing at exactly the one you mean.');
+  process.exit(2);
+}
 
-  let entries: string[];
+async function readLegacyEntries(
+  legacyDir: string,
+  stateRoot: string
+): Promise<string[] | undefined> {
   try {
-    entries = await readdir(legacyDir);
+    const entries = await readdir(legacyDir);
+    if (entries.length === 0) {
+      await reportNoop('Nothing to migrate — legacy .archon/state/ is empty.', stateRoot);
+      return undefined;
+    }
+    return entries;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
       await reportNoop('Nothing to migrate — no legacy .archon/state/ directory.', stateRoot);
-      return;
+      return undefined;
     }
     throw error;
   }
-  if (entries.length === 0) {
-    await reportNoop('Nothing to migrate — legacy .archon/state/ is empty.', stateRoot);
-    return;
-  }
+}
 
-  // Pre-flight: decide the ENTIRE migration before moving a single byte, so
-  // every refusal leaves the source untouched and no partial move can be
-  // reported as success. Two blocking conditions, reported together:
-  //   - a destination file already exists (never clobber)
-  //   - a nested directory (state files are flat JSON; recursing or flattening
-  //     would be a guess, and skipping it would leave state behind)
+async function findMigrationBlockers(
+  entries: string[],
+  legacyDir: string,
+  stateRoot: string
+): Promise<{ conflicts: string[]; directories: string[] }> {
   const conflicts: string[] = [];
   const directories: string[] = [];
   for (const name of entries) {
@@ -262,35 +269,47 @@ async function main(): Promise<void> {
     const info = await stat(join(legacyDir, name));
     if (info.isDirectory()) directories.push(name);
   }
+  return { conflicts, directories };
+}
 
-  if (conflicts.length > 0 || directories.length > 0) {
-    console.error('Refusing to migrate — nothing was moved.');
-    if (conflicts.length > 0) {
-      console.error('');
-      console.error('Already present in $STATE_DIR (resolve by hand, keep the newer copy):');
-      for (const name of conflicts) console.error(`  ${join(stateRoot, name)}`);
-    }
-    if (directories.length > 0) {
-      console.error('');
-      console.error('Nested directories (move these by hand, then re-run):');
-      for (const name of directories) console.error(`  ${join(legacyDir, name)}`);
-    }
+function refuseBlockers(
+  conflicts: string[],
+  directories: string[],
+  legacyDir: string,
+  stateRoot: string
+): void {
+  if (conflicts.length === 0 && directories.length === 0) return;
+  console.error('Refusing to migrate — nothing was moved.');
+  if (conflicts.length > 0) {
     console.error('');
-    console.error('$STATE_DIR was NOT marked initialized — re-run after resolving.');
-    process.exit(2);
+    console.error('Already present in $STATE_DIR (resolve by hand, keep the newer copy):');
+    for (const name of conflicts) console.error(`  ${join(stateRoot, name)}`);
   }
-
-  if (!APPLY) {
-    for (const name of entries) {
-      console.log(`would move  ${name}`);
-    }
-    console.log('');
-    console.log(
-      `Dry run — nothing was moved. Re-run with --apply to migrate ${plural(entries.length)}.`
-    );
-    return;
+  if (directories.length > 0) {
+    console.error('');
+    console.error('Nested directories (move these by hand, then re-run):');
+    for (const name of directories) console.error(`  ${join(legacyDir, name)}`);
   }
+  console.error('');
+  console.error('$STATE_DIR was NOT marked initialized — re-run after resolving.');
+  process.exit(2);
+}
 
+function printDryRun(entries: string[]): void {
+  for (const name of entries) {
+    console.log(`would move  ${name}`);
+  }
+  console.log('');
+  console.log(
+    `Dry run — nothing was moved. Re-run with --apply to migrate ${plural(entries.length)}.`
+  );
+}
+
+async function moveEntries(
+  entries: string[],
+  legacyDir: string,
+  stateRoot: string
+): Promise<number> {
   await mkdir(stateRoot, { recursive: true });
   let moved = 0;
   for (const name of entries) {
@@ -302,6 +321,44 @@ async function main(): Promise<void> {
     // already claimed entries it never got to.
     console.log(`moved  ${name}`);
   }
+  return moved;
+}
+
+async function main(): Promise<void> {
+  // The cwd must exist before anything else: `--cwd /typo` otherwise resolves to
+  // the _cwd fallback, finds no legacy state, and reports a confident success
+  // while marking a project directory nobody asked for.
+  await assertDirectoryExists(CWD);
+
+  const { key, anchor, climbed } = await resolveTarget(CWD);
+  const legacyDir = join(anchor, '.archon', 'state');
+  const { stateRoot } = getProjectStoragePaths(key);
+  printTarget(anchor, CWD, climbed, legacyDir, stateRoot);
+
+  // Climbing means the invocation cwd is NOT where we read from. If that cwd has
+  // its own legacy state, migrating the project's and marking would leave the
+  // subdirectory's unmigrated behind a satisfied marker — C5 all over again, one
+  // level down. Ambiguous input gets a refusal, not a guess.
+  await refuseAmbiguousSources(CWD, legacyDir, climbed);
+
+  const entries = await readLegacyEntries(legacyDir, stateRoot);
+  if (!entries) return;
+
+  // Pre-flight: decide the ENTIRE migration before moving a single byte, so
+  // every refusal leaves the source untouched and no partial move can be
+  // reported as success. Two blocking conditions, reported together:
+  //   - a destination file already exists (never clobber)
+  //   - a nested directory (state files are flat JSON; recursing or flattening
+  //     would be a guess, and skipping it would leave state behind)
+  const { conflicts, directories } = await findMigrationBlockers(entries, legacyDir, stateRoot);
+  refuseBlockers(conflicts, directories, legacyDir, stateRoot);
+
+  if (!APPLY) {
+    printDryRun(entries);
+    return;
+  }
+
+  const moved = await moveEntries(entries, legacyDir, stateRoot);
 
   // Every entry moved (the pre-flight guarantees no skips), so the destination
   // is now the complete state — safe to mark.
