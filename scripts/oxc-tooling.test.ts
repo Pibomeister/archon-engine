@@ -19,7 +19,7 @@ describe('Oxc tooling configuration', () => {
     const config = readLintStagedConfig();
 
     expect(config['*.{ts,tsx}']).toEqual([
-      'oxlint -c .oxlintrc.json --deny-warnings --fix',
+      'oxlint -c .oxlintrc.json --deny-warnings --no-error-on-unmatched-pattern --fix',
       'oxlint -c .oxlintrc.complexity.json --allow correctness --deny complexity --deny-warnings',
       'eslint --fix --max-warnings 0 --no-warn-ignored',
       'oxfmt --config .oxfmtrc.json --ignore-path .oxfmtignore --write',
@@ -74,6 +74,25 @@ describe('Oxc tooling configuration', () => {
       runFail(oxlintBin, complexityArgs(fixtures.complexTest), dir, 'Maximum allowed is 20');
       runOk(oxlintBin, correctnessArgs(fixtures.repaired), dir);
       runOk(oxlintBin, complexityArgs(fixtures.repaired), dir);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('configured correctness hook accepts one ignored test fixture without hiding normal errors', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'archon-oxlint-ignored-test-'));
+    try {
+      writeFileSync(join(dir, '.oxlintrc.json'), readFileSync(oxlintConfig, 'utf8'));
+      writeFileSync(join(dir, 'ignored.test.ts'), "export const fixture = 'ignored';\n");
+      const correctnessHook = readLintStagedConfig()['*.{ts,tsx}'][0].split(' ');
+
+      runFail(
+        oxlintBin,
+        ['-c', '.oxlintrc.json', '--deny-warnings', 'ignored.test.ts'],
+        dir,
+        'No files found to lint'
+      );
+      runOk(oxlintBin, [...correctnessHook.slice(1), 'ignored.test.ts'], dir);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -152,7 +171,7 @@ function createLintFixtures(dir: string): Record<string, string> {
 }
 
 function correctnessArgs(file: string): string[] {
-  return ['-c', oxlintConfig, '--deny-warnings', file];
+  return ['-c', oxlintConfig, '--deny-warnings', '--no-error-on-unmatched-pattern', file];
 }
 
 function complexityArgs(file: string): string[] {
