@@ -33545,7 +33545,7 @@ describe('executeDagWorkflow -- factory human input pause/resume', () => {
   });
 
   afterEach(async () => {
-    await rm(testDir, { recursive: true, force: true });
+    await removeTempTree(testDir);
   });
 
   const workflow = ready({

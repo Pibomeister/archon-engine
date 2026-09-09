@@ -1,6 +1,7 @@
-import { afterAll, afterEach, describe, expect, mock, test } from 'bun:test';
+import { afterAll, describe, expect, mock, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { trackTempRoots } from '@archon/paths/test-utils';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SqliteAdapter } from '@archon/core/db/adapters/sqlite';
@@ -22,7 +23,7 @@ import { resolveWorkflow } from './graph-plan';
 const previousTelemetry = process.env.ARCHON_TELEMETRY_DISABLED;
 process.env.ARCHON_TELEMETRY_DISABLED = '1';
 const db = new SqliteAdapter(':memory:');
-const roots: string[] = [];
+const trackRoot = trackTempRoots();
 mock.module('@archon/core/db/connection', () => ({
   pool: db,
   getDatabase: () => db,
@@ -55,9 +56,6 @@ const operations = await import('@archon/core/operations/workflow-operations');
 const { createWorkflowStore } = await import('@archon/core/workflows/store-adapter');
 const { executeDagWorkflow } = await import('./dag-executor');
 
-afterEach(async () => {
-  for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
-});
 afterAll(async () => {
   await db.close();
   if (previousTelemetry === undefined) delete process.env.ARCHON_TELEMETRY_DISABLED;
@@ -241,7 +239,7 @@ async function resumedFixture(
   occurrence: { iteration?: number; reask?: number }
 ): Promise<Fixture> {
   const root = await mkdtemp(join(tmpdir(), 'archon-factory-native-state-'));
-  roots.push(root);
+  trackRoot(root);
   const conversationId = randomUUID();
   await db.query(
     'INSERT INTO remote_agent_conversations (id, platform_type, platform_conversation_id) VALUES ($1, $2, $3)',
