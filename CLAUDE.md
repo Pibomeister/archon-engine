@@ -132,7 +132,7 @@ These are implementation constraints, not slogans. Apply them by default.
 
 Oxc formatter/linter CLIs require Node.js ^20.19.0 or >=22.12.0 in addition to Bun.
 
-`bun run type-check`, `lint`, `lint:fix`, `lint:complexity` (strict max-20 debt gate), `format`, `format:check`.
+`bun run type-check`, `lint`, `lint:fix`, `lint:complexity` (mandatory max-20 gate in local validation and CI), `format`, `format:check`.
 
 ### Pre-PR Validation
 

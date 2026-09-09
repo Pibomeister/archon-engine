@@ -18,6 +18,7 @@ Before submitting a PR, ensure (requires Bun plus Node.js ^20.19.0 or >=22.12.0 
 
 ```bash
 bun run check:bundled  # Bundled defaults are up to date (see note below)
+bun run lint:complexity # Cyclomatic complexity must not exceed 20
 bun run type-check     # TypeScript types
 bun run lint           # Oxlint + ESLint
 bun run format         # Oxfmt
@@ -32,6 +33,8 @@ bun run validate
 `bun run generate:bundled` to refresh the embedded bundle before committing.
 
 **Important:** Use `bun run test` (not `bun test` from the repo root) to avoid mock pollution across packages.
+
+The max-20 complexity check is mandatory in `bun run validate` and CI on every push and pull request. The staged-file hook also checks whole TypeScript files; clear every violation in a touched file before committing. Do not raise the threshold or suppress the rule. Branch protection is configured separately.
 
 ### Commit Messages
 

@@ -36,7 +36,7 @@
     "build:web": "bun --filter @archon/web build",
     "dev:docs": "bun --filter @archon/docs-web dev",
     "build:docs": "bun --filter @archon/docs-web build",
-    "validate": "bun run check:bundled && bun run check:bundled-skill && bun run check:bundled-schema && bun run check:pi-vendor-map && bun run check:capability-matrix && bun run type-check && bun run lint && bun run format:check && bun run test:install && bun run test",
+    "validate": "bun run check:bundled && bun run check:bundled-skill && bun run check:bundled-schema && bun run check:pi-vendor-map && bun run check:capability-matrix && bun run lint:complexity && bun run type-check && bun run lint && bun run format:check && bun run test:install && bun run test",
     "prepare": "husky",
     "setup-auth": "bun --filter @archon/server setup-auth",
     "lint:eslint": "bun x eslint . --cache --max-warnings 0",
