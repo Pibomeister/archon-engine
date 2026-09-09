@@ -14,13 +14,13 @@ Thank you for your interest in contributing to Archon!
 
 ### Code Quality
 
-Before submitting a PR, ensure:
+Before submitting a PR, ensure (requires Bun plus Node.js ^20.19.0 or >=22.12.0 for the Oxc CLIs):
 
 ```bash
 bun run check:bundled  # Bundled defaults are up to date (see note below)
 bun run type-check     # TypeScript types
-bun run lint           # ESLint
-bun run format         # Prettier
+bun run lint           # Oxlint + ESLint
+bun run format         # Oxfmt
 bun run test           # All tests (per-package isolation)
 
 # Or run the full validation suite:

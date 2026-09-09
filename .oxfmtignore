@@ -46,9 +46,11 @@ CONTRIBUTING.md
 *.yaml
 
 # Hash-pinned seccomp artifacts: preserve reviewed bytes.
-packages/isolation/docker/playwright-seccomp.json
-packages/isolation/docker/playwright-seccomp.no-io-uring.chroot.json
+**/playwright-seccomp.json
+**/playwright-seccomp.no-io-uring.chroot.json
 
 # Generated hardening evidence captures preserve raw bytes/provenance.
-runtime/.omx/hardening*/taskevidence/**/*.json
-.omx/hardening*/taskevidence/**/*.json
+.omx/
+.omx/**
+runtime/.omx/
+runtime/.omx/**

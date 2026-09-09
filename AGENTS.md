@@ -152,10 +152,13 @@ bun test packages/core/src/handlers/command-handler.test.ts  # Single file
 
 ### Type Checking & Linting
 
+Oxc formatter/linter CLIs require Node.js ^20.19.0 or >=22.12.0 in addition to Bun.
+
 ```bash
 bun run type-check
 bun run lint
 bun run lint:fix
+bun run lint:complexity  # strict max-20 debt gate; pre-existing violations are tracked separately
 bun run format
 bun run format:check
 ```
@@ -168,7 +171,7 @@ bun run format:check
 bun run validate
 ```
 
-This runs `check:bundled`, `check:bundled-skill`, `check:bundled-schema`, type-check, lint, format check, and tests. All seven must pass for CI to succeed.
+This runs `check:bundled`, `check:bundled-skill`, `check:bundled-schema`, type-check, Oxlint + ESLint, Oxfmt check, and tests. All gates must pass for CI to succeed.
 
 ### ESLint Guidelines
 

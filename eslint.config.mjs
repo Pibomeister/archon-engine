@@ -1,6 +1,5 @@
 import eslint from '@eslint/js';
 import tseslint from 'typescript-eslint';
-import prettierConfig from 'eslint-config-prettier';
 
 export default tseslint.config(
   // Global ignores (applied to all configs)
@@ -37,9 +36,6 @@ export default tseslint.config(
   ...tseslint.configs.recommendedTypeChecked,
   ...tseslint.configs.strictTypeChecked,
   ...tseslint.configs.stylisticTypeChecked,
-
-  // Prettier integration
-  prettierConfig,
 
   // Project-specific settings
   {

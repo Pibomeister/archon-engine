@@ -26,7 +26,7 @@ USER root
 # RUN gh extension install github/gh-copilot
 
 # Example: install global npm packages
-# RUN npm install -g tsx prettier
+# RUN npm install -g tsx oxfmt
 
 # Example: copy a custom binary into PATH
 # COPY --chown=appuser:appuser ./my-tool /usr/local/bin/my-tool

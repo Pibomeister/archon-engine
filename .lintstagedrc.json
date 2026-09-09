@@ -1,4 +1,9 @@
 {
-  "*.{ts,tsx}": ["eslint --fix --max-warnings 0 --no-warn-ignored", "prettier --write"],
-  "*.{json,md,yaml,yml}": ["prettier --write"]
+  "*.{ts,tsx}": [
+    "oxlint -c .oxlintrc.json --deny-warnings --fix",
+    "oxlint -c .oxlintrc.complexity.json --allow correctness --deny complexity --deny-warnings",
+    "eslint --fix --max-warnings 0 --no-warn-ignored",
+    "oxfmt --config .oxfmtrc.json --ignore-path .oxfmtignore --write"
+  ],
+  "*.{json,md,yaml,yml}": ["oxfmt --config .oxfmtrc.json --ignore-path .oxfmtignore --write"]
 }

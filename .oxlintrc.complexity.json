@@ -1,0 +1,29 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["eslint"],
+  "ignorePatterns": [
+    "node_modules/**",
+    "packages/*/node_modules/**",
+    "packages/*/dist/**",
+    "dist/**",
+    "coverage/**",
+    ".agents/examples/**",
+    "packages/docs-web/**",
+    "workspace/**",
+    "worktrees/**",
+    ".claude/worktrees/**",
+    ".claude/skills/**",
+    ".archon/**",
+    ".omx/**",
+    "runtime/.omx/**",
+    "**/*.generated.ts",
+    "**/*.js",
+    "*.mjs",
+    "*.d.ts",
+    "**/*.generated.d.ts",
+    "packages/web/vite.config.ts",
+    "packages/web/components.json",
+    "packages/web/src/components/ui/**",
+    "packages/web/src/lib/utils.ts"
+  ]
+}
