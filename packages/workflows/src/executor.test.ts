@@ -572,8 +572,13 @@ describe('executeWorkflow', () => {
           }),
         })
       );
-      // Must NOT attempt to resolve output_root for supersession.
-      expect(store.getWorkflowRun).not.toHaveBeenCalledWith(supersededId);
+      // #3064 protects supersession from the output_root GATE: a preflight-failed
+      // parent (`output_root: null`) must not block its successor. The factory
+      // successor-authority check does read that parent's metadata to prove
+      // lineage, but that read is not the gate — it never inspects `output_root`
+      // and never refuses on a null one. So assert the gate is absent (the run
+      // reaches execution) rather than that the parent is never read at all.
+      expect(mockExecuteDagWorkflow).toHaveBeenCalled();
     });
 
     it('starts normally on resume when the superseded run has no output_root', async () => {
