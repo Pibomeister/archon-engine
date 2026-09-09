@@ -29,7 +29,12 @@ describe('factory Codex SDK configuration serialization', () => {
       mkdirSync(join(manual, '.git'), { recursive: true });
       writeFileSync(
         recorder,
-        '#!/bin/sh\nprintf "%s\\n" "$@" > ' + JSON.stringify(capture) + '\nexit 1\n'
+        // Drain stdin before exiting. The SDK writes the prompt into this child, and a
+        // child that exits first closes the pipe out from under that write — EPIPE in
+        // the parent. The race is only lost on Linux; macOS happens to win it.
+        '#!/bin/sh\nprintf "%s\\n" "$@" > ' +
+          JSON.stringify(capture) +
+          '\ncat >/dev/null 2>&1\nexit 1\n'
       );
       chmodSync(recorder, 0o700);
       const overrides = factoryCodexConfigOverrides(
