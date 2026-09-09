@@ -228,6 +228,21 @@ function rewriteNodeOutputRefs(node: DagNode, rename: (id: string) => string): v
  * separate, lower-severity gap tracked on its own). Every model-facing string field must
  * be walked here, whether or not the rewrite walks it.
  */
+function applyInputsToCommonFields(node: DagNode, substitute: (text: string) => string): void {
+  if (node.when !== undefined) node.when = substitute(node.when);
+
+  // Base AI-turn fields — valid on every AI node mode (command / prompt / loop_group), so
+  // they are walked outside the mode chain, like `when:`. Both go straight to the provider
+  // with no substitution of their own downstream.
+  if (node.systemPrompt !== undefined) node.systemPrompt = substitute(node.systemPrompt);
+  if (node.agents !== undefined) {
+    for (const agent of Object.values(node.agents)) {
+      agent.prompt = substitute(agent.prompt);
+      agent.description = substitute(agent.description);
+    }
+  }
+}
+
 function applyInputsMacro(node: DagNode, args: Record<string, string>, missing: Set<string>): void {
   const substitute = (text: string): string =>
     text.replace(INPUTS_REF, (match, name: string) => {
@@ -244,18 +259,7 @@ function applyInputsMacro(node: DagNode, args: Record<string, string>, missing: 
       return value;
     });
 
-  if (node.when !== undefined) node.when = substitute(node.when);
-
-  // Base AI-turn fields — valid on every AI node mode (command / prompt / loop_group), so
-  // they are walked outside the mode chain, like `when:`. Both go straight to the provider
-  // with no substitution of their own downstream.
-  if (node.systemPrompt !== undefined) node.systemPrompt = substitute(node.systemPrompt);
-  if (node.agents !== undefined) {
-    for (const agent of Object.values(node.agents)) {
-      agent.prompt = substitute(agent.prompt);
-      agent.description = substitute(agent.description);
-    }
-  }
+  applyInputsToCommonFields(node, substitute);
 
   if (isLoopNode(node)) {
     if (node.loop.prompt !== undefined) node.loop.prompt = substitute(node.loop.prompt);

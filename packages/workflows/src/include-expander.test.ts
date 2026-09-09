@@ -454,6 +454,63 @@ describe('expandWorkflowIncludes — with input mapping', () => {
       },
     });
   });
+
+  test('substitutes loop group AI fields and nested body inputs independently', () => {
+    const block = wf('parameterized', [
+      {
+        id: 'group',
+        systemPrompt: 'Coordinator for $INPUTS.scope',
+        agents: {
+          reviewer: {
+            description: 'Reviews $INPUTS.scope',
+            prompt: 'Review $INPUTS.scope',
+          },
+        },
+        loop_group: {
+          until: 'DONE',
+          max_iterations: 1,
+          nodes: [
+            {
+              id: 'body',
+              prompt: 'Body sees $INPUTS.scope',
+              when: "$INPUTS.gate == 'YES'",
+            },
+          ],
+        },
+      },
+    ]);
+    const parent = wf('parent', [
+      { id: 'gate', bash: 'echo YES' },
+      {
+        id: 'review',
+        include: 'parameterized',
+        depends_on: ['gate'],
+        with: { gate: '$gate.output', scope: 'release-cut' },
+      },
+    ]);
+
+    const { workflows, errors } = expandWorkflowIncludes(mapOf(block, parent));
+    expect(errors).toHaveLength(0);
+    const expanded = workflows.get('parent')!;
+    expect(nodeById(expanded, 'review__group')).toMatchObject({
+      systemPrompt: 'Coordinator for release-cut',
+      agents: {
+        reviewer: {
+          description: 'Reviews release-cut',
+          prompt: 'Review release-cut',
+        },
+      },
+      loop_group: {
+        nodes: [
+          {
+            id: 'body',
+            prompt: 'Body sees release-cut',
+            when: "$gate.output == 'YES'",
+          },
+        ],
+      },
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
