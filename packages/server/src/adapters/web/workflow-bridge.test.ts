@@ -226,3 +226,103 @@ describe('mapWorkflowEvent — container_lifecycle (Phase B)', () => {
     expect(payload).not.toHaveProperty('containerId');
   });
 });
+
+describe('mapWorkflowEvent — run, loop, node, approval, and default literals', () => {
+  beforeEach(() => {
+    mockLogger.warn.mockClear();
+  });
+
+  test('workflow_failed maps to failed workflow_status with error', () => {
+    const event: WorkflowEmitterEvent = {
+      type: 'workflow_failed',
+      runId: 'run-failed',
+      workflowName: 'deploy',
+      error: 'boom',
+    };
+
+    const payload = JSON.parse(mapWorkflowEvent(event) ?? '{}') as Record<string, unknown>;
+
+    expect(payload).toMatchObject({
+      type: 'workflow_status',
+      runId: 'run-failed',
+      workflowName: 'deploy',
+      status: 'failed',
+      error: 'boom',
+    });
+    expect(payload).toHaveProperty('timestamp');
+  });
+
+  test('loop_iteration_completed keeps total zero and duration', () => {
+    const event: WorkflowEmitterEvent = {
+      type: 'loop_iteration_completed',
+      runId: 'run-loop',
+      nodeId: 'review',
+      iteration: 3,
+      duration: 25,
+    };
+
+    const payload = JSON.parse(mapWorkflowEvent(event) ?? '{}') as Record<string, unknown>;
+
+    expect(payload).toMatchObject({
+      type: 'workflow_step',
+      runId: 'run-loop',
+      nodeId: 'review',
+      step: 2,
+      total: 0,
+      name: 'iteration-3',
+      status: 'completed',
+      duration: 25,
+      iteration: 3,
+    });
+  });
+
+  test('node_skipped maps reason onto skipped dag_node', () => {
+    const event: WorkflowEmitterEvent = {
+      type: 'node_skipped',
+      runId: 'run-node',
+      nodeId: 'lint',
+      nodeName: 'Lint',
+      reason: 'prior success',
+    };
+
+    const payload = JSON.parse(mapWorkflowEvent(event) ?? '{}') as Record<string, unknown>;
+
+    expect(payload).toMatchObject({
+      type: 'dag_node',
+      runId: 'run-node',
+      nodeId: 'lint',
+      name: 'Lint',
+      status: 'skipped',
+      reason: 'prior success',
+    });
+  });
+
+  test('approval_pending pauses workflow_status with approval message', () => {
+    const event: WorkflowEmitterEvent = {
+      type: 'approval_pending',
+      runId: 'run-approve',
+      nodeId: 'ship',
+      message: 'Deploy?',
+    };
+
+    const payload = JSON.parse(mapWorkflowEvent(event) ?? '{}') as Record<string, unknown>;
+
+    expect(payload).toMatchObject({
+      type: 'workflow_status',
+      runId: 'run-approve',
+      workflowName: '',
+      status: 'paused',
+      approval: { nodeId: 'ship', message: 'Deploy?' },
+    });
+  });
+
+  test('unknown runtime event logs and returns null', () => {
+    const event = { type: 'future_event', runId: 'run-unknown' } as unknown as WorkflowEmitterEvent;
+
+    expect(mapWorkflowEvent(event)).toBeNull();
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      { type: 'future_event' },
+      'unhandled_workflow_event'
+    );
+  });
+});

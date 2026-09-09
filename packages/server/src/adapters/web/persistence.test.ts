@@ -162,6 +162,21 @@ describe('MessagePersistence', () => {
       void persistence.flush('conv-1');
       expect(mockAddMessage).not.toHaveBeenCalled();
     });
+
+    test('workflow status text stays isolated from adjacent assistant text', async () => {
+      persistence.setConversationDbId('conv-1', 'db-uuid-1');
+
+      persistence.appendText('conv-1', 'before');
+      persistence.appendText('conv-1', 'running', { category: 'workflow_status' });
+      persistence.appendText('conv-1', 'after');
+      await persistence.flush('conv-1');
+
+      expect(mockAddMessage.mock.calls.map(call => call[2])).toEqual([
+        'before',
+        'running',
+        'after',
+      ]);
+    });
   });
 
   describe('retractLastSegment', () => {

@@ -17,6 +17,66 @@ function getLog(): ReturnType<typeof createLogger> {
   return cachedLog;
 }
 
+interface RunningTool {
+  toolCallId: string;
+  name: string;
+  startedAt: number;
+}
+
+type ToolChunk = Extract<MessageChunk, { type: 'tool' }>;
+type ToolResultChunk = Extract<MessageChunk, { type: 'tool_result' }>;
+
+function takeMatchedTool(
+  convTools: Map<string, RunningTool>,
+  chunk: ToolResultChunk
+): RunningTool | undefined {
+  if (chunk.toolCallId && convTools.has(chunk.toolCallId)) {
+    const tool = convTools.get(chunk.toolCallId);
+    if (tool) {
+      convTools.delete(chunk.toolCallId);
+      return tool;
+    }
+  }
+
+  // Reverse iterate to match the most recent tool with this name
+  for (const [id, tool] of [...convTools.entries()].reverse()) {
+    if (tool.name === chunk.toolName) {
+      convTools.delete(id);
+      return tool;
+    }
+  }
+  return undefined;
+}
+
+function createNonToolEvent(chunk: MessageChunk): string | undefined {
+  if (chunk.type === 'result' && chunk.sessionId) {
+    return JSON.stringify({
+      type: 'session_info',
+      sessionId: chunk.sessionId,
+      timestamp: Date.now(),
+    });
+  }
+
+  if (chunk.type === 'workflow_dispatch') {
+    return JSON.stringify({
+      type: 'workflow_dispatch',
+      workerConversationId: chunk.workerConversationId,
+      workflowName: chunk.workflowName,
+      timestamp: Date.now(),
+    });
+  }
+
+  if (chunk.type === 'system') {
+    return JSON.stringify({
+      type: 'system_status',
+      content: chunk.content,
+      timestamp: Date.now(),
+    });
+  }
+
+  return undefined;
+}
+
 export class WebAdapter implements IWebPlatformAdapter {
   /** Per-conversation tool call counter for unique SSE tool IDs */
   private toolCallCounter = new Map<string, number>();
@@ -25,10 +85,7 @@ export class WebAdapter implements IWebPlatformAdapter {
    * Uses a Map of toolCallId → start info so parallel DAG nodes don't
    * overwrite each other (they share a conversationId).
    */
-  private runningTools = new Map<
-    string,
-    Map<string, { toolCallId: string; name: string; startedAt: number }>
-  >();
+  private runningTools = new Map<string, Map<string, RunningTool>>();
 
   constructor(
     private transport: SSETransport,
@@ -97,131 +154,120 @@ export class WebAdapter implements IWebPlatformAdapter {
   }
 
   async sendStructuredEvent(conversationId: string, chunk: MessageChunk): Promise<void> {
-    let event: string;
-
     if (chunk.type === 'tool' && chunk.toolName) {
-      const now = Date.now();
+      await this.transport.emit(conversationId, this.createToolCallEvent(conversationId, chunk));
+      return;
+    }
 
-      // Buffer tool call for direct chat persistence (message metadata)
-      this.persistence.appendToolCall(conversationId, {
-        name: chunk.toolName,
-        input: chunk.toolInput ?? {},
-      });
+    if (chunk.type === 'tool_result' && chunk.toolName) {
+      await this.transport.emit(conversationId, this.createToolResultEvent(conversationId, chunk));
+      return;
+    }
 
-      // Prefer the SDK-provided stable ID (e.g. Claude `tool_use_id`); fall back to a
-      // generated counter for clients that don't supply one (e.g. Codex). Stable IDs
-      // guarantee tool_call/tool_result pair correctly under concurrent same-named tools.
-      let toolCallId: string;
-      if (chunk.toolCallId) {
-        toolCallId = chunk.toolCallId;
-      } else {
-        const counter = (this.toolCallCounter.get(conversationId) ?? 0) + 1;
-        this.toolCallCounter.set(conversationId, counter);
-        toolCallId = `${conversationId}-tool-${String(counter)}`;
-      }
-
-      // Track this tool's start for duration computation (supports parallel DAG nodes)
-      let convTools = this.runningTools.get(conversationId);
-      if (!convTools) {
-        convTools = new Map();
-        this.runningTools.set(conversationId, convTools);
-      }
-      convTools.set(toolCallId, { toolCallId, name: chunk.toolName, startedAt: now });
-
-      event = JSON.stringify({
-        type: 'tool_call',
-        toolCallId,
-        name: chunk.toolName,
-        input: chunk.toolInput ?? {},
-        timestamp: now,
-      });
-    } else if (chunk.type === 'tool_result' && chunk.toolName) {
-      const now = Date.now();
-      // Find and remove the matching running tool entry. Prefer stable ID lookup
-      // (correct under concurrent same-named tools), fall back to name reverse-scan
-      // for clients that don't supply an ID.
-      const convTools = this.runningTools.get(conversationId);
-      let matchedToolCallId: string | undefined;
-      let startedAt = now;
-      if (convTools) {
-        if (chunk.toolCallId && convTools.has(chunk.toolCallId)) {
-          const t = convTools.get(chunk.toolCallId);
-          if (t) {
-            matchedToolCallId = chunk.toolCallId;
-            startedAt = t.startedAt;
-            convTools.delete(chunk.toolCallId);
-          }
-        } else {
-          // Reverse iterate to match the most recent tool with this name
-          for (const [id, t] of [...convTools.entries()].reverse()) {
-            if (t.name === chunk.toolName) {
-              matchedToolCallId = id;
-              startedAt = t.startedAt;
-              convTools.delete(id);
-              break;
-            }
-          }
-        }
-      }
-      if (!matchedToolCallId) {
-        // Neither stable-ID lookup nor name reverse-scan found a match. The
-        // SSE event still goes out, but the UI cannot pair it to a running
-        // card and the entry (if any) will leak in runningTools. Surface this
-        // so we can debug missing tool_call emissions.
-        getLog().warn(
-          {
-            conversationId,
-            toolName: chunk.toolName,
-            toolCallId: chunk.toolCallId,
-          },
-          'web_adapter.tool_result_unmatched'
-        );
-      }
-      const duration = now - startedAt;
-      // Persist tool output to DB
-      try {
-        this.persistence.appendToolResult(
-          conversationId,
-          chunk.toolName,
-          chunk.toolOutput,
-          duration
-        );
-      } catch (e: unknown) {
-        getLog().error({ conversationId, err: e }, 'tool_result_persist_failed');
-      }
-      // Bound the SSE payload only — the DB write above keeps the full output
-      event = JSON.stringify({
-        type: 'tool_result',
-        toolCallId: matchedToolCallId,
-        name: chunk.toolName,
-        output: truncateToolOutput(chunk.toolOutput),
-        duration,
-        timestamp: now,
-      });
-    } else if (chunk.type === 'result' && chunk.sessionId) {
-      event = JSON.stringify({
-        type: 'session_info',
-        sessionId: chunk.sessionId,
-        timestamp: Date.now(),
-      });
-    } else if (chunk.type === 'workflow_dispatch') {
-      event = JSON.stringify({
-        type: 'workflow_dispatch',
-        workerConversationId: chunk.workerConversationId,
-        workflowName: chunk.workflowName,
-        timestamp: Date.now(),
-      });
-    } else if (chunk.type === 'system') {
-      event = JSON.stringify({
-        type: 'system_status',
-        content: chunk.content,
-        timestamp: Date.now(),
-      });
-    } else {
+    const event = createNonToolEvent(chunk);
+    if (!event) {
       return;
     }
 
     await this.transport.emit(conversationId, event);
+  }
+
+  private createToolCallEvent(conversationId: string, chunk: ToolChunk): string {
+    const now = Date.now();
+
+    // Buffer tool call for direct chat persistence (message metadata)
+    this.persistence.appendToolCall(conversationId, {
+      name: chunk.toolName,
+      input: chunk.toolInput ?? {},
+    });
+
+    const toolCallId = this.allocateToolCallId(conversationId, chunk.toolCallId);
+    this.getConversationTools(conversationId).set(toolCallId, {
+      toolCallId,
+      name: chunk.toolName,
+      startedAt: now,
+    });
+
+    return JSON.stringify({
+      type: 'tool_call',
+      toolCallId,
+      name: chunk.toolName,
+      input: chunk.toolInput ?? {},
+      timestamp: now,
+    });
+  }
+
+  private createToolResultEvent(conversationId: string, chunk: ToolResultChunk): string {
+    const now = Date.now();
+    const match = this.takeRunningTool(conversationId, chunk, now);
+    const duration = now - match.startedAt;
+    this.persistToolResult(conversationId, chunk.toolName, chunk.toolOutput, duration);
+
+    // Bound the SSE payload only — the DB write above keeps the full output
+    return JSON.stringify({
+      type: 'tool_result',
+      toolCallId: match.toolCallId,
+      name: chunk.toolName,
+      output: truncateToolOutput(chunk.toolOutput),
+      duration,
+      timestamp: now,
+    });
+  }
+
+  private allocateToolCallId(conversationId: string, toolCallId?: string): string {
+    // Prefer the SDK-provided stable ID (e.g. Claude `tool_use_id`); fall back to a
+    // generated counter for clients that don't supply one (e.g. Codex). Stable IDs
+    // guarantee tool_call/tool_result pair correctly under concurrent same-named tools.
+    if (toolCallId) return toolCallId;
+    const counter = (this.toolCallCounter.get(conversationId) ?? 0) + 1;
+    this.toolCallCounter.set(conversationId, counter);
+    return `${conversationId}-tool-${String(counter)}`;
+  }
+
+  private getConversationTools(conversationId: string): Map<string, RunningTool> {
+    let convTools = this.runningTools.get(conversationId);
+    if (!convTools) {
+      convTools = new Map();
+      this.runningTools.set(conversationId, convTools);
+    }
+    return convTools;
+  }
+
+  private takeRunningTool(
+    conversationId: string,
+    chunk: ToolResultChunk,
+    now: number
+  ): { toolCallId?: string; startedAt: number } {
+    const convTools = this.runningTools.get(conversationId);
+    const match = convTools ? takeMatchedTool(convTools, chunk) : undefined;
+    if (match) return match;
+
+    // Neither stable-ID lookup nor name reverse-scan found a match. The
+    // SSE event still goes out, but the UI cannot pair it to a running
+    // card and the entry (if any) will leak in runningTools. Surface this
+    // so we can debug missing tool_call emissions.
+    getLog().warn(
+      {
+        conversationId,
+        toolName: chunk.toolName,
+        toolCallId: chunk.toolCallId,
+      },
+      'web_adapter.tool_result_unmatched'
+    );
+    return { startedAt: now };
+  }
+
+  private persistToolResult(
+    conversationId: string,
+    toolName: string,
+    toolOutput: string,
+    duration: number
+  ): void {
+    try {
+      this.persistence.appendToolResult(conversationId, toolName, toolOutput, duration);
+    } catch (e: unknown) {
+      getLog().error({ conversationId, err: e }, 'tool_result_persist_failed');
+    }
   }
 
   async ensureThread(originalConversationId: string): Promise<string> {

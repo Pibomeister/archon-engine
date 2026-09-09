@@ -13,188 +13,211 @@ function getLog(): ReturnType<typeof createLogger> {
   return cachedLog;
 }
 
+type WorkflowRunEvent = Extract<
+  WorkflowEmitterEvent,
+  { type: 'workflow_started' | 'workflow_completed' | 'workflow_failed' }
+>;
+type LoopEvent = Extract<
+  WorkflowEmitterEvent,
+  { type: 'loop_iteration_started' | 'loop_iteration_completed' | 'loop_iteration_failed' }
+>;
+type NodeEvent = Extract<
+  WorkflowEmitterEvent,
+  { type: 'node_started' | 'node_completed' | 'node_failed' | 'node_skipped' }
+>;
+type ToolEvent = Extract<WorkflowEmitterEvent, { type: 'tool_started' | 'tool_completed' }>;
+type ApprovalEvent = Extract<WorkflowEmitterEvent, { type: 'approval_pending' }>;
+type CancelledEvent = Extract<WorkflowEmitterEvent, { type: 'workflow_cancelled' }>;
+type TaskActivityEvent = Extract<WorkflowEmitterEvent, { type: 'task_activity' }>;
+type HookActivityEvent = Extract<WorkflowEmitterEvent, { type: 'hook_activity' }>;
+type ContainerLifecycleEvent = Extract<WorkflowEmitterEvent, { type: 'container_lifecycle' }>;
+
+function stringifyWorkflowEvent(payload: Record<string, unknown>): string {
+  return JSON.stringify({ ...payload, timestamp: Date.now() });
+}
+
+function mapWorkflowRunEvent(event: WorkflowRunEvent): string {
+  const status =
+    event.type === 'workflow_started'
+      ? 'running'
+      : event.type === 'workflow_completed'
+        ? 'completed'
+        : 'failed';
+  return stringifyWorkflowEvent({
+    type: 'workflow_status',
+    runId: event.runId,
+    workflowName: event.workflowName,
+    status,
+    error: event.type === 'workflow_failed' ? event.error : undefined,
+  });
+}
+
+function mapLoopEvent(event: LoopEvent): string {
+  const completed = event.type === 'loop_iteration_completed';
+  const failed = event.type === 'loop_iteration_failed';
+  return stringifyWorkflowEvent({
+    type: 'workflow_step',
+    runId: event.runId,
+    nodeId: event.nodeId,
+    step: event.iteration - 1,
+    // total: 0 intentionally for completed/failed — maxIterations is not carried by those events.
+    // workflow-store.ts handleLoopIteration guards against 0 by preserving the prior wf.maxIterations value.
+    total: event.type === 'loop_iteration_started' ? event.maxIterations : 0,
+    name: `iteration-${String(event.iteration)}`,
+    status: completed ? 'completed' : failed ? 'failed' : 'running',
+    duration: completed ? event.duration : undefined,
+    iteration: event.iteration,
+  });
+}
+
+function mapWorkflowArtifactEvent(
+  event: Extract<WorkflowEmitterEvent, { type: 'workflow_artifact' }>
+): string {
+  return stringifyWorkflowEvent({
+    type: 'workflow_artifact',
+    runId: event.runId,
+    artifactType: event.artifactType,
+    label: event.label,
+    url: event.url,
+    path: event.path,
+  });
+}
+
+function nodeStatus(event: NodeEvent): 'running' | 'completed' | 'failed' | 'skipped' {
+  if (event.type === 'node_started') return 'running';
+  if (event.type === 'node_completed') return 'completed';
+  if (event.type === 'node_failed') return 'failed';
+  return 'skipped';
+}
+
+function mapNodeEvent(event: NodeEvent): string {
+  return stringifyWorkflowEvent({
+    type: 'dag_node',
+    runId: event.runId,
+    nodeId: event.nodeId,
+    name: event.nodeName,
+    status: nodeStatus(event),
+    duration: event.type === 'node_completed' ? event.duration : undefined,
+    error: event.type === 'node_failed' ? event.error : undefined,
+    reason: event.type === 'node_skipped' ? event.reason : undefined,
+  });
+}
+
+function mapToolEvent(event: ToolEvent): string {
+  if (event.type === 'tool_started') {
+    return stringifyWorkflowEvent({
+      type: 'workflow_tool_activity',
+      runId: event.runId,
+      toolName: event.toolName,
+      stepName: event.stepName,
+      toolCallId: event.toolCallId,
+      status: 'started',
+    });
+  }
+
+  return stringifyWorkflowEvent({
+    type: 'workflow_tool_activity',
+    runId: event.runId,
+    toolName: event.toolName,
+    stepName: event.stepName,
+    toolCallId: event.toolCallId,
+    status: 'completed',
+    durationMs: event.durationMs,
+    toolOutcome: event.toolOutcome,
+    exitCode: event.exitCode,
+  });
+}
+
+function mapApprovalEvent(event: ApprovalEvent): string {
+  return stringifyWorkflowEvent({
+    type: 'workflow_status',
+    runId: event.runId,
+    workflowName: '',
+    status: 'paused',
+    approval: {
+      nodeId: event.nodeId,
+      message: event.message,
+    },
+  });
+}
+
+function mapCancelledEvent(event: CancelledEvent): string {
+  return stringifyWorkflowEvent({
+    type: 'workflow_status',
+    runId: event.runId,
+    workflowName: '',
+    status: 'cancelled',
+  });
+}
+
+function mapTaskActivityEvent(event: TaskActivityEvent): string {
+  return stringifyWorkflowEvent({
+    type: 'workflow_task_activity',
+    runId: event.runId,
+    nodeId: event.nodeId,
+    taskId: event.taskId,
+    activity: event.activity,
+    ...(event.description !== undefined ? { description: event.description } : {}),
+    ...(event.summary !== undefined ? { summary: event.summary } : {}),
+    ...(event.usage !== undefined ? { usage: event.usage } : {}),
+    ...(event.lastToolName !== undefined ? { lastToolName: event.lastToolName } : {}),
+    ...(event.taskType !== undefined ? { taskType: event.taskType } : {}),
+  });
+}
+
+function mapHookActivityEvent(event: HookActivityEvent): string {
+  return stringifyWorkflowEvent({
+    type: 'workflow_hook_activity',
+    runId: event.runId,
+    nodeId: event.nodeId,
+    hookId: event.hookId,
+    hookName: event.hookName,
+    hookEvent: event.hookEvent,
+    activity: event.activity,
+    ...(event.outcome !== undefined ? { outcome: event.outcome } : {}),
+    ...(event.exitCode !== undefined ? { exitCode: event.exitCode } : {}),
+  });
+}
+
+function mapContainerLifecycleEvent(event: ContainerLifecycleEvent): string {
+  return stringifyWorkflowEvent({
+    type: 'workflow_container_lifecycle',
+    runId: event.runId,
+    phase: event.phase,
+    ...(event.containerId !== undefined ? { containerId: event.containerId } : {}),
+  });
+}
+
 export function mapWorkflowEvent(event: WorkflowEmitterEvent): string | null {
   switch (event.type) {
     case 'workflow_started':
     case 'workflow_completed':
     case 'workflow_failed':
-      return JSON.stringify({
-        type: 'workflow_status',
-        runId: event.runId,
-        workflowName: event.workflowName,
-        status:
-          event.type === 'workflow_started'
-            ? 'running'
-            : event.type === 'workflow_completed'
-              ? 'completed'
-              : 'failed',
-        error: event.type === 'workflow_failed' ? event.error : undefined,
-        timestamp: Date.now(),
-      });
-
+      return mapWorkflowRunEvent(event);
     case 'loop_iteration_started':
-      return JSON.stringify({
-        type: 'workflow_step',
-        runId: event.runId,
-        nodeId: event.nodeId,
-        step: event.iteration - 1,
-        total: event.maxIterations,
-        name: `iteration-${String(event.iteration)}`,
-        status: 'running',
-        iteration: event.iteration,
-        timestamp: Date.now(),
-      });
-
     case 'loop_iteration_completed':
-      return JSON.stringify({
-        type: 'workflow_step',
-        runId: event.runId,
-        nodeId: event.nodeId,
-        step: event.iteration - 1,
-        // total: 0 intentionally — maxIterations is not carried by loop_iteration_completed/failed events.
-        // workflow-store.ts handleLoopIteration guards against 0 by preserving the prior wf.maxIterations value.
-        total: 0,
-        name: `iteration-${String(event.iteration)}`,
-        status: 'completed',
-        duration: event.duration,
-        iteration: event.iteration,
-        timestamp: Date.now(),
-      });
-
     case 'loop_iteration_failed':
-      return JSON.stringify({
-        type: 'workflow_step',
-        runId: event.runId,
-        nodeId: event.nodeId,
-        step: event.iteration - 1,
-        // total: 0 intentionally — maxIterations is not carried by loop_iteration_completed/failed events.
-        // workflow-store.ts handleLoopIteration guards against 0 by preserving the prior wf.maxIterations value.
-        total: 0,
-        name: `iteration-${String(event.iteration)}`,
-        status: 'failed',
-        iteration: event.iteration,
-        timestamp: Date.now(),
-      });
-
+      return mapLoopEvent(event);
     case 'workflow_artifact':
-      return JSON.stringify({
-        type: 'workflow_artifact',
-        runId: event.runId,
-        artifactType: event.artifactType,
-        label: event.label,
-        url: event.url,
-        path: event.path,
-        timestamp: Date.now(),
-      });
-
+      return mapWorkflowArtifactEvent(event);
     case 'node_started':
     case 'node_completed':
     case 'node_failed':
     case 'node_skipped':
-      return JSON.stringify({
-        type: 'dag_node',
-        runId: event.runId,
-        nodeId: event.nodeId,
-        name: event.nodeName,
-        status:
-          event.type === 'node_started'
-            ? 'running'
-            : event.type === 'node_completed'
-              ? 'completed'
-              : event.type === 'node_failed'
-                ? 'failed'
-                : 'skipped',
-        duration: event.type === 'node_completed' ? event.duration : undefined,
-        error: event.type === 'node_failed' ? event.error : undefined,
-        reason: event.type === 'node_skipped' ? event.reason : undefined,
-        timestamp: Date.now(),
-      });
-
+      return mapNodeEvent(event);
     case 'tool_started':
-      return JSON.stringify({
-        type: 'workflow_tool_activity',
-        runId: event.runId,
-        toolName: event.toolName,
-        stepName: event.stepName,
-        toolCallId: event.toolCallId,
-        status: 'started',
-        timestamp: Date.now(),
-      });
-
     case 'tool_completed':
-      return JSON.stringify({
-        type: 'workflow_tool_activity',
-        runId: event.runId,
-        toolName: event.toolName,
-        stepName: event.stepName,
-        toolCallId: event.toolCallId,
-        status: 'completed',
-        durationMs: event.durationMs,
-        toolOutcome: event.toolOutcome,
-        exitCode: event.exitCode,
-        timestamp: Date.now(),
-      });
-
+      return mapToolEvent(event);
     case 'approval_pending':
-      return JSON.stringify({
-        type: 'workflow_status',
-        runId: event.runId,
-        workflowName: '',
-        status: 'paused',
-        timestamp: Date.now(),
-        approval: {
-          nodeId: event.nodeId,
-          message: event.message,
-        },
-      });
-
+      return mapApprovalEvent(event);
     case 'workflow_cancelled':
-      return JSON.stringify({
-        type: 'workflow_status',
-        runId: event.runId,
-        workflowName: '',
-        status: 'cancelled',
-        timestamp: Date.now(),
-      });
-
+      return mapCancelledEvent(event);
     case 'task_activity':
-      return JSON.stringify({
-        type: 'workflow_task_activity',
-        runId: event.runId,
-        nodeId: event.nodeId,
-        taskId: event.taskId,
-        activity: event.activity,
-        ...(event.description !== undefined ? { description: event.description } : {}),
-        ...(event.summary !== undefined ? { summary: event.summary } : {}),
-        ...(event.usage !== undefined ? { usage: event.usage } : {}),
-        ...(event.lastToolName !== undefined ? { lastToolName: event.lastToolName } : {}),
-        ...(event.taskType !== undefined ? { taskType: event.taskType } : {}),
-        timestamp: Date.now(),
-      });
-
+      return mapTaskActivityEvent(event);
     case 'hook_activity':
-      return JSON.stringify({
-        type: 'workflow_hook_activity',
-        runId: event.runId,
-        nodeId: event.nodeId,
-        hookId: event.hookId,
-        hookName: event.hookName,
-        hookEvent: event.hookEvent,
-        activity: event.activity,
-        ...(event.outcome !== undefined ? { outcome: event.outcome } : {}),
-        ...(event.exitCode !== undefined ? { exitCode: event.exitCode } : {}),
-        timestamp: Date.now(),
-      });
-
+      return mapHookActivityEvent(event);
     case 'container_lifecycle':
-      return JSON.stringify({
-        type: 'workflow_container_lifecycle',
-        runId: event.runId,
-        phase: event.phase,
-        ...(event.containerId !== undefined ? { containerId: event.containerId } : {}),
-        timestamp: Date.now(),
-      });
-
+      return mapContainerLifecycleEvent(event);
     default: {
       const exhaustiveCheck: never = event;
       getLog().warn(

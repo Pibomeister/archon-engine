@@ -2636,61 +2636,9 @@ export function registerApiRoutes(
       return c.json({ error: 'Invalid conversation ID' }, 400);
     }
 
-    let message: string;
-    let savedFiles: AttachedFile[] = [];
-    let uploadDir = '';
-
-    const contentType = c.req.header('content-type') ?? '';
-
-    if (contentType.includes('multipart/form-data')) {
-      let body: Record<string, string | File | (string | File)[]>;
-      try {
-        body = await c.req.parseBody({ all: true });
-      } catch (parseErr: unknown) {
-        getLog().warn({ err: parseErr, conversationId }, 'upload.parse_failed');
-        return c.json({ error: 'Invalid multipart form data' }, 400);
-      }
-
-      const rawMessage = body.message;
-      if (typeof rawMessage !== 'string' || !rawMessage) {
-        return c.json({ error: 'message must be a non-empty string' }, 400);
-      }
-      message = rawMessage;
-
-      const rawFiles = body.files;
-      let fileList: (string | File)[];
-      if (Array.isArray(rawFiles)) {
-        fileList = rawFiles;
-      } else if (rawFiles !== undefined) {
-        fileList = [rawFiles];
-      } else {
-        fileList = [];
-      }
-
-      const fileEntries = fileList.filter((e): e is File => e instanceof File);
-      if (fileEntries.length > 0) {
-        const result = await persistUploadedFiles(conversationId, fileEntries);
-        if (!result.ok) {
-          return c.json({ error: result.error }, result.status);
-        }
-        savedFiles = result.savedFiles;
-        uploadDir = result.uploadDir;
-        getLog().info({ conversationId, fileCount: savedFiles.length }, 'message.files_uploaded');
-      }
-    } else {
-      let body: { message?: unknown };
-      try {
-        body = await c.req.json();
-      } catch (parseErr: unknown) {
-        getLog().warn({ err: parseErr, conversationId }, 'message.json_parse_failed');
-        return c.json({ error: 'Invalid JSON in request body' }, 400);
-      }
-
-      if (typeof body.message !== 'string' || !body.message) {
-        return c.json({ error: 'message must be a non-empty string' }, 400);
-      }
-      message = body.message;
-    }
+    const parsed = await parseSendMessageRequest(c, conversationId);
+    if (!parsed.ok) return parsed.response;
+    const { message, savedFiles, uploadDir } = parsed;
 
     // Look up conversation for message persistence
     let conv: Awaited<ReturnType<typeof conversationDb.findConversationByPlatformId>> = null;
@@ -3036,6 +2984,333 @@ export function registerApiRoutes(
     return (c.req as unknown as { valid(k: 'json'): T }).valid('json');
   }
 
+  function fileEntriesFromBody(body: Record<string, string | File | (string | File)[]>): File[] {
+    const rawFiles = body.files;
+    const fileList: (string | File)[] = Array.isArray(rawFiles)
+      ? rawFiles
+      : rawFiles !== undefined
+        ? [rawFiles]
+        : [];
+    return fileList.filter((entry): entry is File => entry instanceof File);
+  }
+
+  async function parseSendMessageRequest(
+    c: Context,
+    conversationId: string
+  ): Promise<
+    | { ok: true; message: string; savedFiles: AttachedFile[]; uploadDir: string }
+    | { ok: false; response: Response }
+  > {
+    const contentType = c.req.header('content-type') ?? '';
+    if (!contentType.includes('multipart/form-data')) {
+      return parseJsonSendMessageRequest(c, conversationId);
+    }
+
+    let body: Record<string, string | File | (string | File)[]>;
+    try {
+      body = await c.req.parseBody({ all: true });
+    } catch (parseErr: unknown) {
+      getLog().warn({ err: parseErr, conversationId }, 'upload.parse_failed');
+      return { ok: false, response: c.json({ error: 'Invalid multipart form data' }, 400) };
+    }
+
+    const rawMessage = body.message;
+    if (typeof rawMessage !== 'string' || !rawMessage) {
+      return { ok: false, response: c.json({ error: 'message must be a non-empty string' }, 400) };
+    }
+
+    const upload = await persistMessageFiles(c, conversationId, fileEntriesFromBody(body));
+    if (!upload.ok) return { ok: false, response: upload.response };
+    return {
+      ok: true,
+      message: rawMessage,
+      savedFiles: upload.savedFiles,
+      uploadDir: upload.uploadDir,
+    };
+  }
+
+  async function parseJsonSendMessageRequest(
+    c: Context,
+    conversationId: string
+  ): Promise<
+    | { ok: true; message: string; savedFiles: AttachedFile[]; uploadDir: string }
+    | { ok: false; response: Response }
+  > {
+    let body: { message?: unknown };
+    try {
+      body = await c.req.json();
+    } catch (parseErr: unknown) {
+      getLog().warn({ err: parseErr, conversationId }, 'message.json_parse_failed');
+      return { ok: false, response: c.json({ error: 'Invalid JSON in request body' }, 400) };
+    }
+
+    if (typeof body.message !== 'string' || !body.message) {
+      return { ok: false, response: c.json({ error: 'message must be a non-empty string' }, 400) };
+    }
+    return { ok: true, message: body.message, savedFiles: [], uploadDir: '' };
+  }
+
+  async function persistMessageFiles(
+    c: Context,
+    conversationId: string,
+    fileEntries: File[]
+  ): Promise<
+    { ok: true; savedFiles: AttachedFile[]; uploadDir: string } | { ok: false; response: Response }
+  > {
+    if (fileEntries.length === 0) return { ok: true, savedFiles: [], uploadDir: '' };
+    const result = await persistUploadedFiles(conversationId, fileEntries);
+    if (!result.ok) return { ok: false, response: c.json({ error: result.error }, result.status) };
+    getLog().info(
+      { conversationId, fileCount: result.savedFiles.length },
+      'message.files_uploaded'
+    );
+    return { ok: true, savedFiles: result.savedFiles, uploadDir: result.uploadDir };
+  }
+
+  async function parseRunWorkflowRequest(
+    c: Context,
+    workflowName: string
+  ): Promise<
+    | {
+        ok: true;
+        conversationId: string;
+        message: string;
+        savedFiles: AttachedFile[];
+        uploadDir: string;
+      }
+    | { ok: false; response: Response }
+  > {
+    const contentType = c.req.header('content-type') ?? '';
+    if (!contentType.includes('multipart/form-data')) {
+      return parseJsonRunWorkflowRequest(c);
+    }
+
+    let body: Record<string, string | File | (string | File)[]>;
+    try {
+      body = await c.req.parseBody({ all: true });
+    } catch (parseErr: unknown) {
+      getLog().warn({ err: parseErr }, 'run_workflow.multipart_parse_failed');
+      return { ok: false, response: apiError(c, 400, 'Invalid multipart form data') };
+    }
+
+    const parsed = parseRunWorkflowFields(c, body.message, body.conversationId);
+    if (!parsed.ok) return parsed;
+    const upload = await persistRunWorkflowFiles(
+      c,
+      parsed.conversationId,
+      workflowName,
+      fileEntriesFromBody(body)
+    );
+    if (!upload.ok) return upload;
+    return {
+      ok: true,
+      message: parsed.message,
+      conversationId: parsed.conversationId,
+      savedFiles: upload.savedFiles,
+      uploadDir: upload.uploadDir,
+    };
+  }
+
+  function parseRunWorkflowFields(
+    c: Context,
+    rawMessage: unknown,
+    rawConv: unknown
+  ): { ok: true; conversationId: string; message: string } | { ok: false; response: Response } {
+    if (typeof rawMessage !== 'string' || !rawMessage) {
+      return { ok: false, response: apiError(c, 400, 'message must be a non-empty string') };
+    }
+    if (typeof rawConv !== 'string' || !rawConv || !/^[\w-]+$/.test(rawConv)) {
+      return {
+        ok: false,
+        response: apiError(c, 400, 'conversationId must be a non-empty alphanumeric string'),
+      };
+    }
+    return { ok: true, conversationId: rawConv, message: rawMessage };
+  }
+
+  async function parseJsonRunWorkflowRequest(c: Context): Promise<
+    | {
+        ok: true;
+        conversationId: string;
+        message: string;
+        savedFiles: AttachedFile[];
+        uploadDir: string;
+      }
+    | { ok: false; response: Response }
+  > {
+    let body: { conversationId?: unknown; message?: unknown };
+    try {
+      body = await c.req.json();
+    } catch (parseErr: unknown) {
+      getLog().warn({ err: parseErr }, 'run_workflow.json_parse_failed');
+      return { ok: false, response: apiError(c, 400, 'Invalid JSON in request body') };
+    }
+    const parsed = parseRunWorkflowFields(c, body.message, body.conversationId);
+    if (!parsed.ok) return parsed;
+    return {
+      ok: true,
+      conversationId: parsed.conversationId,
+      message: parsed.message,
+      savedFiles: [],
+      uploadDir: '',
+    };
+  }
+
+  async function persistRunWorkflowFiles(
+    c: Context,
+    conversationId: string,
+    workflowName: string,
+    fileEntries: File[]
+  ): Promise<
+    { ok: true; savedFiles: AttachedFile[]; uploadDir: string } | { ok: false; response: Response }
+  > {
+    if (fileEntries.length === 0) return { ok: true, savedFiles: [], uploadDir: '' };
+    const result = await persistUploadedFiles(conversationId, fileEntries);
+    if (!result.ok) return { ok: false, response: apiError(c, result.status, result.error) };
+    getLog().info(
+      { conversationId, fileCount: result.savedFiles.length, workflowName },
+      'run_workflow.files_uploaded'
+    );
+    return { ok: true, savedFiles: result.savedFiles, uploadDir: result.uploadDir };
+  }
+
+  async function persistWorkflowRunUserMessage(
+    conversationId: string,
+    message: string,
+    savedFiles: AttachedFile[],
+    userId: string | undefined,
+    workflowName: string
+  ): Promise<void> {
+    let conv: Awaited<ReturnType<typeof conversationDb.findConversationByPlatformId>> = null;
+    try {
+      conv = await conversationDb.findConversationByPlatformId(conversationId);
+    } catch (e: unknown) {
+      getLog().error({ err: e, conversationId }, 'conversation_lookup_failed');
+    }
+    if (!conv) return;
+
+    try {
+      const meta = savedFilesMetadata(savedFiles);
+      await messageDb.addMessage(conv.id, 'user', message, meta, userId);
+    } catch (e: unknown) {
+      getLog().error({ err: e, conversationId: conv.id }, 'message_persistence_failed');
+    }
+    webAdapter.setConversationDbId(conversationId, conv.id);
+    if (!conv.title) {
+      void resolveTitleRequest(conv.ai_assistant_type, userId).then(titleRequest =>
+        generateAndSetTitle(
+          conv.id,
+          message,
+          titleRequest.provider,
+          getArchonWorkspacesPath(),
+          workflowName,
+          titleRequest.options.assistantConfig,
+          titleRequest.options
+        )
+      );
+    }
+  }
+
+  function savedFilesMetadata(
+    savedFiles: AttachedFile[]
+  ): { files: { name: string; mimeType: string; size: number }[] } | undefined {
+    if (savedFiles.length === 0) return undefined;
+    return {
+      files: savedFiles.map(f => ({ name: f.name, mimeType: f.mimeType, size: f.size })),
+    };
+  }
+
+  async function readWorkflowAt(
+    name: string,
+    dir: string
+  ): Promise<{ filename: string; content: string } | null> {
+    // Try `.yaml` then `.yml`, mirroring `loadWorkflowsFromDir` in
+    // workflow-discovery.ts so by-name lookup matches the list endpoint.
+    for (const ext of ['yaml', 'yml']) {
+      const filename = `${name}.${ext}`;
+      try {
+        const content = await readFile(join(dir, filename), 'utf-8');
+        return { filename, content };
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+      }
+    }
+    return null;
+  }
+
+  async function resolveWorkflowReadDir(cwd: string | undefined): Promise<string | undefined> {
+    if (cwd) return cwd;
+    const codebases = await codebaseDb.listCodebases();
+    return codebases[0]?.default_cwd;
+  }
+
+  function workflowReadResponse(
+    c: Context,
+    hit: { filename: string; content: string },
+    source: WorkflowSource,
+    invalidPrefix: string
+  ): Response {
+    const result = parseWorkflow(hit.content, hit.filename);
+    if (result.error) {
+      return apiError(c, 500, `${invalidPrefix}: ${result.error.error}`);
+    }
+    return c.json({ workflow: result.workflow, filename: hit.filename, source });
+  }
+
+  async function tryProjectWorkflowResponse(
+    c: Context,
+    name: string,
+    workingDir: string | undefined
+  ): Promise<Response | undefined> {
+    if (!workingDir) return undefined;
+    const [workflowFolder] = getWorkflowFolderSearchPaths();
+    try {
+      const hit = await readWorkflowAt(name, join(workingDir, workflowFolder));
+      if (!hit) return undefined;
+      return workflowReadResponse(c, hit, 'project', 'Workflow file is invalid');
+    } catch (err) {
+      getLog().error({ err, name }, 'workflow.fetch_failed');
+      return apiError(c, 500, 'Failed to read workflow');
+    }
+  }
+
+  async function tryHomeWorkflowResponse(c: Context, name: string): Promise<Response | undefined> {
+    try {
+      const hit = await readWorkflowAt(name, getHomeWorkflowsPath());
+      if (!hit) return undefined;
+      return workflowReadResponse(c, hit, 'global', 'Home workflow file is invalid');
+    } catch (err) {
+      getLog().error({ err, name }, 'workflow.fetch_home_failed');
+      return apiError(c, 500, 'Failed to read home-scoped workflow');
+    }
+  }
+
+  function tryBundledWorkflowResponse(c: Context, name: string): Response | undefined {
+    if (!Object.hasOwn(BUNDLED_WORKFLOWS, name)) return undefined;
+    const filename = `${name}.yaml`;
+    return workflowReadResponse(
+      c,
+      { filename, content: BUNDLED_WORKFLOWS[name] },
+      'bundled',
+      'Bundled workflow is invalid'
+    );
+  }
+
+  async function tryDefaultWorkflowResponse(
+    c: Context,
+    name: string
+  ): Promise<Response | undefined> {
+    if (isBinaryBuild()) return undefined;
+    try {
+      const hit = await readWorkflowAt(name, getDefaultWorkflowsPath());
+      if (!hit) return undefined;
+      return workflowReadResponse(c, hit, 'bundled', 'Default workflow is invalid');
+    } catch (err) {
+      getLog().error({ err, name }, 'workflow.fetch_default_failed');
+      return apiError(c, 500, 'Failed to read default workflow');
+    }
+  }
+
   // Serve OpenAPI spec
   app.doc('/api/openapi.json', {
     openapi: '3.0.0',
@@ -3129,114 +3404,21 @@ export function registerApiRoutes(
       return apiError(c, 400, 'Invalid workflow name');
     }
 
-    let message: string;
-    let conversationId: string;
-    let savedFiles: AttachedFile[] = [];
-    let uploadDir = '';
-
-    const contentType = c.req.header('content-type') ?? '';
-
-    if (contentType.includes('multipart/form-data')) {
-      let body: Record<string, string | File | (string | File)[]>;
-      try {
-        body = await c.req.parseBody({ all: true });
-      } catch (parseErr: unknown) {
-        getLog().warn({ err: parseErr }, 'run_workflow.multipart_parse_failed');
-        return apiError(c, 400, 'Invalid multipart form data');
-      }
-
-      const rawMessage = body.message;
-      const rawConv = body.conversationId;
-      if (typeof rawMessage !== 'string' || !rawMessage) {
-        return apiError(c, 400, 'message must be a non-empty string');
-      }
-      if (typeof rawConv !== 'string' || !rawConv || !/^[\w-]+$/.test(rawConv)) {
-        return apiError(c, 400, 'conversationId must be a non-empty alphanumeric string');
-      }
-      message = rawMessage;
-      conversationId = rawConv;
-
-      const rawFiles = body.files;
-      const fileList: (string | File)[] = Array.isArray(rawFiles)
-        ? rawFiles
-        : rawFiles !== undefined
-          ? [rawFiles]
-          : [];
-      const fileEntries = fileList.filter((e): e is File => e instanceof File);
-
-      if (fileEntries.length > 0) {
-        const result = await persistUploadedFiles(conversationId, fileEntries);
-        if (!result.ok) {
-          return apiError(c, result.status, result.error);
-        }
-        savedFiles = result.savedFiles;
-        uploadDir = result.uploadDir;
-        getLog().info(
-          { conversationId, fileCount: savedFiles.length, workflowName },
-          'run_workflow.files_uploaded'
-        );
-      }
-    } else {
-      let body: { conversationId?: unknown; message?: unknown };
-      try {
-        body = await c.req.json();
-      } catch (parseErr: unknown) {
-        getLog().warn({ err: parseErr }, 'run_workflow.json_parse_failed');
-        return apiError(c, 400, 'Invalid JSON in request body');
-      }
-      if (typeof body.conversationId !== 'string' || !body.conversationId) {
-        return apiError(c, 400, 'conversationId must be a non-empty string');
-      }
-      if (typeof body.message !== 'string' || !body.message) {
-        return apiError(c, 400, 'message must be a non-empty string');
-      }
-      conversationId = body.conversationId;
-      message = body.message;
-    }
+    const parsed = await parseRunWorkflowRequest(c, workflowName);
+    if (!parsed.ok) return parsed.response;
+    const { conversationId, message, savedFiles, uploadDir } = parsed;
 
     try {
       // Persist user message and register DB ID (same as message endpoint).
       // File metadata (name/mime/size — no path, since the on-disk file is
       // ephemeral) goes into message metadata when present.
-      let conv: Awaited<ReturnType<typeof conversationDb.findConversationByPlatformId>> = null;
-      try {
-        conv = await conversationDb.findConversationByPlatformId(conversationId);
-      } catch (e: unknown) {
-        getLog().error({ err: e, conversationId }, 'conversation_lookup_failed');
-      }
-      if (conv) {
-        try {
-          const meta =
-            savedFiles.length > 0
-              ? {
-                  files: savedFiles.map(f => ({
-                    name: f.name,
-                    mimeType: f.mimeType,
-                    size: f.size,
-                  })),
-                }
-              : undefined;
-          await messageDb.addMessage(conv.id, 'user', message, meta, userId);
-        } catch (e: unknown) {
-          getLog().error({ err: e, conversationId: conv.id }, 'message_persistence_failed');
-        }
-        webAdapter.setConversationDbId(conversationId, conv.id);
-        if (!conv.title) {
-          // Resolve the `small` tier (config tiers + per-user prefs) instead of the raw
-          // assistant default (#1855). Both calls never throw.
-          void resolveTitleRequest(conv.ai_assistant_type, userId).then(titleRequest =>
-            generateAndSetTitle(
-              conv.id,
-              message,
-              titleRequest.provider,
-              getArchonWorkspacesPath(),
-              workflowName,
-              titleRequest.options.assistantConfig,
-              titleRequest.options
-            )
-          );
-        }
-      }
+      await persistWorkflowRunUserMessage(
+        conversationId,
+        message,
+        savedFiles,
+        userId,
+        workflowName
+      );
 
       const fullMessage = `/workflow run ${workflowName} ${message}`;
       const extraContext: Omit<HandleMessageContext, 'isolationHints'> =
@@ -3762,112 +3944,30 @@ export function registerApiRoutes(
       return apiError(c, 400, 'Invalid workflow name');
     }
 
-    // Try `.yaml` then `.yml`, mirroring `loadWorkflowsFromDir` in
-    // workflow-discovery.ts so by-name lookup matches the list endpoint.
-    // Returns null if neither extension exists (caller tries the next source).
-    const tryReadWorkflowAt = async (
-      dir: string
-    ): Promise<{ filename: string; content: string } | null> => {
-      for (const ext of ['yaml', 'yml']) {
-        const filename = `${name}.${ext}`;
-        try {
-          const content = await readFile(join(dir, filename), 'utf-8');
-          return { filename, content };
-        } catch (err) {
-          if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
-        }
-      }
-      return null;
-    };
-
     try {
       const cwd = c.req.query('cwd');
-      let workingDir = cwd;
       if (cwd) {
         if (!(await validateCwd(cwd))) {
           return apiError(c, 400, 'Invalid cwd: must match a registered codebase path');
         }
-      } else {
-        const codebases = await codebaseDb.listCodebases();
-        if (codebases.length > 0) workingDir = codebases[0].default_cwd;
       }
+      const workingDir = await resolveWorkflowReadDir(cwd);
 
       // 1. Try user-defined workflow in cwd.
-      if (workingDir) {
-        const [workflowFolder] = getWorkflowFolderSearchPaths();
-        try {
-          const hit = await tryReadWorkflowAt(join(workingDir, workflowFolder));
-          if (hit) {
-            const result = parseWorkflow(hit.content, hit.filename);
-            if (result.error) {
-              return apiError(c, 500, `Workflow file is invalid: ${result.error.error}`);
-            }
-            return c.json({
-              workflow: result.workflow,
-              filename: hit.filename,
-              source: 'project' as WorkflowSource,
-            });
-          }
-        } catch (err) {
-          getLog().error({ err, name }, 'workflow.fetch_failed');
-          return apiError(c, 500, 'Failed to read workflow');
-        }
-      }
+      const projectResponse = await tryProjectWorkflowResponse(c, name, workingDir);
+      if (projectResponse) return projectResponse;
 
       // 2. Fall back to home-scoped workflow (`~/.archon/workflows/`).
       // Mirrors the discovery order in `discoverWorkflowsWithConfig`.
-      try {
-        const hit = await tryReadWorkflowAt(getHomeWorkflowsPath());
-        if (hit) {
-          const result = parseWorkflow(hit.content, hit.filename);
-          if (result.error) {
-            return apiError(c, 500, `Home workflow file is invalid: ${result.error.error}`);
-          }
-          return c.json({
-            workflow: result.workflow,
-            filename: hit.filename,
-            source: 'global' as WorkflowSource,
-          });
-        }
-      } catch (err) {
-        getLog().error({ err, name }, 'workflow.fetch_home_failed');
-        return apiError(c, 500, 'Failed to read home-scoped workflow');
-      }
+      const homeResponse = await tryHomeWorkflowResponse(c, name);
+      if (homeResponse) return homeResponse;
 
       // 3. Fall back to bundled defaults.
-      if (Object.hasOwn(BUNDLED_WORKFLOWS, name)) {
-        const bundledFilename = `${name}.yaml`;
-        const bundledContent = BUNDLED_WORKFLOWS[name];
-        const result = parseWorkflow(bundledContent, bundledFilename);
-        if (result.error) {
-          return apiError(c, 500, `Bundled workflow is invalid: ${result.error.error}`);
-        }
-        return c.json({
-          workflow: result.workflow,
-          filename: bundledFilename,
-          source: 'bundled' as WorkflowSource,
-        });
-      }
+      const bundledResponse = tryBundledWorkflowResponse(c, name);
+      if (bundledResponse) return bundledResponse;
 
-      if (!isBinaryBuild()) {
-        try {
-          const hit = await tryReadWorkflowAt(getDefaultWorkflowsPath());
-          if (hit) {
-            const result = parseWorkflow(hit.content, hit.filename);
-            if (result.error) {
-              return apiError(c, 500, `Default workflow is invalid: ${result.error.error}`);
-            }
-            return c.json({
-              workflow: result.workflow,
-              filename: hit.filename,
-              source: 'bundled' as WorkflowSource,
-            });
-          }
-        } catch (err) {
-          getLog().error({ err, name }, 'workflow.fetch_default_failed');
-          return apiError(c, 500, 'Failed to read default workflow');
-        }
-      }
+      const defaultResponse = await tryDefaultWorkflowResponse(c, name);
+      if (defaultResponse) return defaultResponse;
 
       return apiError(c, 404, `Workflow not found: ${name}`);
     } catch (error) {

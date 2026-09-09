@@ -102,7 +102,7 @@ import {
   type GitHubAuth,
   type IGitHubAppAuthProvider,
 } from '@archon/core';
-import type { IPlatformAdapter } from '@archon/core';
+import type { GlobalConfig, IPlatformAdapter } from '@archon/core';
 import type { IdentityPlatform } from '@archon/core';
 import * as userDb from '@archon/core/db/users';
 import {
@@ -221,15 +221,20 @@ export interface ServerOptions {
   skipPlatformAdapters?: boolean;
 }
 
-export async function startServer(opts: ServerOptions = {}): Promise<void> {
-  getLog().info('server_starting');
-  // Anonymous once-per-boot startup event (self-gates on opt-out). Flushed by
-  // the shutdownTelemetry() call in the SIGINT/SIGTERM shutdown handler.
-  // Deployment shape is categorical only — booleans/enums derived from which
-  // integrations are configured, never the config values themselves. The
-  // adapter gates mirror the env checks the adapter-init section below uses
-  // (loadArchonEnv() ran at module load, so process.env is final here).
-  const deploymentShape = {
+interface DeploymentShape {
+  dbKind: ReturnType<typeof getDatabaseType>;
+  webAuthEnabled: boolean;
+  multiUser: boolean;
+  githubAuthMode: ReturnType<typeof selectGitHubAuthMode>['kind'];
+  adapterSlack: boolean;
+  adapterTelegram: boolean;
+  adapterDiscord: boolean;
+  adapterGitea: boolean;
+  adapterGitlab: boolean;
+}
+
+function createDeploymentShape(): DeploymentShape {
+  return {
     dbKind: getDatabaseType(),
     webAuthEnabled: isWebAuthEnabled(),
     multiUser: isPerUserProviderKeysEnabled(),
@@ -242,33 +247,16 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     ),
     adapterGitlab: Boolean(process.env.GITLAB_TOKEN && process.env.GITLAB_WEBHOOK_SECRET),
   };
-  captureArchonStarted({ surface: 'server', ...deploymentShape });
+}
 
-  // Daily heartbeat so long-running servers stay visible in active-install
-  // metrics (a boot-only event undercounts server installs after day one).
-  // unref() so the timer never keeps the process alive on shutdown.
-  // captureArchonActive is synchronous fire-and-forget (errors swallowed
-  // internally) — if it ever becomes async, this callback must not return
-  // its promise unhandled.
-  const TELEMETRY_HEARTBEAT_INTERVAL_MS = 24 * 60 * 60 * 1000;
+function startTelemetryHeartbeat(deploymentShape: DeploymentShape): void {
+  const telemetryHeartbeatIntervalMs = 24 * 60 * 60 * 1000;
   setInterval(() => {
     captureArchonActive({ surface: 'server', ...deploymentShape });
-  }, TELEMETRY_HEARTBEAT_INTERVAL_MS).unref();
+  }, telemetryHeartbeatIntervalMs).unref();
+}
 
-  // Phase 2: validate the encryption key the moment per-user provider keys are
-  // enabled, regardless of GitHub App configuration. TOKEN_ENCRYPTION_KEY alone
-  // is the gate — a malformed key must fail boot here rather than at the first
-  // PUT /api/auth/providers/* (when an operator is already wired in).
-  // No-op when the feature is disabled.
-  assertProviderKeysKeyAtBoot();
-
-  // Database auto-detected: SQLite (default) or PostgreSQL (if DATABASE_URL set)
-  // No required environment variables - SQLite works out of the box
-
-  // Validate AI assistant credentials (warn if missing, don't fail).
-  // A per-user install (TOKEN_ENCRYPTION_KEY) is a valid posture even with no
-  // shared Claude key — auth is delivered per request from the encrypted store,
-  // so it must NOT trip the no-credentials exit (#1983).
+function assertAiCredentialPosture(): void {
   const hasClaudeCredentials = hasClaudeBootAuthPosture(process.env);
   const hasCodexCredentials = process.env.CODEX_ID_TOKEN && process.env.CODEX_ACCESS_TOKEN;
 
@@ -304,6 +292,589 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       'codex_credentials_missing'
     );
   }
+}
+
+interface WebRuntime {
+  transport: SSETransport;
+  persistence: MessagePersistence;
+  workflowBridge: WorkflowEventBridge;
+  webAdapter: WebAdapter;
+  dashboardPoller: DashboardEventPoller;
+  pgNotifyListener?: PgNotifyListener;
+}
+
+async function startWebRuntime(): Promise<WebRuntime> {
+  const holder: { persistence?: MessagePersistence } = {};
+  const transport = new SSETransport(conversationId => {
+    // Flush (not clear!) — the orchestrator/workflow may still be writing messages
+    // even though the SSE stream disconnected. Clearing the dbId mapping would cause
+    // all subsequent messages to be lost (never persisted to DB).
+    void holder.persistence?.flush(conversationId).catch((e: unknown) => {
+      getLog().error({ conversationId, err: e }, 'transport_cleanup_flush_failed');
+    });
+  });
+  const persistence = new MessagePersistence((conversationId, event) =>
+    transport.emit(conversationId, event)
+  );
+  holder.persistence = persistence;
+  const workflowBridge = new WorkflowEventBridge(transport);
+  const webAdapter = new WebAdapter(transport, persistence, workflowBridge);
+  await webAdapter.start();
+  persistence.startPeriodicFlush();
+  const { dashboardPoller, pgNotifyListener } = await startDashboardEvents(transport);
+  return { transport, persistence, workflowBridge, webAdapter, dashboardPoller, pgNotifyListener };
+}
+
+async function startDashboardEvents(transport: SSETransport): Promise<{
+  dashboardPoller: DashboardEventPoller;
+  pgNotifyListener?: PgNotifyListener;
+}> {
+  const dashboardPoller = new DashboardEventPoller();
+  const dbNotifier = getDbNotificationListener();
+  if (dbNotifier) {
+    dashboardPoller.start(transport, 10_000);
+    const pgNotifyListener = new PgNotifyListener(dbNotifier, dashboardPoller);
+    await pgNotifyListener.start();
+    return { dashboardPoller, pgNotifyListener };
+  }
+  dashboardPoller.start(transport, 1_500);
+  return { dashboardPoller };
+}
+
+interface PlatformRuntime {
+  github: GitHubAdapter | null;
+  githubAppAuthProvider: IGitHubAppAuthProvider | null;
+  gitea: GiteaAdapter | null;
+  gitlab: GitLabAdapter | null;
+  discord: DiscordAdapter | null;
+  slack: SlackAdapter | null;
+  slackBridge: SlackWorkflowBridge | null;
+}
+
+function emptyPlatformRuntime(): PlatformRuntime {
+  return {
+    github: null,
+    githubAppAuthProvider: null,
+    gitea: null,
+    gitlab: null,
+    discord: null,
+    slack: null,
+    slackBridge: null,
+  };
+}
+
+async function startPlatformAdapters(
+  config: GlobalConfig,
+  lockManager: ConversationLockManager,
+  activePlatforms: string[],
+  skipPlatformAdapters: boolean | undefined
+): Promise<PlatformRuntime> {
+  if (skipPlatformAdapters) {
+    getLog().info('platform_adapters_skipped');
+    return emptyPlatformRuntime();
+  }
+
+  warnIfNoPlatformConfigured();
+  const runtime = emptyPlatformRuntime();
+  const githubRuntime = await startGitHubAdapter(config, lockManager, activePlatforms);
+  runtime.github = githubRuntime.github;
+  runtime.githubAppAuthProvider = githubRuntime.githubAppAuthProvider;
+  runtime.gitea = await startGiteaAdapter(config, lockManager, activePlatforms);
+  runtime.gitlab = await startGitLabAdapter(config, lockManager, activePlatforms);
+  runtime.discord = await startDiscordAdapter(lockManager, activePlatforms);
+  const slackRuntime = await startSlackAdapter(lockManager, activePlatforms);
+  runtime.slack = slackRuntime.slack;
+  runtime.slackBridge = slackRuntime.slackBridge;
+  return runtime;
+}
+
+function warnIfNoPlatformConfigured(): void {
+  const hasTelegram = Boolean(process.env.TELEGRAM_BOT_TOKEN);
+  const hasDiscord = Boolean(process.env.DISCORD_BOT_TOKEN);
+  const ghAuthMode = selectGitHubAuthMode(process.env);
+  const hasGitHub = ghAuthMode.kind !== 'none';
+  const hasGitea = Boolean(
+    process.env.GITEA_URL && process.env.GITEA_TOKEN && process.env.GITEA_WEBHOOK_SECRET
+  );
+  const hasGitLab = Boolean(process.env.GITLAB_TOKEN && process.env.GITLAB_WEBHOOK_SECRET);
+  if (!hasTelegram && !hasDiscord && !hasGitHub && !hasGitea && !hasGitLab) {
+    getLog().warn('no_platform_adapters_configured');
+  }
+}
+
+async function startGitHubAdapter(
+  config: GlobalConfig,
+  lockManager: ConversationLockManager,
+  activePlatforms: string[]
+): Promise<Pick<PlatformRuntime, 'github' | 'githubAppAuthProvider'>> {
+  const ghAuthMode = selectGitHubAuthMode(process.env);
+  if (ghAuthMode.kind === 'conflict') throw new Error(ghAuthMode.message);
+  if (ghAuthMode.kind === 'app') {
+    return startGitHubAppAdapter(config, lockManager, activePlatforms);
+  }
+  if (ghAuthMode.kind === 'pat') {
+    return startGitHubPatAdapter(config, lockManager, activePlatforms);
+  }
+  getLog().info('github_adapter_skipped');
+  return { github: null, githubAppAuthProvider: null };
+}
+
+async function startGitHubAppAdapter(
+  config: GlobalConfig,
+  lockManager: ConversationLockManager,
+  activePlatforms: string[]
+): Promise<Pick<PlatformRuntime, 'github' | 'githubAppAuthProvider'>> {
+  const appId = process.env.GITHUB_APP_ID;
+  const webhookSecret = process.env.WEBHOOK_SECRET;
+  if (!appId || !webhookSecret) {
+    throw new Error('GitHub App mode misconfigured: GITHUB_APP_ID and WEBHOOK_SECRET required');
+  }
+  const privateKey = loadAppPrivateKey();
+  assertEncryptionKeyAtBoot();
+  if (!isPerUserGitHubEnabled()) {
+    getLog().warn(
+      'github_app.per_user_disabled — set TOKEN_ENCRYPTION_KEY (and GITHUB_APP_CLIENT_ID) to enable per-user GitHub identity'
+    );
+  }
+  const defaultInstallationId = process.env.GITHUB_APP_INSTALLATION_ID
+    ? Number(process.env.GITHUB_APP_INSTALLATION_ID)
+    : undefined;
+  const githubAppAuthProvider = createGitHubAppAuthProvider({
+    appId,
+    privateKey,
+    slug: process.env.GITHUB_APP_SLUG ?? 'archon',
+    defaultInstallationId,
+  });
+  registerGitHubAppAuthProvider(githubAppAuthProvider);
+  const botMention =
+    process.env.GITHUB_BOT_MENTION || process.env.BOT_DISPLAY_NAME || config.botName;
+  const auth: GitHubAuth = { kind: 'app', provider: githubAppAuthProvider };
+  const getUserToken = isPerUserGitHubEnabled()
+    ? async (userId: string): Promise<string | undefined> =>
+        (await getDecryptedAccessToken(userId)) ?? undefined
+    : undefined;
+  const github = new GitHubAdapter(auth, webhookSecret, lockManager, botMention, { getUserToken });
+  await github.start();
+  activePlatforms.push('GitHub (App)');
+  getLog().info(
+    { slug: githubAppAuthProvider.slug, defaultInstallationId },
+    'github.adapter_mode_app'
+  );
+  return { github, githubAppAuthProvider };
+}
+
+async function startGitHubPatAdapter(
+  config: GlobalConfig,
+  lockManager: ConversationLockManager,
+  activePlatforms: string[]
+): Promise<Pick<PlatformRuntime, 'github' | 'githubAppAuthProvider'>> {
+  const patToken = process.env.GITHUB_TOKEN;
+  const webhookSecret = process.env.WEBHOOK_SECRET;
+  if (!patToken || !webhookSecret) {
+    throw new Error('GitHub PAT mode misconfigured: GITHUB_TOKEN and WEBHOOK_SECRET required');
+  }
+  const botMention =
+    process.env.GITHUB_BOT_MENTION || process.env.BOT_DISPLAY_NAME || config.botName;
+  const auth: GitHubAuth = { kind: 'pat', token: patToken };
+  const github = new GitHubAdapter(auth, webhookSecret, lockManager, botMention);
+  await github.start();
+  activePlatforms.push('GitHub');
+  getLog().info('github.adapter_mode_pat');
+  return { github, githubAppAuthProvider: null };
+}
+
+async function startGiteaAdapter(
+  config: GlobalConfig,
+  lockManager: ConversationLockManager,
+  activePlatforms: string[]
+): Promise<GiteaAdapter | null> {
+  if (!(process.env.GITEA_URL && process.env.GITEA_TOKEN && process.env.GITEA_WEBHOOK_SECRET)) {
+    getLog().info('gitea_adapter_skipped');
+    return null;
+  }
+  const botMention =
+    process.env.GITEA_BOT_MENTION || process.env.BOT_DISPLAY_NAME || config.botName;
+  const gitea = new GiteaAdapter(
+    process.env.GITEA_URL,
+    process.env.GITEA_TOKEN,
+    process.env.GITEA_WEBHOOK_SECRET,
+    lockManager,
+    botMention
+  );
+  await gitea.start();
+  activePlatforms.push('Gitea');
+  return gitea;
+}
+
+async function startGitLabAdapter(
+  config: GlobalConfig,
+  lockManager: ConversationLockManager,
+  activePlatforms: string[]
+): Promise<GitLabAdapter | null> {
+  if (!(process.env.GITLAB_TOKEN && process.env.GITLAB_WEBHOOK_SECRET)) {
+    getLog().info('gitlab_adapter_skipped');
+    return null;
+  }
+  const botMention =
+    process.env.GITLAB_BOT_MENTION || process.env.BOT_DISPLAY_NAME || config.botName;
+  const gitlab = new GitLabAdapter(
+    process.env.GITLAB_TOKEN,
+    process.env.GITLAB_WEBHOOK_SECRET,
+    lockManager,
+    process.env.GITLAB_URL || undefined,
+    botMention
+  );
+  await gitlab.start();
+  activePlatforms.push('GitLab');
+  return gitlab;
+}
+
+async function startDiscordAdapter(
+  lockManager: ConversationLockManager,
+  activePlatforms: string[]
+): Promise<DiscordAdapter | null> {
+  if (!process.env.DISCORD_BOT_TOKEN) {
+    getLog().info('discord_adapter_skipped');
+    return null;
+  }
+  const discordStreamingMode = (process.env.DISCORD_STREAMING_MODE ?? 'batch') as
+    | 'stream'
+    | 'batch';
+  const discord = new DiscordAdapter(process.env.DISCORD_BOT_TOKEN, discordStreamingMode);
+  registerDiscordMessageHandler(discord, lockManager);
+  try {
+    await discord.start();
+    activePlatforms.push('Discord');
+    return discord;
+  } catch (error) {
+    logDiscordStartFailure(error);
+    return null;
+  }
+}
+
+function registerDiscordMessageHandler(
+  discordAdapter: DiscordAdapter,
+  lockManager: ConversationLockManager
+): void {
+  const discordRequireMention = isDiscordMentionRequired();
+  discordAdapter.onMessage(async ({ message, platformUserId, displayName }) => {
+    let conversationId = discordAdapter.getConversationId(message);
+    if (!message.content) return;
+    const isDM = !message.guild;
+    if (!isDM && discordRequireMention && !discordAdapter.isBotMentioned(message)) return;
+    const content = discordAdapter.stripBotMention(message);
+    if (!content) return;
+    conversationId = await discordAdapter.ensureThread(conversationId, message);
+    const thread = await getDiscordThreadContext(discordAdapter, message);
+    const userId = await resolveUserId('discord', platformUserId, displayName);
+    lockManager
+      .acquireLock(conversationId, async () => {
+        await handleMessage(discordAdapter, conversationId, content, {
+          ...thread,
+          isolationHints: { workflowType: 'thread', workflowId: conversationId },
+          userId,
+        });
+      })
+      .catch(createMessageErrorHandler('Discord', discordAdapter, conversationId));
+  });
+}
+
+async function getDiscordThreadContext(
+  discordAdapter: DiscordAdapter,
+  message: Parameters<Parameters<DiscordAdapter['onMessage']>[0]>[0]['message']
+): Promise<{ threadContext?: string; parentConversationId?: string }> {
+  if (!discordAdapter.isThread(message)) return {};
+  const history = await discordAdapter.fetchThreadHistory(message);
+  const threadContext = history.length > 1 ? history.slice(0, -1).join('\n') : undefined;
+  const parentConversationId = discordAdapter.getParentChannelId(message) ?? undefined;
+  return { threadContext, parentConversationId };
+}
+
+function logDiscordStartFailure(error: unknown): void {
+  const err = error as Error;
+  const isPrivilegedIntentError = err.message?.includes('disallowed intents');
+  const hint = isPrivilegedIntentError
+    ? 'Enable "Message Content Intent" in the Discord Developer Portal ' +
+      '(your application > Bot > Privileged Gateway Intents) and restart, ' +
+      'or unset DISCORD_BOT_TOKEN if you do not want the Discord adapter.'
+    : 'Verify DISCORD_BOT_TOKEN is valid, or unset it to disable the Discord adapter.';
+  getLog().error({ err, hint }, 'discord.start_failed_continuing_without_adapter');
+}
+
+async function startSlackAdapter(
+  lockManager: ConversationLockManager,
+  activePlatforms: string[]
+): Promise<Pick<PlatformRuntime, 'slack' | 'slackBridge'>> {
+  if (!(process.env.SLACK_BOT_TOKEN && process.env.SLACK_APP_TOKEN)) {
+    getLog().info('slack_adapter_skipped');
+    return { slack: null, slackBridge: null };
+  }
+  const slackStreamingMode = (process.env.SLACK_STREAMING_MODE ?? 'batch') as 'stream' | 'batch';
+  const slack = new SlackAdapter(
+    process.env.SLACK_BOT_TOKEN,
+    process.env.SLACK_APP_TOKEN,
+    slackStreamingMode
+  );
+  registerSlackMessageHandler(slack, lockManager);
+  const slackBridge = new SlackWorkflowBridge(slack);
+  slackBridge.attach();
+  await slack.start();
+  activePlatforms.push('Slack');
+  return { slack, slackBridge };
+}
+
+function registerSlackMessageHandler(
+  slackAdapter: SlackAdapter,
+  lockManager: ConversationLockManager
+): void {
+  slackAdapter.onMessage(async event => {
+    const conversationId = slackAdapter.getConversationId(event);
+    if (!event.text) return;
+    const content = slackAdapter.stripBotMention(event.text);
+    if (!content) return;
+    const thread = await getSlackThreadContext(slackAdapter, event);
+    const userId = await resolveUserId('slack', event.user, event.displayName);
+    lockManager
+      .acquireLock(conversationId, async () => {
+        await handleMessage(slackAdapter, conversationId, content, {
+          ...thread,
+          isolationHints: { workflowType: 'thread', workflowId: conversationId },
+          userId,
+        });
+      })
+      .catch(createMessageErrorHandler('Slack', slackAdapter, conversationId));
+  });
+}
+
+async function getSlackThreadContext(
+  slackAdapter: SlackAdapter,
+  event: Parameters<Parameters<SlackAdapter['onMessage']>[0]>[0]
+): Promise<{ threadContext?: string; parentConversationId?: string }> {
+  if (!slackAdapter.isThread(event)) return {};
+  const history = await slackAdapter.fetchThreadHistory(event);
+  const threadContext = history.length > 1 ? history.slice(0, -1).join('\n') : undefined;
+  const parentConversationId = slackAdapter.getParentConversationId(event) ?? undefined;
+  return { threadContext, parentConversationId };
+}
+
+function createServerApp(
+  webAdapter: WebAdapter,
+  lockManager: ConversationLockManager,
+  activePlatforms: readonly string[],
+  github: GitHubAdapter | null
+): OpenAPIHono {
+  const app = new OpenAPIHono({ defaultHook: validationErrorHook });
+  app.onError((err, c) => {
+    getLog().error({ err, path: c.req.path, method: c.req.method }, 'unhandled_request_error');
+    return c.json({ error: 'Internal server error' }, 500);
+  });
+  registerWebAuthRoutes(app);
+  registerApiRoutes(app, webAdapter, lockManager, activePlatforms);
+  if (github) {
+    registerGithubWebhookRoute(app, github);
+    getLog().info('github_webhook_registered');
+  }
+  return app;
+}
+
+function registerWebAuthRoutes(app: OpenAPIHono): void {
+  const webAuth = getAuth();
+  if (!webAuth) return;
+  app.on(['POST', 'GET'], '/api/auth/*', (c, next) => {
+    if (isArchonOwnedAuthPath(c.req.path)) return next();
+    return webAuth.handler(c.req.raw);
+  });
+  getLog().info('web_auth.handler_registered');
+  if (getSignupMode() === 'disabled') {
+    getLog().warn(
+      {
+        hint: 'Set ARCHON_AUTH_ALLOWED_EMAILS to invite users, or ARCHON_AUTH_OPEN_SIGNUP=true for open signup.',
+      },
+      'web_auth.signup_disabled_no_allowlist'
+    );
+  }
+}
+
+function registerInternalGitCredentialRoute(app: OpenAPIHono, github: GitHubAdapter | null): void {
+  if (github?.getAuthMode() !== 'app') return;
+  const gitCredentialRequestSchema = z.object({
+    host: z.string().optional(),
+    path: z.string().optional(),
+  });
+
+  app.post('/internal/git-credential', async c => {
+    try {
+      const raw = await c.req.json().catch(() => null);
+      const parseResult = gitCredentialRequestSchema.safeParse(raw);
+      if (!parseResult.success || parseResult.data.host !== 'github.com') {
+        return c.json({ error: 'unsupported host' }, 400);
+      }
+      const parsed = parseGitCredentialPath(parseResult.data.path ?? '');
+      if (!parsed) return c.json({ error: 'unparseable path' }, 400);
+      const token = await github.getInstallationToken(parsed.owner, parsed.repo);
+      return c.json({ token });
+    } catch (err) {
+      getLog().error({ err }, 'internal.git_credential_resolve_failed');
+      return c.json({ error: 'resolution failed' }, 500);
+    }
+  });
+  getLog().info('internal_git_credential_endpoint_registered');
+}
+
+function registerForgeWebhookRoutes(
+  app: OpenAPIHono,
+  gitea: GiteaAdapter | null,
+  gitlab: GitLabAdapter | null
+): void {
+  if (gitea) registerGiteaWebhookRoute(app, gitea);
+  if (gitlab) registerGitLabWebhookRoute(app, gitlab);
+}
+
+function registerGiteaWebhookRoute(app: OpenAPIHono, gitea: GiteaAdapter): void {
+  app.post('/webhooks/gitea', async c => {
+    const eventType = c.req.header('x-gitea-event');
+    try {
+      const signature = c.req.header('x-gitea-signature');
+      if (!signature) return c.json({ error: 'Missing signature header' }, 400);
+      const payload = await c.req.text();
+      gitea.handleWebhook(payload, signature).catch((error: unknown) => {
+        getLog().error({ err: error, eventType }, 'gitea_webhook_processing_error');
+      });
+      return c.text('OK', 200);
+    } catch (error) {
+      getLog().error({ err: error, eventType }, 'gitea_webhook_endpoint_error');
+      return c.json({ error: 'Internal server error' }, 500);
+    }
+  });
+  getLog().info('gitea_webhook_registered');
+}
+
+function registerGitLabWebhookRoute(app: OpenAPIHono, gitlab: GitLabAdapter): void {
+  app.post('/webhooks/gitlab', async c => {
+    const eventType = c.req.header('x-gitlab-event');
+    try {
+      const token = c.req.header('x-gitlab-token');
+      if (!token) return c.json({ error: 'Missing token header' }, 400);
+      const payload = await c.req.text();
+      gitlab.handleWebhook(payload, token).catch((error: unknown) => {
+        getLog().error({ err: error, eventType }, 'gitlab.webhook_processing_error');
+      });
+      return c.text('OK', 200);
+    } catch (error) {
+      getLog().error({ err: error, eventType }, 'gitlab.webhook_endpoint_error');
+      return c.json({ error: 'Internal server error' }, 500);
+    }
+  });
+  getLog().info('gitlab_webhook_registered');
+}
+
+function registerHealthRoutes(app: OpenAPIHono, lockManager: ConversationLockManager): void {
+  app.get('/health', c => c.json({ status: 'ok' }));
+  app.get('/health/db', async c => {
+    try {
+      await pool.query('SELECT 1');
+      return c.json({ status: 'ok', database: 'connected' });
+    } catch (error) {
+      getLog().error({ err: error }, 'health_check_db_failed');
+      return c.json({ status: 'error', database: 'disconnected' }, 500);
+    }
+  });
+  app.get('/health/concurrency', c => {
+    const { active, queuedTotal, maxConcurrent } = lockManager.getStats();
+    return c.json({ status: 'ok', active, queuedTotal, maxConcurrent });
+  });
+}
+
+async function registerStaticRoutes(app: OpenAPIHono, opts: ServerOptions): Promise<void> {
+  if (process.env.NODE_ENV !== 'production' && process.env.WEB_UI_DEV) return;
+  const { serveStatic } = await import('hono/bun');
+  const pathModule = await import('path');
+  const webDistPath =
+    opts.webDistPath ??
+    pathModule.join(pathModule.dirname(pathModule.dirname(import.meta.dir)), 'web', 'dist');
+  if (!existsSync(webDistPath)) {
+    getLog().warn({ webDistPath }, 'web_dist_not_found');
+  }
+  app.use('/assets/*', serveStatic({ root: webDistPath }));
+  app.use('/favicon.png', serveStatic({ root: webDistPath, path: 'favicon.png' }));
+  app.get('*', serveStatic({ root: webDistPath, path: 'index.html' }));
+}
+
+function assertSafeInternalBind(
+  githubAppAuthProvider: IGitHubAppAuthProvider | null,
+  hostname: string
+): void {
+  if (!githubAppAuthProvider || hostname === '127.0.0.1' || hostname === 'localhost') return;
+  if (process.env.ARCHON_ALLOW_INTERNAL_ON_PUBLIC_BIND === '1') {
+    getLog().warn({ hostname }, 'github_app.internal_endpoint_exposed_acknowledged');
+    return;
+  }
+  getLog().fatal({ hostname }, 'github_app.internal_endpoint_public_bind_rejected');
+  throw new Error(
+    'GitHub App mode is active but the server is bound to a non-loopback ' +
+      `interface (${hostname}). The /internal/git-credential endpoint hands out ` +
+      'live installation tokens — exposing it would leak credentials to the network. ' +
+      'Either bind to 127.0.0.1 (HOST=127.0.0.1), or, if your reverse proxy already ' +
+      'drops /internal/* and the upstream needs a non-loopback bind, opt out by ' +
+      'setting ARCHON_ALLOW_INTERNAL_ON_PUBLIC_BIND=1.'
+  );
+}
+
+function warnIfHeaderTrustPublic(hostname: string): void {
+  const webAuthHeaderTrustActive =
+    Boolean(process.env.ARCHON_WEB_AUTH_HEADER) || isPerUserGitHubEnabled() || isWebAuthEnabled();
+  if (!webAuthHeaderTrustActive || hostname === '127.0.0.1' || hostname === 'localhost') return;
+  getLog().warn(
+    { hostname, headerName: process.env.ARCHON_WEB_AUTH_HEADER || 'X-Archon-User' },
+    'web_auth.header_trust_on_public_bind'
+  );
+}
+
+function serveHttp(app: OpenAPIHono, port: number): void {
+  const hostname = process.env.HOST || '0.0.0.0';
+  const server = Bun.serve({
+    fetch: app.fetch,
+    hostname,
+    port,
+    idleTimeout: 255,
+  });
+  getLog().info({ port: server.port, hostname }, 'server_listening');
+}
+
+export async function startServer(opts: ServerOptions = {}): Promise<void> {
+  getLog().info('server_starting');
+  // Anonymous once-per-boot startup event (self-gates on opt-out). Flushed by
+  // the shutdownTelemetry() call in the SIGINT/SIGTERM shutdown handler.
+  // Deployment shape is categorical only — booleans/enums derived from which
+  // integrations are configured, never the config values themselves. The
+  // adapter gates mirror the env checks the adapter-init section below uses
+  // (loadArchonEnv() ran at module load, so process.env is final here).
+  const deploymentShape = createDeploymentShape();
+  captureArchonStarted({ surface: 'server', ...deploymentShape });
+
+  // Daily heartbeat so long-running servers stay visible in active-install
+  // metrics (a boot-only event undercounts server installs after day one).
+  // unref() so the timer never keeps the process alive on shutdown.
+  // captureArchonActive is synchronous fire-and-forget (errors swallowed
+  // internally) — if it ever becomes async, this callback must not return
+  // its promise unhandled.
+  startTelemetryHeartbeat(deploymentShape);
+
+  // Phase 2: validate the encryption key the moment per-user provider keys are
+  // enabled, regardless of GitHub App configuration. TOKEN_ENCRYPTION_KEY alone
+  // is the gate — a malformed key must fail boot here rather than at the first
+  // PUT /api/auth/providers/* (when an operator is already wired in).
+  // No-op when the feature is disabled.
+  assertProviderKeysKeyAtBoot();
+
+  // Database auto-detected: SQLite (default) or PostgreSQL (if DATABASE_URL set)
+  // No required environment variables - SQLite works out of the box
+
+  // Validate AI assistant credentials (warn if missing, don't fail).
+  // A per-user install (TOKEN_ENCRYPTION_KEY) is a valid posture even with no
+  // shared Claude key — auth is delivered per request from the encrypted store,
+  // so it must NOT trip the no-credentials exit (#1983).
+  assertAiCredentialPosture();
 
   // Test database connection
   try {
@@ -348,327 +919,25 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   // - transport's cleanup callback references persistence/workflowBridge (declared after, but
   //   only invoked from a grace period timer — well after all constructors complete)
   // - persistence's emitEvent closure references transport.emit (same lazy pattern)
-  const transport = new SSETransport(conversationId => {
-    // Flush (not clear!) — the orchestrator/workflow may still be writing messages
-    // even though the SSE stream disconnected. Clearing the dbId mapping would cause
-    // all subsequent messages to be lost (never persisted to DB).
-    void persistence.flush(conversationId).catch((e: unknown) => {
-      getLog().error({ conversationId, err: e }, 'transport_cleanup_flush_failed');
-    });
-  });
-  const persistence = new MessagePersistence((conversationId, event) =>
-    transport.emit(conversationId, event)
-  );
-  const workflowBridge = new WorkflowEventBridge(transport);
-  const webAdapter = new WebAdapter(transport, persistence, workflowBridge);
-  await webAdapter.start();
-  persistence.startPeriodicFlush();
+  const { persistence, webAdapter, dashboardPoller, pgNotifyListener } = await startWebRuntime();
 
   // Stream workflow runs started in ANY process (incl. the `archon` CLI / `--detach`)
   // to the console dashboard. The in-process WorkflowEventBridge only sees runs
   // executed inside the server; this poller tails the events table. On Postgres,
   // LISTEN/NOTIFY wakes it for near-instant push (poll becomes a slow backstop);
   // on SQLite it polls fast.
-  const dashboardPoller = new DashboardEventPoller();
-  const dbNotifier = getDbNotificationListener();
-  let pgNotifyListener: PgNotifyListener | undefined;
-  if (dbNotifier) {
-    dashboardPoller.start(transport, 10_000);
-    pgNotifyListener = new PgNotifyListener(dbNotifier, dashboardPoller);
-    await pgNotifyListener.start();
-  } else {
-    dashboardPoller.start(transport, 1_500);
-  }
-
   // Mutable — pushed to as each adapter starts, read by the /api/health endpoint.
   // Must be a live reference because Telegram starts after the HTTP listener begins
   // accepting requests, so a snapshot taken at registration time would miss it.
   const activePlatforms: string[] = ['Web'];
 
-  // Platform adapters (skipped in CLI serve mode or when not configured)
-  let github: GitHubAdapter | null = null;
-  let githubAppAuthProvider: IGitHubAppAuthProvider | null = null;
-  let gitea: GiteaAdapter | null = null;
-  let gitlab: GitLabAdapter | null = null;
-  let discord: DiscordAdapter | null = null;
-  let slack: SlackAdapter | null = null;
-  let slackBridge: SlackWorkflowBridge | null = null;
-
-  if (!opts.skipPlatformAdapters) {
-    // Check that at least one platform is configured
-    const hasTelegram = Boolean(process.env.TELEGRAM_BOT_TOKEN);
-    const hasDiscord = Boolean(process.env.DISCORD_BOT_TOKEN);
-    // GitHub adapter: dual-mode (App vs PAT). Fail fast if both are configured —
-    // silently preferring one would create 3am debugging sessions for an operator
-    // who copy-pasted half a config and didn't realise the other half was already
-    // set in /etc/archon/.env. (PRD: "fail-fast on misconfig".)
-    const ghAuthMode = selectGitHubAuthMode(process.env);
-    if (ghAuthMode.kind === 'conflict') {
-      throw new Error(ghAuthMode.message);
-    }
-    const hasGitHub = ghAuthMode.kind !== 'none';
-    const hasGitea = Boolean(
-      process.env.GITEA_URL && process.env.GITEA_TOKEN && process.env.GITEA_WEBHOOK_SECRET
-    );
-    const hasGitLab = Boolean(process.env.GITLAB_TOKEN && process.env.GITLAB_WEBHOOK_SECRET);
-
-    if (!hasTelegram && !hasDiscord && !hasGitHub && !hasGitea && !hasGitLab) {
-      getLog().warn('no_platform_adapters_configured');
-    }
-
-    if (ghAuthMode.kind === 'app') {
-      // Locals avoid `!` non-null assertions: hasGitHubApp already guarantees
-      // GITHUB_APP_ID and WEBHOOK_SECRET are set, but the linter can't infer that.
-      const appId = process.env.GITHUB_APP_ID;
-      const webhookSecret = process.env.WEBHOOK_SECRET;
-      if (!appId || !webhookSecret) {
-        throw new Error('GitHub App mode misconfigured: GITHUB_APP_ID and WEBHOOK_SECRET required');
-      }
-      const privateKey = loadAppPrivateKey();
-      // Fail fast on a malformed TOKEN_ENCRYPTION_KEY when per-user is enabled,
-      // so we never store unencryptable tokens at runtime. If the key is absent,
-      // per-user GitHub is simply disabled (App-for-bot-only remains valid).
-      assertEncryptionKeyAtBoot();
-      if (!isPerUserGitHubEnabled()) {
-        getLog().warn(
-          'github_app.per_user_disabled — set TOKEN_ENCRYPTION_KEY (and GITHUB_APP_CLIENT_ID) to enable per-user GitHub identity'
-        );
-      }
-      const defaultInstallationId = process.env.GITHUB_APP_INSTALLATION_ID
-        ? Number(process.env.GITHUB_APP_INSTALLATION_ID)
-        : undefined;
-      githubAppAuthProvider = createGitHubAppAuthProvider({
-        appId,
-        privateKey,
-        slug: process.env.GITHUB_APP_SLUG ?? 'archon',
-        defaultInstallationId,
-      });
-      // Register on the module-level singleton consumed by createWorkflowDeps()
-      // so bash/script subprocess env injection picks up the provider.
-      registerGitHubAppAuthProvider(githubAppAuthProvider);
-      const botMention =
-        process.env.GITHUB_BOT_MENTION || process.env.BOT_DISPLAY_NAME || config.botName;
-      const auth: GitHubAuth = { kind: 'app', provider: githubAppAuthProvider };
-      // Per-user comment attribution: when enabled, let the adapter author PR/
-      // issue comments under the originating user's GitHub identity. Resolver
-      // returns undefined for unconnected users → bot identity fallback.
-      const getUserToken = isPerUserGitHubEnabled()
-        ? async (userId: string): Promise<string | undefined> =>
-            (await getDecryptedAccessToken(userId)) ?? undefined
-        : undefined;
-      github = new GitHubAdapter(auth, webhookSecret, lockManager, botMention, { getUserToken });
-      await github.start();
-      activePlatforms.push('GitHub (App)');
-      getLog().info(
-        { slug: githubAppAuthProvider.slug, defaultInstallationId },
-        'github.adapter_mode_app'
-      );
-    } else if (ghAuthMode.kind === 'pat') {
-      const patToken = process.env.GITHUB_TOKEN;
-      const webhookSecret = process.env.WEBHOOK_SECRET;
-      if (!patToken || !webhookSecret) {
-        throw new Error('GitHub PAT mode misconfigured: GITHUB_TOKEN and WEBHOOK_SECRET required');
-      }
-      const botMention =
-        process.env.GITHUB_BOT_MENTION || process.env.BOT_DISPLAY_NAME || config.botName;
-      const auth: GitHubAuth = { kind: 'pat', token: patToken };
-      github = new GitHubAdapter(auth, webhookSecret, lockManager, botMention);
-      await github.start();
-      activePlatforms.push('GitHub');
-      getLog().info('github.adapter_mode_pat');
-    } else {
-      getLog().info('github_adapter_skipped');
-    }
-
-    // Initialize Gitea adapter (conditional)
-    if (process.env.GITEA_URL && process.env.GITEA_TOKEN && process.env.GITEA_WEBHOOK_SECRET) {
-      const giteaBotMention =
-        process.env.GITEA_BOT_MENTION || process.env.BOT_DISPLAY_NAME || config.botName;
-      gitea = new GiteaAdapter(
-        process.env.GITEA_URL,
-        process.env.GITEA_TOKEN,
-        process.env.GITEA_WEBHOOK_SECRET,
-        lockManager,
-        giteaBotMention
-      );
-      await gitea.start();
-      activePlatforms.push('Gitea');
-    } else {
-      getLog().info('gitea_adapter_skipped');
-    }
-
-    // Initialize GitLab adapter (conditional)
-    if (process.env.GITLAB_TOKEN && process.env.GITLAB_WEBHOOK_SECRET) {
-      const gitlabBotMention =
-        process.env.GITLAB_BOT_MENTION || process.env.BOT_DISPLAY_NAME || config.botName;
-      gitlab = new GitLabAdapter(
-        process.env.GITLAB_TOKEN,
-        process.env.GITLAB_WEBHOOK_SECRET,
-        lockManager,
-        process.env.GITLAB_URL || undefined,
-        gitlabBotMention
-      );
-      await gitlab.start();
-      activePlatforms.push('GitLab');
-    } else {
-      getLog().info('gitlab_adapter_skipped');
-    }
-
-    // Initialize Discord adapter (conditional)
-    if (process.env.DISCORD_BOT_TOKEN) {
-      const discordStreamingMode = (process.env.DISCORD_STREAMING_MODE ?? 'batch') as
-        | 'stream'
-        | 'batch';
-      discord = new DiscordAdapter(process.env.DISCORD_BOT_TOKEN, discordStreamingMode);
-      const discordAdapter = discord; // Capture for use in callback
-      const discordRequireMention = isDiscordMentionRequired();
-
-      // Register message handler
-      discordAdapter.onMessage(async ({ message, platformUserId, displayName }) => {
-        // Get initial conversation ID
-        let conversationId = discordAdapter.getConversationId(message);
-
-        // Skip if no content
-        if (!message.content) return;
-
-        // Check if bot was mentioned (required for activation unless
-        // DISCORD_REQUIRE_MENTION=false opts out of the gate)
-        // Exception: DMs never require mention
-        const isDM = !message.guild;
-        if (!isDM && discordRequireMention && !discordAdapter.isBotMentioned(message)) {
-          return; // Ignore messages that don't mention the bot
-        }
-
-        // Strip the bot mention from the message
-        const content = discordAdapter.stripBotMention(message);
-        if (!content) return; // Message was only a mention with no content
-
-        // Ensure we're responding in a thread - creates one if needed
-        conversationId = await discordAdapter.ensureThread(conversationId, message);
-
-        // Check for thread context (now we're guaranteed to be in a thread if applicable)
-        let threadContext: string | undefined;
-        let parentConversationId: string | undefined;
-
-        if (discordAdapter.isThread(message)) {
-          // Fetch thread history for context (exclude current message)
-          const history = await discordAdapter.fetchThreadHistory(message);
-          if (history.length > 1) {
-            threadContext = history.slice(0, -1).join('\n');
-          }
-
-          // Get parent channel ID for context inheritance
-          parentConversationId = discordAdapter.getParentChannelId(message) ?? undefined;
-        }
-
-        // Resolve Discord author → Archon user UUID.
-        // displayName is already display-quality on Discord (no extra API call needed).
-        const userId = await resolveUserId('discord', platformUserId, displayName);
-
-        // Fire-and-forget: handler returns immediately, processing happens async
-        lockManager
-          .acquireLock(conversationId, async () => {
-            await handleMessage(discordAdapter, conversationId, content, {
-              threadContext,
-              parentConversationId,
-              isolationHints: { workflowType: 'thread', workflowId: conversationId },
-              userId,
-            });
-          })
-          .catch(createMessageErrorHandler('Discord', discordAdapter, conversationId));
-      });
-
-      // Don't let a Discord login failure (bad token, missing privileged
-      // intents, etc.) bring down the whole server — users running
-      // `archon serve` for the web UI shouldn't lose it because of an
-      // unrelated bot misconfiguration. See #1365.
-      try {
-        await discord.start();
-        activePlatforms.push('Discord');
-      } catch (error) {
-        const err = error as Error;
-        const isPrivilegedIntentError = err.message?.includes('disallowed intents');
-        const hint = isPrivilegedIntentError
-          ? 'Enable "Message Content Intent" in the Discord Developer Portal ' +
-            '(your application > Bot > Privileged Gateway Intents) and restart, ' +
-            'or unset DISCORD_BOT_TOKEN if you do not want the Discord adapter.'
-          : 'Verify DISCORD_BOT_TOKEN is valid, or unset it to disable the Discord adapter.';
-        getLog().error({ err, hint }, 'discord.start_failed_continuing_without_adapter');
-        discord = null;
-      }
-    } else {
-      getLog().info('discord_adapter_skipped');
-    }
-
-    // Initialize Slack adapter (conditional)
-    if (process.env.SLACK_BOT_TOKEN && process.env.SLACK_APP_TOKEN) {
-      const slackStreamingMode = (process.env.SLACK_STREAMING_MODE ?? 'batch') as
-        | 'stream'
-        | 'batch';
-      slack = new SlackAdapter(
-        process.env.SLACK_BOT_TOKEN,
-        process.env.SLACK_APP_TOKEN,
-        slackStreamingMode
-      );
-      const slackAdapter = slack; // Capture for use in callback
-
-      // Register message handler
-      slackAdapter.onMessage(async event => {
-        const conversationId = slackAdapter.getConversationId(event);
-
-        // Skip if no text
-        if (!event.text) return;
-
-        // Strip the bot mention from the message
-        const content = slackAdapter.stripBotMention(event.text);
-        if (!content) return; // Message was only a mention with no content
-
-        // Check for thread context
-        let threadContext: string | undefined;
-        let parentConversationId: string | undefined;
-
-        if (slackAdapter.isThread(event)) {
-          // Fetch thread history for context (exclude current message)
-          const history = await slackAdapter.fetchThreadHistory(event);
-          if (history.length > 1) {
-            threadContext = history.slice(0, -1).join('\n');
-          }
-
-          // Get parent conversation ID for context inheritance
-          parentConversationId = slackAdapter.getParentConversationId(event) ?? undefined;
-        }
-
-        // Resolve Slack user → Archon user UUID. displayName comes from
-        // the adapter's users.info enrichment (cached per slackUserId).
-        const userId = await resolveUserId('slack', event.user, event.displayName);
-
-        // Fire-and-forget: handler returns immediately, processing happens async
-        lockManager
-          .acquireLock(conversationId, async () => {
-            await handleMessage(slackAdapter, conversationId, content, {
-              threadContext,
-              parentConversationId,
-              isolationHints: { workflowType: 'thread', workflowId: conversationId },
-              userId,
-            });
-          })
-          .catch(createMessageErrorHandler('Slack', slackAdapter, conversationId));
-      });
-
-      // Attach the workflow bridge BEFORE app.start(): Bolt's Socket Mode
-      // refuses new event-handler registrations once the connection is open,
-      // so `app.action(...)` calls inside the bridge must run first.
-      slackBridge = new SlackWorkflowBridge(slack);
-      slackBridge.attach();
-
-      await slack.start();
-      activePlatforms.push('Slack');
-    } else {
-      getLog().info('slack_adapter_skipped');
-    }
-  } else {
-    getLog().info('platform_adapters_skipped');
-  }
+  const platforms = await startPlatformAdapters(
+    config,
+    lockManager,
+    activePlatforms,
+    opts.skipPlatformAdapters
+  );
+  const { github, githubAppAuthProvider, gitea, gitlab, discord, slack, slackBridge } = platforms;
 
   // Fail fast on a misconfigured web-auth secret before binding a socket: when
   // web auth is enabled, BETTER_AUTH_SECRET must be long enough to be a real
@@ -676,253 +945,18 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   assertWebAuthAtBoot();
 
   // Setup Hono server
-  const app = new OpenAPIHono({ defaultHook: validationErrorHook });
-  const port = opts.port ?? (await getPort());
-
-  // Global error handler for unhandled exceptions
-  app.onError((err, c) => {
-    getLog().error({ err, path: c.req.path, method: c.req.method }, 'unhandled_request_error');
-    return c.json({ error: 'Internal server error' }, 500);
-  });
-
-  // Opt-in web auth (Better Auth). Mount the handler at /api/auth/* AFTER
-  // app.onError and BEFORE registerApiRoutes (so it wins over the '*' SPA
-  // fallback). getAuth() returns null when web auth is disabled — solo/SQLite
-  // installs mount nothing and behave exactly as before.
-  //
-  // Better Auth's basePath is /api/auth, so its handler is a catch-all under
-  // that prefix. Archon ALSO owns a few /api/auth/* routes (status + the GitHub
-  // device flow) registered later in registerApiRoutes. To avoid shadowing
-  // them, explicitly fall through (next()) for those Archon-owned paths so the
-  // later route handlers run; everything else under /api/auth/* is Better Auth.
-  // DELETE isn't registered here, so DELETE /api/auth/github is never
-  // intercepted either. (Raw app.on, not registerOpenApiRoute: Better Auth is
-  // an external handler serving its own non-OpenAPI surface, like the webhooks.)
-  const webAuth = getAuth();
-  if (webAuth) {
-    // isArchonOwnedAuthPath (in ./auth/config) is the single source of truth for
-    // which /api/auth/* paths fall through to Archon's own handlers vs. Better
-    // Auth. A guard test asserts every Archon-registered /api/auth/* route is in
-    // it, so adding a route without exempting it fails CI rather than 404ing live.
-    app.on(['POST', 'GET'], '/api/auth/*', (c, next) => {
-      if (isArchonOwnedAuthPath(c.req.path)) return next();
-      return webAuth.handler(c.req.raw);
-    });
-    getLog().info('web_auth.handler_registered');
-    // Safe-default signal: web auth is on but no allowlist + no open-signup flag
-    // → self-serve registration is OFF. Surface it so an operator who meant to
-    // invite teammates isn't silently locked out of signups.
-    if (getSignupMode() === 'disabled') {
-      getLog().warn(
-        {
-          hint: 'Set ARCHON_AUTH_ALLOWED_EMAILS to invite users, or ARCHON_AUTH_OPEN_SIGNUP=true for open signup.',
-        },
-        'web_auth.signup_disabled_no_allowlist'
-      );
-    }
-  }
-
-  // Register Web UI API routes
-  registerApiRoutes(app, webAdapter, lockManager, activePlatforms);
-
-  // GitHub webhook endpoint
-  if (github) {
-    registerGithubWebhookRoute(app, github);
-    getLog().info('github_webhook_registered');
-  }
-
-  // Internal endpoint: git credential helper.
-  //
-  // SECURITY: hands out live installation access tokens to anyone who can hit
-  // this URL. MUST be exposed on 127.0.0.1 only — the reverse proxy in front
-  // of Archon must NOT forward `/internal/*`. The startup guard below refuses
-  // to start the server (fatal error) when the operator binds to a non-loopback
-  // host with App mode active, unless ARCHON_ALLOW_INTERNAL_ON_PUBLIC_BIND=1.
-  if (github?.getAuthMode() === 'app') {
-    // Request schema for /internal/git-credential. Validates the small
-    // host/path payload the credential helper sends. Inline declaration
-    // because the endpoint is a one-off internal surface (not part of the
-    // OpenAPI-published API), so it doesn't belong in routes/schemas/.
-    const gitCredentialRequestSchema = z.object({
-      host: z.string().optional(),
-      path: z.string().optional(),
-    });
-
-    app.post('/internal/git-credential', async c => {
-      try {
-        const raw = await c.req.json().catch(() => null);
-        const parseResult = gitCredentialRequestSchema.safeParse(raw);
-        if (!parseResult.success || parseResult.data.host !== 'github.com') {
-          return c.json({ error: 'unsupported host' }, 400);
-        }
-        const parsed = parseGitCredentialPath(parseResult.data.path ?? '');
-        if (!parsed) {
-          return c.json({ error: 'unparseable path' }, 400);
-        }
-        const token = await github.getInstallationToken(parsed.owner, parsed.repo);
-        return c.json({ token });
-      } catch (err) {
-        // ERROR (not WARN): this is a live credential-vending failure. If we
-        // can't issue a token, every workflow `git push` and `gh` call against
-        // that repo will start failing — operators need this surfaced loudly.
-        getLog().error({ err }, 'internal.git_credential_resolve_failed');
-        return c.json({ error: 'resolution failed' }, 500);
-      }
-    });
-    getLog().info('internal_git_credential_endpoint_registered');
-  }
-
-  // Gitea webhook endpoint
-  if (gitea) {
-    app.post('/webhooks/gitea', async c => {
-      const eventType = c.req.header('x-gitea-event');
-
-      try {
-        const signature = c.req.header('x-gitea-signature');
-        if (!signature) {
-          return c.json({ error: 'Missing signature header' }, 400);
-        }
-
-        // CRITICAL: Use c.req.text() for raw body (signature verification)
-        const payload = await c.req.text();
-
-        // Process async (fire-and-forget for fast webhook response)
-        gitea.handleWebhook(payload, signature).catch((error: unknown) => {
-          getLog().error({ err: error, eventType }, 'gitea_webhook_processing_error');
-        });
-
-        return c.text('OK', 200);
-      } catch (error) {
-        getLog().error({ err: error, eventType }, 'gitea_webhook_endpoint_error');
-        return c.json({ error: 'Internal server error' }, 500);
-      }
-    });
-    getLog().info('gitea_webhook_registered');
-  }
-
-  // GitLab webhook endpoint
-  if (gitlab) {
-    app.post('/webhooks/gitlab', async c => {
-      const eventType = c.req.header('x-gitlab-event');
-
-      try {
-        const token = c.req.header('x-gitlab-token');
-        if (!token) {
-          return c.json({ error: 'Missing token header' }, 400);
-        }
-
-        const payload = await c.req.text();
-
-        gitlab.handleWebhook(payload, token).catch((error: unknown) => {
-          getLog().error({ err: error, eventType }, 'gitlab.webhook_processing_error');
-        });
-
-        return c.text('OK', 200);
-      } catch (error) {
-        getLog().error({ err: error, eventType }, 'gitlab.webhook_endpoint_error');
-        return c.json({ error: 'Internal server error' }, 500);
-      }
-    });
-    getLog().info('gitlab_webhook_registered');
-  }
-
-  // Health check endpoints
-  app.get('/health', c => {
-    return c.json({ status: 'ok' });
-  });
-
-  app.get('/health/db', async c => {
-    try {
-      await pool.query('SELECT 1');
-      return c.json({ status: 'ok', database: 'connected' });
-    } catch (error) {
-      getLog().error({ err: error }, 'health_check_db_failed');
-      return c.json({ status: 'error', database: 'disconnected' }, 500);
-    }
-  });
-
-  app.get('/health/concurrency', c => {
-    const { active, queuedTotal, maxConcurrent } = lockManager.getStats();
-    return c.json({ status: 'ok', active, queuedTotal, maxConcurrent });
-  });
-
-  // Serve web UI static files in production
-  // Uses import.meta.dir for absolute path (CWD varies with bun --filter)
-  if (process.env.NODE_ENV === 'production' || !process.env.WEB_UI_DEV) {
-    const { serveStatic } = await import('hono/bun');
-    const pathModule = await import('path');
-    const webDistPath =
-      opts.webDistPath ??
-      pathModule.join(pathModule.dirname(pathModule.dirname(import.meta.dir)), 'web', 'dist');
-
-    if (!existsSync(webDistPath)) {
-      getLog().warn({ webDistPath }, 'web_dist_not_found');
-    }
-
-    app.use('/assets/*', serveStatic({ root: webDistPath }));
-    app.use('/favicon.png', serveStatic({ root: webDistPath, path: 'favicon.png' }));
-    // SPA fallback - serve index.html for unmatched routes (after all API routes)
-    app.get('*', serveStatic({ root: webDistPath, path: 'index.html' }));
-  }
+  const app = createServerApp(webAdapter, lockManager, activePlatforms, github);
+  registerInternalGitCredentialRoute(app, github);
+  registerForgeWebhookRoutes(app, gitea, gitlab);
+  registerHealthRoutes(app, lockManager);
+  await registerStaticRoutes(app, opts);
 
   const hostname = process.env.HOST || '0.0.0.0';
+  assertSafeInternalBind(githubAppAuthProvider, hostname);
+  warnIfHeaderTrustPublic(hostname);
 
-  // Security guardrail: /internal/git-credential hands out live installation
-  // access tokens. Fail fast (not just WARN) when App mode is active and the
-  // server is bound to a non-loopback interface — a WARN line in startup
-  // logs is too easy to scroll past, and the failure mode is "anyone on the
-  // network who can hit the port pulls a live token". Operators who deliberately
-  // firewall externally (so loopback bind would block their reverse proxy's
-  // upstream) can opt out via ARCHON_ALLOW_INTERNAL_ON_PUBLIC_BIND=1.
-  //
-  // Runs BEFORE Bun.serve so a rejected config never opens the listening
-  // socket — even briefly — and `server_listening` is never logged.
-  if (githubAppAuthProvider && hostname !== '127.0.0.1' && hostname !== 'localhost') {
-    if (process.env.ARCHON_ALLOW_INTERNAL_ON_PUBLIC_BIND === '1') {
-      getLog().warn({ hostname }, 'github_app.internal_endpoint_exposed_acknowledged');
-    } else {
-      getLog().fatal({ hostname }, 'github_app.internal_endpoint_public_bind_rejected');
-      throw new Error(
-        'GitHub App mode is active but the server is bound to a non-loopback ' +
-          `interface (${hostname}). The /internal/git-credential endpoint hands out ` +
-          'live installation tokens — exposing it would leak credentials to the network. ' +
-          'Either bind to 127.0.0.1 (HOST=127.0.0.1), or, if your reverse proxy already ' +
-          'drops /internal/* and the upstream needs a non-loopback bind, opt out by ' +
-          'setting ARCHON_ALLOW_INTERNAL_ON_PUBLIC_BIND=1.'
-      );
-    }
-  }
-
-  // Security guardrail (advisory): the web identity header (ARCHON_WEB_AUTH_HEADER,
-  // default X-Archon-User) is trusted as-is — Archon attributes web requests to
-  // whoever the header names. That is only sound when Archon is reachable SOLELY
-  // through a reverse proxy that authenticates and sets the header (loopback bind).
-  // On a non-loopback bind any client that can reach the port can forge it:
-  // cosmetic misattribution without per-user GitHub, but in per-user mode a forged
-  // header can read/disconnect another user's GitHub connection or bind a
-  // device-flow token under their identity. WARN (not fatal) so existing exposed
-  // installs without per-user identity keep starting — but the misconfiguration is
-  // surfaced. The default header name means the trust is live even when
-  // ARCHON_WEB_AUTH_HEADER is unset, so per-user mode alone arms this check.
-  // Web auth (Better Auth) also keeps the header active as a fallback (proxy
-  // deploys / auth-service sidecar), so an enabled install on a public bind
-  // gets the same advisory.
-  const webAuthHeaderTrustActive =
-    Boolean(process.env.ARCHON_WEB_AUTH_HEADER) || isPerUserGitHubEnabled() || isWebAuthEnabled();
-  if (webAuthHeaderTrustActive && hostname !== '127.0.0.1' && hostname !== 'localhost') {
-    getLog().warn(
-      { hostname, headerName: process.env.ARCHON_WEB_AUTH_HEADER || 'X-Archon-User' },
-      'web_auth.header_trust_on_public_bind'
-    );
-  }
-
-  const server = Bun.serve({
-    fetch: app.fetch,
-    hostname,
-    port,
-    idleTimeout: 255, // Max value (seconds) - prevents SSE connections from being killed
-  });
-  getLog().info({ port: server.port, hostname }, 'server_listening');
+  const port = opts.port ?? (await getPort());
+  serveHttp(app, port);
 
   // Initialize Telegram adapter (conditional, skipped in CLI serve mode)
   let telegram: TelegramAdapter | null = null;

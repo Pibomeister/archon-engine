@@ -28,6 +28,88 @@ interface AssistantBuffer {
   segments: BufferedSegment[];
 }
 
+function shouldSkipText(metadata?: MessageMetadata): boolean {
+  return metadata?.category === 'tool_call_formatted' || metadata?.category === 'isolation_context';
+}
+
+function skipTextLogName(category: MessageMetadata['category'] | undefined): string {
+  return category === 'tool_call_formatted'
+    ? 'persistence_skip_tool_call_formatted'
+    : 'persistence_skip_isolation_context';
+}
+
+function isWorkflowStatusCategory(category?: MessageMetadata['category']): boolean {
+  return category === 'workflow_status' || category === 'workflow_dispatch_status';
+}
+
+function shouldStartNewSegment(
+  lastSeg: BufferedSegment | undefined,
+  metadata?: MessageMetadata
+): boolean {
+  if (!lastSeg) return true;
+  const segmentDirective = metadata?.segment ?? 'auto';
+  if (segmentDirective === 'new') return true;
+  if (segmentDirective !== 'auto') return false;
+  return (
+    lastSeg.toolCalls.length > 0 ||
+    isWorkflowStatusCategory(metadata?.category) ||
+    isWorkflowStatusCategory(lastSeg.category)
+  );
+}
+
+function createSegment(message: string, metadata?: MessageMetadata): BufferedSegment {
+  return {
+    content: message,
+    toolCalls: [],
+    category: metadata?.category,
+    workflowDispatch: metadata?.workflowDispatch,
+    workflowResult: metadata?.workflowResult,
+  };
+}
+
+function finalizeLastToolDuration(seg: BufferedSegment, now: number): void {
+  const lastTool = seg.toolCalls[seg.toolCalls.length - 1];
+  if (lastTool && lastTool.duration === undefined) {
+    lastTool.duration = now - lastTool.startedAt;
+  }
+}
+
+function finalizeSegmentDurations(segments: BufferedSegment[], now: number): void {
+  for (const seg of segments) {
+    finalizeLastToolDuration(seg, now);
+  }
+}
+
+function splitReadySegments(segments: BufferedSegment[]): {
+  ready: BufferedSegment[];
+  pending: BufferedSegment[];
+} {
+  const ready: BufferedSegment[] = [];
+  const pending: BufferedSegment[] = [];
+  for (const seg of segments) {
+    const hasInflightTool = seg.toolCalls.some(
+      tc => tc.output === undefined && tc.duration === undefined
+    );
+    if (hasInflightTool) pending.push(seg);
+    else ready.push(seg);
+  }
+  return { ready, pending };
+}
+
+function segmentMetadata(seg: BufferedSegment): Record<string, unknown> {
+  const toolCalls = seg.toolCalls.map(tc => ({
+    name: tc.name,
+    input: tc.input,
+    duration: tc.duration,
+    ...(tc.output !== undefined ? { output: tc.output } : {}),
+  }));
+  return {
+    ...(toolCalls.length > 0 ? { toolCalls } : {}),
+    ...(seg.workflowDispatch ? { workflowDispatch: seg.workflowDispatch } : {}),
+    ...(seg.workflowResult ? { workflowResult: seg.workflowResult } : {}),
+  };
+}
+
 export class MessagePersistence {
   private assistantBuffer = new Map<string, AssistantBuffer>();
   private dbIdMap = new Map<string, string>(); // platform_conversation_id → DB UUID
@@ -42,46 +124,20 @@ export class MessagePersistence {
   }
 
   appendText(conversationId: string, message: string, metadata?: MessageMetadata): void {
-    if (metadata?.category === 'tool_call_formatted') {
-      getLog().debug({ conversationId }, 'persistence_skip_tool_call_formatted');
-      return;
-    }
-
-    if (metadata?.category === 'isolation_context') {
-      getLog().debug({ conversationId }, 'persistence_skip_isolation_context');
+    const category = metadata?.category;
+    if (shouldSkipText(metadata)) {
+      getLog().debug({ conversationId }, skipTextLogName(category));
       return;
     }
 
     // Buffer assistant text for persistence (segment-based to preserve message structure)
     const buf = this.assistantBuffer.get(conversationId) ?? { segments: [] };
     const lastSeg = buf.segments[buf.segments.length - 1];
-    const isWorkflowStatus =
-      metadata?.category === 'workflow_status' || metadata?.category === 'workflow_dispatch_status';
 
-    const segmentDirective = metadata?.segment ?? 'auto';
-
-    // Start a new segment when:
-    // 1. No segments yet
-    // 2. Previous segment has tool calls (text after tool = new message in live view)
-    // 3. This is a workflow status message (🚀/✅ should be its own bubble)
-    // 4. Previous segment was a workflow status (next text should be separate)
-    const needsNewSegment =
-      !lastSeg ||
-      segmentDirective === 'new' ||
-      (segmentDirective === 'auto' &&
-        (lastSeg.toolCalls.length > 0 ||
-          isWorkflowStatus ||
-          lastSeg.category === 'workflow_status' ||
-          lastSeg.category === 'workflow_dispatch_status'));
-
-    if (needsNewSegment) {
-      buf.segments.push({
-        content: message,
-        toolCalls: [],
-        category: metadata?.category,
-        workflowDispatch: metadata?.workflowDispatch,
-        workflowResult: metadata?.workflowResult,
-      });
+    // Segment boundaries preserve live-view message structure:
+    // no prior segment, explicit new segment, text after tools, and workflow status bubbles.
+    if (shouldStartNewSegment(lastSeg, metadata)) {
+      buf.segments.push(createSegment(message, metadata));
     } else {
       lastSeg.content += message;
     }
@@ -160,10 +216,7 @@ export class MessagePersistence {
     if (!buf) return;
     const now = Date.now();
     for (const seg of buf.segments) {
-      const lastTool = seg.toolCalls[seg.toolCalls.length - 1];
-      if (lastTool && lastTool.duration === undefined) {
-        lastTool.duration = now - lastTool.startedAt;
-      }
+      finalizeLastToolDuration(seg, now);
     }
   }
 
@@ -187,28 +240,11 @@ export class MessagePersistence {
     // Pre-set `duration` on the last tool in each segment so terminal tool calls
     // (those that never receive an appendToolResult) don't satisfy the
     // `output === undefined && duration === undefined` in-flight condition below.
-    const preNow = Date.now();
-    for (const seg of buf.segments) {
-      const lastTool = seg.toolCalls[seg.toolCalls.length - 1];
-      if (lastTool && lastTool.duration === undefined) {
-        lastTool.duration = preNow - lastTool.startedAt;
-      }
-    }
+    finalizeSegmentDurations(buf.segments, Date.now());
 
     // Split: keep segments with in-flight tools (output pending) in the buffer
     // so appendToolResult can still find them. Only flush completed segments.
-    const ready: BufferedSegment[] = [];
-    const pending: BufferedSegment[] = [];
-    for (const seg of buf.segments) {
-      const hasInflightTool = seg.toolCalls.some(
-        tc => tc.output === undefined && tc.duration === undefined
-      );
-      if (hasInflightTool) {
-        pending.push(seg);
-      } else {
-        ready.push(seg);
-      }
-    }
+    const { ready, pending } = splitReadySegments(buf.segments);
 
     if (ready.length === 0) {
       // All segments have in-flight tools — nothing to flush yet
@@ -238,30 +274,13 @@ export class MessagePersistence {
     }
 
     // Finalize any remaining tool durations (last tool in each segment)
-    const now = Date.now();
-    for (const seg of ready) {
-      const lastTool = seg.toolCalls[seg.toolCalls.length - 1];
-      if (lastTool && lastTool.duration === undefined) {
-        lastTool.duration = now - lastTool.startedAt;
-      }
-    }
+    finalizeSegmentDurations(ready, Date.now());
 
     try {
       const { addMessage } = await import('@archon/core/db/messages');
       for (const seg of ready) {
         if (!seg.content && seg.toolCalls.length === 0) continue;
-        const toolCalls = seg.toolCalls.map(tc => ({
-          name: tc.name,
-          input: tc.input,
-          duration: tc.duration,
-          ...(tc.output !== undefined ? { output: tc.output } : {}),
-        }));
-        const metadata = {
-          ...(toolCalls.length > 0 ? { toolCalls } : {}),
-          ...(seg.workflowDispatch ? { workflowDispatch: seg.workflowDispatch } : {}),
-          ...(seg.workflowResult ? { workflowResult: seg.workflowResult } : {}),
-        };
-        await addMessage(dbId, 'assistant', seg.content, metadata);
+        await addMessage(dbId, 'assistant', seg.content, segmentMetadata(seg));
       }
     } catch (e: unknown) {
       getLog().error({ conversationId, err: e }, 'message_persistence_failed');
