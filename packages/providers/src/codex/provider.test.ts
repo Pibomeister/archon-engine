@@ -103,12 +103,16 @@ describe('CodexProvider', () => {
       })) {
         /* consume the SDK fixture */
       }
-      expect(MockCodex.mock.calls[0]?.[0]?.config).toMatchObject({
-        default_permissions: 'archon-factory',
-        permissions: {
-          'archon-factory': { filesystem: { [worktree]: 'write', [manual]: 'deny' } },
-        },
-      });
+      // The scope reaches Codex as raw `configOverrides` lines, not a structured
+      // `config` object: a named permissions profile is expressed as TOML the SDK
+      // forwards verbatim. Asserted exactly — a widened entry (an extra writable
+      // root, or `:minimal` losing its read-only floor) is the failure that matters.
+      expect(MockCodex.mock.calls[0]?.[0]?.configOverrides).toEqual([
+        'default_permissions="archon-factory"',
+        'permissions.archon-factory.filesystem={":minimal" = "read", ' +
+          `${JSON.stringify(worktree)} = "write", ${JSON.stringify(manual)} = "deny"}`,
+        'permissions.archon-factory.network.enabled=true',
+      ]);
       expect(mockStartThread.mock.calls[0]?.[0]).toMatchObject({
         sandboxMode: undefined,
         additionalDirectories: [],
