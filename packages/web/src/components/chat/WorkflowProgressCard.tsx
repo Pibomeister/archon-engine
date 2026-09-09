@@ -16,6 +16,196 @@ interface WorkflowProgressCardProps {
   workerConversationId: string;
 }
 
+type RunDataByWorker = Awaited<ReturnType<typeof getWorkflowRunByWorker>>;
+type LiveWorkflowState =
+  ReturnType<typeof useWorkflowStore.getState>['workflows'] extends Map<string, infer T>
+    ? T
+    : never;
+
+function deriveProgressState(
+  runData: RunDataByWorker | undefined,
+  liveState: LiveWorkflowState | undefined
+): {
+  status: string | undefined;
+  dagNodes: DagNodeState[];
+  currentTool: LiveWorkflowState['currentTool'] | null;
+  approval: LiveWorkflowState['approval'] | null;
+  error: LiveWorkflowState['error'];
+  startedAt: number | undefined;
+  completedAt: number | undefined;
+  completedCount: number;
+  totalNodes: number;
+  isRunning: boolean;
+  isPaused: boolean;
+  finalDuration: number | null;
+} {
+  const status = liveState?.status ?? runData?.run?.status;
+  const dagNodes: DagNodeState[] = liveState?.dagNodes ?? [];
+  const startedAt = liveState?.startedAt;
+  const completedAt = liveState?.completedAt;
+  return {
+    status,
+    dagNodes,
+    currentTool: liveState?.currentTool ?? null,
+    approval: liveState?.approval ?? null,
+    error: liveState?.error,
+    startedAt,
+    completedAt,
+    completedCount: countCompleted(dagNodes),
+    totalNodes: dagNodes.length,
+    isRunning: isRunningStatus(status),
+    isPaused: status === 'paused',
+    finalDuration: completedAt && startedAt ? completedAt - startedAt : null,
+  };
+}
+
+function isRunningStatus(status: string | undefined): boolean {
+  return status === 'running' || status === 'pending';
+}
+
+function countCompleted(nodes: DagNodeState[]): number {
+  return nodes.filter(node => node.status === 'completed').length;
+}
+
+function DurationPill({
+  isRunning,
+  elapsed,
+  finalDuration,
+}: {
+  isRunning: boolean;
+  elapsed: number;
+  finalDuration: number | null;
+}): React.ReactElement | null {
+  const duration = isRunning && elapsed > 0 ? elapsed : finalDuration;
+  if (duration === null) return null;
+  const cls = isRunning ? 'bg-primary/20 text-primary' : 'bg-surface-elevated text-text-secondary';
+  return (
+    <span className={`rounded-full px-2 py-0.5 text-[10px] ${cls}`}>
+      {formatDurationMs(duration)}
+    </span>
+  );
+}
+
+function LoadingProgressCard({ workflowName }: { workflowName: string }): React.ReactElement {
+  return (
+    <div className="flex items-center gap-2 rounded-lg border border-border bg-surface px-3 py-2 text-xs max-w-md">
+      <Loader2 className="h-3.5 w-3.5 animate-spin text-primary shrink-0" />
+      <span className="truncate text-text-primary font-medium">{workflowName}</span>
+      <span className="text-text-tertiary">Starting...</span>
+    </div>
+  );
+}
+
+function ErrorProgressCard({
+  workflowName,
+  onRetry,
+}: {
+  workflowName: string;
+  onRetry: () => void;
+}): React.ReactElement {
+  return (
+    <div className="flex items-center gap-2 rounded-lg border border-border bg-surface px-3 py-2 text-xs max-w-md">
+      <span className="text-error text-xs shrink-0">&#x26A0;</span>
+      <span className="truncate text-text-primary font-medium">{workflowName}</span>
+      <button
+        onClick={onRetry}
+        className="text-primary hover:text-accent-bright transition-colors shrink-0"
+      >
+        Retry
+      </button>
+    </div>
+  );
+}
+
+function ProgressNodeList({ nodes }: { nodes: DagNodeState[] }): React.ReactElement | null {
+  if (nodes.length === 0) return null;
+  return (
+    <div className="space-y-0.5 px-3 py-2">
+      {nodes.map(node => (
+        <div key={node.nodeId} className="flex items-center gap-2 text-xs py-0.5">
+          <span className="shrink-0">
+            <StatusIcon status={node.status} />
+          </span>
+          <span className="truncate flex-1 text-text-secondary">{node.name}</span>
+          {node.duration !== undefined ? (
+            <span className="shrink-0 text-[10px] text-text-tertiary">
+              {formatDurationMs(node.duration)}
+            </span>
+          ) : null}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ApprovalBanner({
+  workflowName,
+  approvalMessage,
+  runId,
+  approvePending,
+  rejectPending,
+  approve,
+  reject,
+  mutationError,
+}: {
+  workflowName: string;
+  approvalMessage: string | undefined;
+  runId: string | undefined;
+  approvePending: boolean;
+  rejectPending: boolean;
+  approve: () => void;
+  reject: (reason?: string) => void;
+  mutationError: unknown;
+}): React.ReactElement {
+  const disabled = !runId || approvePending || rejectPending;
+  return (
+    <div className="border-t border-border px-3 py-2 space-y-2">
+      <div className="rounded-md bg-warning/5 border border-warning/20 px-3 py-2 flex items-start gap-2">
+        <Pause className="h-3.5 w-3.5 text-warning shrink-0 mt-0.5" />
+        <p className="text-xs text-text-secondary">{approvalMessage ?? 'Waiting for approval'}</p>
+      </div>
+      <div className="flex items-center gap-2">
+        <button
+          onClick={approve}
+          disabled={disabled}
+          className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-success/80 hover:bg-success/10 hover:text-success transition-colors disabled:opacity-50"
+        >
+          <CheckCircle className="h-3.5 w-3.5" />
+          Approve
+        </button>
+        <ConfirmRunActionDialog
+          trigger={
+            <button
+              disabled={disabled}
+              className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-error/80 hover:bg-error/10 hover:text-error transition-colors disabled:opacity-50"
+            >
+              <XCircle className="h-3.5 w-3.5" />
+              Reject
+            </button>
+          }
+          title="Reject workflow?"
+          description={
+            <>
+              Reject the paused workflow <strong>{workflowName}</strong>. If the approval node
+              defines an <code>on_reject</code> prompt, it runs with your reason as{' '}
+              <code>$REJECTION_REASON</code>; otherwise the run is cancelled.
+            </>
+          }
+          confirmLabel="Reject"
+          reasonInput={{
+            label: 'Reason (optional)',
+            placeholder: 'Why are you rejecting? Visible to the on_reject prompt.',
+          }}
+          onConfirm={reject}
+        />
+      </div>
+      {mutationError instanceof Error ? (
+        <p className="text-xs text-error">{mutationError.message}</p>
+      ) : null}
+    </div>
+  );
+}
+
 export function WorkflowProgressCard({
   workflowName,
   workerConversationId,
@@ -38,23 +228,23 @@ export function WorkflowProgressCard({
   });
 
   const runId = runData?.run?.id;
-  const restStatus = runData?.run?.status;
 
   // Live SSE state from Zustand store
   const liveState = useWorkflowStore(state => (runId ? state.workflows.get(runId) : undefined));
-
-  // Merge: prefer live state when available
-  const status = liveState?.status ?? restStatus;
-  const dagNodes: DagNodeState[] = liveState?.dagNodes ?? [];
-  const currentTool = liveState?.currentTool ?? null;
-  const approval = liveState?.approval ?? null;
-  const error = liveState?.error;
-  const startedAt = liveState?.startedAt;
-
-  const completedCount = dagNodes.filter(n => n.status === 'completed').length;
-  const totalNodes = dagNodes.length;
-  const isRunning = status === 'running' || status === 'pending';
-  const isPaused = status === 'paused';
+  const progress = deriveProgressState(runData, liveState);
+  const {
+    status,
+    dagNodes,
+    currentTool,
+    approval,
+    error,
+    startedAt,
+    completedCount,
+    totalNodes,
+    isRunning,
+    isPaused,
+    finalDuration,
+  } = progress;
 
   // Expand/collapse state
   const [expanded, setExpanded] = useState(false);
@@ -92,10 +282,6 @@ export function WorkflowProgressCard({
   });
   const mutationError = approveMutation.error ?? rejectMutation.error;
 
-  // Completed duration from live state
-  const completedAt = liveState?.completedAt;
-  const finalDuration = completedAt && startedAt ? completedAt - startedAt : null;
-
   const handleHeaderClick = (): void => {
     userToggled.current = true;
     setExpanded(prev => !prev);
@@ -110,32 +296,11 @@ export function WorkflowProgressCard({
   };
 
   // Loading state: no run data yet
-  if (!runData && !isError) {
-    return (
-      <div className="flex items-center gap-2 rounded-lg border border-border bg-surface px-3 py-2 text-xs max-w-md">
-        <Loader2 className="h-3.5 w-3.5 animate-spin text-primary shrink-0" />
-        <span className="truncate text-text-primary font-medium">{workflowName}</span>
-        <span className="text-text-tertiary">Starting...</span>
-      </div>
-    );
-  }
+  if (!runData && !isError) return <LoadingProgressCard workflowName={workflowName} />;
 
   // Error state: couldn't fetch run
   if (isError && !runData) {
-    return (
-      <div className="flex items-center gap-2 rounded-lg border border-border bg-surface px-3 py-2 text-xs max-w-md">
-        <span className="text-error text-xs shrink-0">&#x26A0;</span>
-        <span className="truncate text-text-primary font-medium">{workflowName}</span>
-        <button
-          onClick={(): void => {
-            refetch();
-          }}
-          className="text-primary hover:text-accent-bright transition-colors shrink-0"
-        >
-          Retry
-        </button>
-      </div>
-    );
+    return <ErrorProgressCard workflowName={workflowName} onRetry={() => void refetch()} />;
   }
 
   return (
@@ -167,15 +332,7 @@ export function WorkflowProgressCard({
           </span>
         )}
         <span className="ml-auto shrink-0">
-          {isRunning && elapsed > 0 ? (
-            <span className="rounded-full bg-primary/20 px-2 py-0.5 text-[10px] text-primary">
-              {formatDurationMs(elapsed)}
-            </span>
-          ) : finalDuration != null ? (
-            <span className="rounded-full bg-surface-elevated px-2 py-0.5 text-[10px] text-text-secondary">
-              {formatDurationMs(finalDuration)}
-            </span>
-          ) : null}
+          <DurationPill isRunning={isRunning} elapsed={elapsed} finalDuration={finalDuration} />
         </span>
       </button>
 
@@ -183,80 +340,24 @@ export function WorkflowProgressCard({
       {expanded && (
         <div className="border-t border-border">
           {/* Node list */}
-          {dagNodes.length > 0 && (
-            <div className="space-y-0.5 px-3 py-2">
-              {dagNodes.map((node: DagNodeState) => (
-                <div key={node.nodeId} className="flex items-center gap-2 text-xs py-0.5">
-                  <span className="shrink-0">
-                    <StatusIcon status={node.status} />
-                  </span>
-                  <span className="truncate flex-1 text-text-secondary">{node.name}</span>
-                  {node.duration !== undefined && (
-                    <span className="shrink-0 text-[10px] text-text-tertiary">
-                      {formatDurationMs(node.duration)}
-                    </span>
-                  )}
-                </div>
-              ))}
-            </div>
-          )}
+          <ProgressNodeList nodes={dagNodes} />
 
           {/* Approval request banner */}
           {isPaused && (
-            <div className="border-t border-border px-3 py-2 space-y-2">
-              <div className="rounded-md bg-warning/5 border border-warning/20 px-3 py-2 flex items-start gap-2">
-                <Pause className="h-3.5 w-3.5 text-warning shrink-0 mt-0.5" />
-                <p className="text-xs text-text-secondary">
-                  {approval?.message ?? 'Waiting for approval'}
-                </p>
-              </div>
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={() => {
-                    approveMutation.mutate();
-                  }}
-                  disabled={!runId || approveMutation.isPending || rejectMutation.isPending}
-                  className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-success/80 hover:bg-success/10 hover:text-success transition-colors disabled:opacity-50"
-                >
-                  <CheckCircle className="h-3.5 w-3.5" />
-                  Approve
-                </button>
-                <ConfirmRunActionDialog
-                  trigger={
-                    <button
-                      disabled={!runId || approveMutation.isPending || rejectMutation.isPending}
-                      className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-error/80 hover:bg-error/10 hover:text-error transition-colors disabled:opacity-50"
-                    >
-                      <XCircle className="h-3.5 w-3.5" />
-                      Reject
-                    </button>
-                  }
-                  title="Reject workflow?"
-                  description={
-                    <>
-                      Reject the paused workflow <strong>{workflowName}</strong>. If the approval
-                      node defines an <code>on_reject</code> prompt, it runs with your reason as{' '}
-                      <code>$REJECTION_REASON</code>; otherwise the run is cancelled.
-                    </>
-                  }
-                  confirmLabel="Reject"
-                  reasonInput={{
-                    label: 'Reason (optional)',
-                    placeholder: 'Why are you rejecting? Visible to the on_reject prompt.',
-                  }}
-                  onConfirm={(reason): void => {
-                    rejectMutation.mutate(reason);
-                  }}
-                />
-              </div>
-              {(approveMutation.isError || rejectMutation.isError) && (
-                <p className="text-xs text-error">
-                  {mutationError instanceof Error
-                    ? mutationError.message
-                    : 'Action failed — please try again'}
-                </p>
-              )}
-            </div>
+            <ApprovalBanner
+              workflowName={workflowName}
+              approvalMessage={approval?.message}
+              runId={runId}
+              approvePending={approveMutation.isPending}
+              rejectPending={rejectMutation.isPending}
+              approve={() => {
+                approveMutation.mutate();
+              }}
+              reject={(reason): void => {
+                rejectMutation.mutate(reason);
+              }}
+              mutationError={mutationError}
+            />
           )}
 
           {/* Current tool activity */}

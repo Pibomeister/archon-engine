@@ -207,35 +207,37 @@ export type WorkflowIconName =
   | 'Zap'
   | 'Bot';
 
+const WORKFLOW_ICON_PATTERNS: readonly { terms: readonly string[]; icon: WorkflowIconName }[] = [
+  { terms: ['issue', 'bug', 'fix'], icon: 'Bug' },
+  { terms: ['review'], icon: 'Eye' },
+  { terms: ['conflict', 'merge'], icon: 'GitMerge' },
+  { terms: ['feature', 'idea', 'remotion'], icon: 'Rocket' },
+  { terms: ['refactor'], icon: 'RefreshCw' },
+  { terms: ['test', 'validate'], icon: 'TestTube' },
+  { terms: ['plan', 'prd', 'architect'], icon: 'Lightbulb' },
+  { terms: ['ralph'], icon: 'Bot' },
+  { terms: ['assist'], icon: 'Wrench' },
+];
+
+const CATEGORY_ICON: Record<WorkflowCategory, WorkflowIconName> = {
+  All: 'Workflow',
+  'Code Review': 'Eye',
+  'CI/CD': 'TestTube',
+  Automation: 'Zap',
+  Development: 'Rocket',
+};
+
 /**
  * Select an icon name based on workflow name and category.
  */
+
+function categoryIcon(category: WorkflowCategory): WorkflowIconName {
+  return Object.hasOwn(CATEGORY_ICON, category) ? CATEGORY_ICON[category] : 'Workflow';
+}
 export function getWorkflowIconName(name: string, category: WorkflowCategory): WorkflowIconName {
   const lower = name.toLowerCase();
-
-  if (lower.includes('issue') || lower.includes('bug') || lower.includes('fix')) return 'Bug';
-  if (lower.includes('review')) return 'Eye';
-  if (lower.includes('conflict') || lower.includes('merge')) return 'GitMerge';
-  if (lower.includes('feature') || lower.includes('idea') || lower.includes('remotion'))
-    return 'Rocket';
-  if (lower.includes('refactor')) return 'RefreshCw';
-  if (lower.includes('test') || lower.includes('validate')) return 'TestTube';
-  if (lower.includes('plan') || lower.includes('prd') || lower.includes('architect'))
-    return 'Lightbulb';
-  if (lower.includes('ralph')) return 'Bot';
-  if (lower.includes('assist')) return 'Wrench';
-
-  // Fall back to category
-  switch (category) {
-    case 'Code Review':
-      return 'Eye';
-    case 'CI/CD':
-      return 'TestTube';
-    case 'Automation':
-      return 'Zap';
-    case 'Development':
-      return 'Rocket';
-    default:
-      return 'Workflow';
-  }
+  const match = WORKFLOW_ICON_PATTERNS.find(({ terms }) =>
+    terms.some(term => lower.includes(term))
+  );
+  return match?.icon ?? categoryIcon(category);
 }

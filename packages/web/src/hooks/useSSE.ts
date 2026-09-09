@@ -50,6 +50,177 @@ interface SSEHandlers {
   onSystemStatus?: (content: string) => void;
 }
 
+interface SSEDispatchContext {
+  handlers: SSEHandlers;
+  textBufferRef: React.MutableRefObject<string>;
+  flushTimerRef: React.MutableRefObject<ReturnType<typeof setTimeout> | null>;
+  pendingWorkflowResultRef: React.MutableRefObject<
+    { workflowName: string; runId: string } | undefined
+  >;
+  flushText: () => void;
+}
+
+function flushBufferedText(context: SSEDispatchContext): void {
+  if (!context.textBufferRef.current) return;
+  if (context.flushTimerRef.current) {
+    clearTimeout(context.flushTimerRef.current);
+    context.flushTimerRef.current = null;
+  }
+  context.flushText();
+}
+
+function clearBufferedText(context: SSEDispatchContext): void {
+  if (context.flushTimerRef.current) {
+    clearTimeout(context.flushTimerRef.current);
+    context.flushTimerRef.current = null;
+  }
+  context.textBufferRef.current = '';
+  context.pendingWorkflowResultRef.current = undefined;
+}
+
+function handleTextEvent(
+  data: Extract<SSEEvent, { type: 'text' }>,
+  context: SSEDispatchContext
+): void {
+  context.textBufferRef.current += data.content;
+  if ('workflowResult' in data && data.workflowResult && typeof data.workflowResult === 'object') {
+    context.pendingWorkflowResultRef.current = data.workflowResult as {
+      workflowName: string;
+      runId: string;
+    };
+  }
+  if (!context.flushTimerRef.current)
+    context.flushTimerRef.current = setTimeout(context.flushText, 50);
+}
+
+function handleWorkflowStatusEvent(
+  data: Extract<SSEEvent, { type: 'workflow_status' }>,
+  handlers: SSEHandlers
+): void {
+  handlers.onWorkflowStatus?.(data);
+  if (data.status === 'completed' || data.status === 'failed' || data.status === 'cancelled') {
+    handlers.onLockChange(false);
+  }
+}
+
+function dispatchStreamEvent(data: SSEEvent, context: SSEDispatchContext): boolean {
+  const h = context.handlers;
+  switch (data.type) {
+    case 'text':
+      handleTextEvent(data, context);
+      return true;
+    case 'tool_call':
+      flushBufferedText(context);
+      h.onToolCall(data.name, data.input, data.toolCallId);
+      return true;
+    case 'tool_result':
+      flushBufferedText(context);
+      h.onToolResult(data.name, data.output, data.duration, data.toolCallId);
+      return true;
+    case 'conversation_lock':
+      if (!data.locked) flushBufferedText(context);
+      h.onLockChange(data.locked, data.queuePosition);
+      return true;
+    case 'retract':
+      clearBufferedText(context);
+      h.onRetract?.();
+      return true;
+    default:
+      return false;
+  }
+}
+
+function dispatchWorkflowEvent(data: SSEEvent, handlers: SSEHandlers): boolean {
+  switch (data.type) {
+    case 'workflow_status':
+      handleWorkflowStatusEvent(data, handlers);
+      return true;
+    case 'workflow_artifact':
+      handlers.onWorkflowArtifact?.(data);
+      return true;
+    case 'dag_node':
+      handlers.onDagNode?.(data);
+      return true;
+    case 'workflow_step':
+      handlers.onLoopIteration?.(data);
+      return true;
+    case 'workflow_dispatch':
+    case 'workflow_output_preview':
+    case 'workflow_task_activity':
+    case 'workflow_hook_activity':
+      return false;
+    default:
+      return false;
+  }
+}
+
+function dispatchWorkflowAuxEvent(data: SSEEvent, context: SSEDispatchContext): boolean {
+  const h = context.handlers;
+  switch (data.type) {
+    case 'workflow_dispatch':
+      flushBufferedText(context);
+      h.onWorkflowDispatch?.(data);
+      return true;
+    case 'workflow_output_preview':
+      h.onWorkflowOutputPreview?.(data);
+      return true;
+    case 'workflow_task_activity':
+      h.onTaskActivity?.(data);
+      return true;
+    case 'workflow_hook_activity':
+      h.onHookActivity?.(data);
+      return true;
+    default:
+      return false;
+  }
+}
+
+function dispatchSystemEvent(data: SSEEvent, handlers: SSEHandlers): boolean {
+  switch (data.type) {
+    case 'error':
+      handlers.onError({
+        message: data.message,
+        classification: data.classification ?? 'transient',
+        suggestedActions: data.suggestedActions ?? [],
+      });
+      return true;
+    case 'session_info':
+      handlers.onSessionInfo(data.sessionId, data.cost);
+      return true;
+    case 'warning':
+      handlers.onWarning?.(data.message);
+      return true;
+    case 'system_status':
+      handlers.onSystemStatus?.(data.content);
+      return true;
+    case 'heartbeat':
+      return true;
+    default:
+      return false;
+  }
+}
+
+function dispatchSSEEvent(data: SSEEvent, context: SSEDispatchContext): void {
+  if (dispatchStreamEvent(data, context)) return;
+  if (dispatchWorkflowEvent(data, context.handlers)) return;
+  if (dispatchWorkflowAuxEvent(data, context)) return;
+  if (dispatchSystemEvent(data, context.handlers)) return;
+  console.warn('[SSE] Unknown event type', { type: (data as { type: string }).type });
+}
+
+function notifyHandlerError(data: SSEEvent, handlers: SSEHandlers, handlerError: unknown): void {
+  console.error('[SSE] Handler error for event type:', data.type, handlerError);
+  try {
+    handlers.onError({
+      message: `Failed to process ${data.type} event. UI may be out of sync.`,
+      classification: 'transient',
+      suggestedActions: ['Refresh the page if chat appears stuck'],
+    });
+  } catch {
+    // Avoid infinite loop if onError itself throws
+  }
+}
+
 export function useSSE(
   conversationId: string | null,
   handlers: SSEHandlers
@@ -111,147 +282,17 @@ export function useSSE(
         return;
       }
 
+      const context: SSEDispatchContext = {
+        handlers: handlersRef.current,
+        textBufferRef,
+        flushTimerRef,
+        pendingWorkflowResultRef,
+        flushText,
+      };
       try {
-        const h = handlersRef.current;
-
-        switch (data.type) {
-          case 'text':
-            textBufferRef.current += data.content;
-            if (
-              'workflowResult' in data &&
-              data.workflowResult &&
-              typeof data.workflowResult === 'object'
-            ) {
-              pendingWorkflowResultRef.current = data.workflowResult as {
-                workflowName: string;
-                runId: string;
-              };
-            }
-            if (!flushTimerRef.current) {
-              flushTimerRef.current = setTimeout(flushText, 50);
-            }
-            break;
-          case 'tool_call':
-            // Flush buffered text before tool events to ensure text
-            // attaches to the correct message (not the previous one)
-            if (textBufferRef.current) {
-              if (flushTimerRef.current) {
-                clearTimeout(flushTimerRef.current);
-                flushTimerRef.current = null;
-              }
-              flushText();
-            }
-            h.onToolCall(data.name, data.input, data.toolCallId);
-            break;
-          case 'tool_result':
-            // Flush buffered text before tool result too
-            if (textBufferRef.current) {
-              if (flushTimerRef.current) {
-                clearTimeout(flushTimerRef.current);
-                flushTimerRef.current = null;
-              }
-              flushText();
-            }
-            h.onToolResult(data.name, data.output, data.duration, data.toolCallId);
-            break;
-          case 'error':
-            h.onError({
-              message: data.message,
-              classification: data.classification ?? 'transient',
-              suggestedActions: data.suggestedActions ?? [],
-            });
-            break;
-          case 'conversation_lock':
-            // Flush any buffered text before processing lock change,
-            // otherwise text arriving just before lock release creates
-            // a streaming message that never gets cleared.
-            if (!data.locked && textBufferRef.current) {
-              if (flushTimerRef.current) {
-                clearTimeout(flushTimerRef.current);
-                flushTimerRef.current = null;
-              }
-              flushText();
-            }
-            h.onLockChange(data.locked, data.queuePosition);
-            break;
-          case 'session_info':
-            h.onSessionInfo(data.sessionId, data.cost);
-            break;
-          case 'workflow_status':
-            h.onWorkflowStatus?.(data);
-            if (
-              data.status === 'completed' ||
-              data.status === 'failed' ||
-              data.status === 'cancelled'
-            ) {
-              h.onLockChange(false);
-            }
-            break;
-          case 'workflow_artifact':
-            h.onWorkflowArtifact?.(data);
-            break;
-          case 'dag_node':
-            h.onDagNode?.(data);
-            break;
-          case 'workflow_step':
-            h.onLoopIteration?.(data);
-            break;
-          case 'workflow_dispatch':
-            // Flush buffered text before dispatch events to ensure the dispatch
-            // message (🚀) is committed as an assistant message before
-            // onWorkflowDispatch attaches metadata to the "last assistant message".
-            if (textBufferRef.current) {
-              if (flushTimerRef.current) {
-                clearTimeout(flushTimerRef.current);
-                flushTimerRef.current = null;
-              }
-              flushText();
-            }
-            h.onWorkflowDispatch?.(data);
-            break;
-          case 'workflow_output_preview':
-            h.onWorkflowOutputPreview?.(data);
-            break;
-          case 'workflow_task_activity':
-            h.onTaskActivity?.(data);
-            break;
-          case 'workflow_hook_activity':
-            h.onHookActivity?.(data);
-            break;
-          case 'warning':
-            h.onWarning?.(data.message);
-            break;
-          case 'system_status':
-            h.onSystemStatus?.(data.content);
-            break;
-          case 'retract':
-            // Discard any buffered text (don't flush to UI)
-            if (flushTimerRef.current) {
-              clearTimeout(flushTimerRef.current);
-              flushTimerRef.current = null;
-            }
-            textBufferRef.current = '';
-            pendingWorkflowResultRef.current = undefined;
-            h.onRetract?.();
-            break;
-          case 'heartbeat':
-            break;
-          default: {
-            console.warn('[SSE] Unknown event type', { type: (data as { type: string }).type });
-            break;
-          }
-        }
+        dispatchSSEEvent(data, context);
       } catch (handlerError) {
-        console.error('[SSE] Handler error for event type:', data.type, handlerError);
-        try {
-          handlersRef.current.onError({
-            message: `Failed to process ${data.type} event. UI may be out of sync.`,
-            classification: 'transient',
-            suggestedActions: ['Refresh the page if chat appears stuck'],
-          });
-        } catch {
-          // Avoid infinite loop if onError itself throws
-        }
+        notifyHandlerError(data, handlersRef.current, handlerError);
       }
     };
 

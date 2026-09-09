@@ -14,6 +14,197 @@ import {
   type WorkflowCategory,
 } from '@/lib/workflow-metadata';
 
+type ListedWorkflow = NonNullable<
+  Awaited<ReturnType<typeof listWorkflows>>['workflows']
+>[number]['workflow'];
+
+function filterWorkflows(
+  workflows: Awaited<ReturnType<typeof listWorkflows>>['workflows'] | undefined,
+  searchQuery: string,
+  activeCategory: WorkflowCategory,
+  recommendedNames: readonly string[]
+): {
+  filteredWorkflows: ListedWorkflow[];
+  recommendedWorkflows: ListedWorkflow[];
+  restWorkflows: ListedWorkflow[];
+} {
+  if (!workflows) return { filteredWorkflows: [], recommendedWorkflows: [], restWorkflows: [] };
+  const filtered = workflows
+    .map(entry => entry.workflow)
+    .filter(wf => workflowMatches(wf, searchQuery, activeCategory));
+  const { recommended, rest } = partitionWorkflows(filtered, recommendedNames);
+  return { filteredWorkflows: filtered, recommendedWorkflows: recommended, restWorkflows: rest };
+}
+
+function workflowMatches(
+  workflow: ListedWorkflow,
+  searchQuery: string,
+  activeCategory: WorkflowCategory
+): boolean {
+  if (searchQuery) {
+    const query = searchQuery.toLowerCase();
+    const matchesName = workflow.name.toLowerCase().includes(query);
+    const matchesDesc = workflow.description?.toLowerCase().includes(query) ?? false;
+    if (!matchesName && !matchesDesc) return false;
+  }
+  if (activeCategory === 'All') return true;
+  return getWorkflowCategory(workflow.name, workflow.description ?? '') === activeCategory;
+}
+
+function FilterControls({
+  searchQuery,
+  activeCategory,
+  onSearch,
+  onCategory,
+}: {
+  searchQuery: string;
+  activeCategory: WorkflowCategory;
+  onSearch: (value: string) => void;
+  onCategory: (category: WorkflowCategory) => void;
+}): React.ReactElement {
+  return (
+    <div className="space-y-3">
+      <div className="relative">
+        <Search className="absolute left-3 top-1/2 -translate-y-1/2 size-4 text-text-tertiary" />
+        <input
+          type="text"
+          value={searchQuery}
+          onChange={(e): void => {
+            onSearch(e.target.value);
+          }}
+          placeholder="Search workflows..."
+          className="w-full pl-9 pr-3 py-2 rounded-lg border border-border bg-surface text-sm text-text-primary placeholder:text-text-tertiary focus:outline-none focus:ring-1 focus:ring-accent"
+        />
+      </div>
+      <div className="flex items-center gap-2 flex-wrap">
+        {CATEGORIES.map(cat => (
+          <button
+            key={cat}
+            onClick={(): void => {
+              onCategory(cat);
+            }}
+            className={`px-3 py-1 rounded-full text-xs font-medium transition-colors ${
+              activeCategory === cat
+                ? 'bg-primary text-white'
+                : 'bg-surface-elevated text-text-secondary hover:text-text-primary'
+            }`}
+          >
+            {cat}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function WorkflowGrid({
+  workflows,
+  selectedWorkflow,
+  onToggle,
+  onRun,
+}: {
+  workflows: ListedWorkflow[];
+  selectedWorkflow: string | null;
+  onToggle: (name: string) => void;
+  onRun: (name: string) => void;
+}): React.ReactElement {
+  return (
+    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
+      {workflows.map(wf => (
+        <WorkflowCard
+          key={wf.name}
+          workflow={wf}
+          isSelected={selectedWorkflow === wf.name}
+          onToggle={onToggle}
+          onRun={onRun}
+        />
+      ))}
+    </div>
+  );
+}
+
+function EmptyWorkflowMessage({
+  localProjectId,
+}: {
+  localProjectId: string | null;
+}): React.ReactElement {
+  return (
+    <div className="text-sm text-text-secondary">
+      {localProjectId ? (
+        <>
+          No workflows found in this project. Add workflow definitions to{' '}
+          <code className="text-xs bg-surface-inset px-1 py-0.5 rounded">.archon/workflows/</code>{' '}
+          in the project root.
+        </>
+      ) : (
+        <>
+          No workflows are available. Bundled defaults should appear here automatically; if they do
+          not, check that{' '}
+          <code className="text-xs bg-surface-inset px-1 py-0.5 rounded">
+            defaults.loadDefaultWorkflows
+          </code>{' '}
+          is enabled in your config.
+        </>
+      )}
+    </div>
+  );
+}
+
+function WorkflowSections({
+  hasWorkflows,
+  localProjectId,
+  filteredWorkflows,
+  recommendedWorkflows,
+  restWorkflows,
+  selectedWorkflow,
+  onToggle,
+  onRun,
+}: {
+  hasWorkflows: boolean;
+  localProjectId: string | null;
+  filteredWorkflows: ListedWorkflow[];
+  recommendedWorkflows: ListedWorkflow[];
+  restWorkflows: ListedWorkflow[];
+  selectedWorkflow: string | null;
+  onToggle: (name: string) => void;
+  onRun: (name: string) => void;
+}): React.ReactElement {
+  if (!hasWorkflows) return <EmptyWorkflowMessage localProjectId={localProjectId} />;
+  if (filteredWorkflows.length === 0) {
+    return (
+      <div className="text-sm text-text-secondary py-8 text-center">
+        No workflows match your search.
+      </div>
+    );
+  }
+  return (
+    <div className="space-y-4">
+      {recommendedWorkflows.length > 0 && (
+        <div className="space-y-3">
+          <h3 className="text-xs font-semibold uppercase tracking-wider text-text-secondary">
+            Recommended for this project
+          </h3>
+          <WorkflowGrid
+            workflows={recommendedWorkflows}
+            selectedWorkflow={selectedWorkflow}
+            onToggle={onToggle}
+            onRun={onRun}
+          />
+          {restWorkflows.length > 0 && <hr className="border-border" />}
+        </div>
+      )}
+      {restWorkflows.length > 0 && (
+        <WorkflowGrid
+          workflows={restWorkflows}
+          selectedWorkflow={selectedWorkflow}
+          onToggle={onToggle}
+          onRun={onRun}
+        />
+      )}
+    </div>
+  );
+}
+
 export function WorkflowList(): React.ReactElement {
   const navigate = useNavigate();
   const [selectedWorkflow, setSelectedWorkflow] = useState<string | null>(null);
@@ -97,29 +288,25 @@ export function WorkflowList(): React.ReactElement {
 
   // Filter workflows + partition into recommended (declared order) and rest.
   // Filters apply to both partitions; an empty recommended partition hides the header.
-  const { filteredWorkflows, recommendedWorkflows, restWorkflows } = useMemo(() => {
-    if (!workflows) {
-      return { filteredWorkflows: [], recommendedWorkflows: [], restWorkflows: [] };
-    }
-    const filtered = workflows
-      .map(entry => entry.workflow)
-      .filter(wf => {
-        if (searchQuery) {
-          const query = searchQuery.toLowerCase();
-          const matchesName = wf.name.toLowerCase().includes(query);
-          const matchesDesc = wf.description?.toLowerCase().includes(query) ?? false;
-          if (!matchesName && !matchesDesc) return false;
-        }
-        if (activeCategory !== 'All') {
-          const cat = getWorkflowCategory(wf.name, wf.description ?? '');
-          if (cat !== activeCategory) return false;
-        }
-        return true;
-      });
+  const { filteredWorkflows, recommendedWorkflows, restWorkflows } = useMemo(
+    () => filterWorkflows(workflows, searchQuery, activeCategory, recommendedNames),
+    [workflows, searchQuery, activeCategory, recommendedNames]
+  );
 
-    const { recommended, rest } = partitionWorkflows(filtered, recommendedNames);
-    return { filteredWorkflows: filtered, recommendedWorkflows: recommended, restWorkflows: rest };
-  }, [workflows, searchQuery, activeCategory, recommendedNames]);
+  const resetRunPanel = (): void => {
+    setRunMessage('');
+    setRunError(null);
+  };
+
+  const toggleWorkflow = (name: string): void => {
+    setSelectedWorkflow(selectedWorkflow === name ? null : name);
+    resetRunPanel();
+  };
+
+  const selectWorkflowForRun = (name: string): void => {
+    setSelectedWorkflow(name);
+    resetRunPanel();
+  };
 
   if (loadingWorkflows) {
     return (
@@ -143,120 +330,25 @@ export function WorkflowList(): React.ReactElement {
       <div className="flex-1 overflow-auto space-y-4 p-0">
         {/* Search + Category Filters — only show when workflows exist */}
         {hasWorkflows && (
-          <div className="space-y-3">
-            {/* Search bar */}
-            <div className="relative">
-              <Search className="absolute left-3 top-1/2 -translate-y-1/2 size-4 text-text-tertiary" />
-              <input
-                type="text"
-                value={searchQuery}
-                onChange={(e): void => {
-                  setSearchQuery(e.target.value);
-                }}
-                placeholder="Search workflows..."
-                className="w-full pl-9 pr-3 py-2 rounded-lg border border-border bg-surface text-sm text-text-primary placeholder:text-text-tertiary focus:outline-none focus:ring-1 focus:ring-accent"
-              />
-            </div>
-
-            {/* Category filter tabs */}
-            <div className="flex items-center gap-2 flex-wrap">
-              {CATEGORIES.map(cat => (
-                <button
-                  key={cat}
-                  onClick={(): void => {
-                    setActiveCategory(cat);
-                  }}
-                  className={`px-3 py-1 rounded-full text-xs font-medium transition-colors ${
-                    activeCategory === cat
-                      ? 'bg-primary text-white'
-                      : 'bg-surface-elevated text-text-secondary hover:text-text-primary'
-                  }`}
-                >
-                  {cat}
-                </button>
-              ))}
-            </div>
-          </div>
+          <FilterControls
+            searchQuery={searchQuery}
+            activeCategory={activeCategory}
+            onSearch={setSearchQuery}
+            onCategory={setActiveCategory}
+          />
         )}
 
         {/* Workflow grid */}
-        {!hasWorkflows ? (
-          <div className="text-sm text-text-secondary">
-            {localProjectId ? (
-              <>
-                No workflows found in this project. Add workflow definitions to{' '}
-                <code className="text-xs bg-surface-inset px-1 py-0.5 rounded">
-                  .archon/workflows/
-                </code>{' '}
-                in the project root.
-              </>
-            ) : (
-              <>
-                No workflows are available. Bundled defaults should appear here automatically; if
-                they do not, check that{' '}
-                <code className="text-xs bg-surface-inset px-1 py-0.5 rounded">
-                  defaults.loadDefaultWorkflows
-                </code>{' '}
-                is enabled in your config.
-              </>
-            )}
-          </div>
-        ) : filteredWorkflows.length === 0 ? (
-          <div className="text-sm text-text-secondary py-8 text-center">
-            No workflows match your search.
-          </div>
-        ) : (
-          <div className="space-y-4">
-            {recommendedWorkflows.length > 0 && (
-              <div className="space-y-3">
-                <h3 className="text-xs font-semibold uppercase tracking-wider text-text-secondary">
-                  Recommended for this project
-                </h3>
-                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
-                  {recommendedWorkflows.map(wf => (
-                    <WorkflowCard
-                      key={wf.name}
-                      workflow={wf}
-                      isSelected={selectedWorkflow === wf.name}
-                      onToggle={(name): void => {
-                        setSelectedWorkflow(selectedWorkflow === name ? null : name);
-                        setRunMessage('');
-                        setRunError(null);
-                      }}
-                      onRun={(name): void => {
-                        setSelectedWorkflow(name);
-                        setRunMessage('');
-                        setRunError(null);
-                      }}
-                    />
-                  ))}
-                </div>
-                {restWorkflows.length > 0 && <hr className="border-border" />}
-              </div>
-            )}
-            {restWorkflows.length > 0 && (
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
-                {restWorkflows.map(wf => (
-                  <WorkflowCard
-                    key={wf.name}
-                    workflow={wf}
-                    isSelected={selectedWorkflow === wf.name}
-                    onToggle={(name): void => {
-                      setSelectedWorkflow(selectedWorkflow === name ? null : name);
-                      setRunMessage('');
-                      setRunError(null);
-                    }}
-                    onRun={(name): void => {
-                      setSelectedWorkflow(name);
-                      setRunMessage('');
-                      setRunError(null);
-                    }}
-                  />
-                ))}
-              </div>
-            )}
-          </div>
-        )}
+        <WorkflowSections
+          hasWorkflows={hasWorkflows}
+          localProjectId={localProjectId}
+          filteredWorkflows={filteredWorkflows}
+          recommendedWorkflows={recommendedWorkflows}
+          restWorkflows={restWorkflows}
+          selectedWorkflow={selectedWorkflow}
+          onToggle={toggleWorkflow}
+          onRun={selectWorkflowForRun}
+        />
       </div>
 
       {/* Sticky run bar — anchored at bottom, slides up with glow when workflow selected */}

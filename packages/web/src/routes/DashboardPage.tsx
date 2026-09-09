@@ -26,9 +26,21 @@ import { useWorkflowStore } from '@/stores/workflow-store';
 
 const DEFAULT_PAGE_SIZE = 10;
 const PAGE_SIZE_OPTIONS = [10, 25, 50] as const;
+type PageSize = (typeof PAGE_SIZE_OPTIONS)[number];
 
 /** Date range presets. "all" means no date filter. */
 type DateRange = 'today' | '7d' | '30d' | 'all';
+
+function parseDateRange(value: string | null): DateRange {
+  return value === 'today' || value === '7d' || value === '30d' || value === 'all' ? value : 'all';
+}
+
+function parsePageSize(value: string | null): PageSize {
+  const numeric = Number(value ?? '0');
+  return PAGE_SIZE_OPTIONS.includes(numeric as PageSize)
+    ? (numeric as PageSize)
+    : DEFAULT_PAGE_SIZE;
+}
 
 function getDateBounds(range: DateRange): { after?: string; before?: string } {
   if (range === 'all') return {};
@@ -44,6 +56,166 @@ function getDateBounds(range: DateRange): { after?: string; before?: string } {
   return { after: start.toISOString() };
 }
 
+interface ActiveRunGroups {
+  multiRunGroups: { parentPlatformId: string | null; runs: DashboardRunResponse[] }[];
+  singletonRuns: DashboardRunResponse[];
+}
+
+function activeStatuses(run: DashboardRunResponse): boolean {
+  return run.status === 'running' || run.status === 'pending' || run.status === 'paused';
+}
+
+function historyStatuses(run: DashboardRunResponse): boolean {
+  return run.status === 'completed' || run.status === 'failed' || run.status === 'cancelled';
+}
+
+function groupActiveRuns(activeRuns: DashboardRunResponse[]): ActiveRunGroups {
+  const groups = new Map<
+    string,
+    { parentPlatformId: string | null; runs: DashboardRunResponse[] }
+  >();
+  for (const run of activeRuns) {
+    const key = run.parent_platform_id ?? '__standalone__';
+    const group = groups.get(key) ?? { parentPlatformId: run.parent_platform_id, runs: [] };
+    group.runs.push(run);
+    groups.set(key, group);
+  }
+  const multiRunGroups: ActiveRunGroups['multiRunGroups'] = [];
+  const singletonRuns: DashboardRunResponse[] = [];
+  for (const group of groups.values()) {
+    if (group.runs.length > 1) multiRunGroups.push(group);
+    else if (group.runs[0] !== undefined) singletonRuns.push(group.runs[0]);
+  }
+  return { multiRunGroups, singletonRuns };
+}
+
+interface DashboardActionHandlers {
+  onCancel: (runId: string) => Promise<void>;
+  onResume: (runId: string) => Promise<void>;
+  onAbandon: (runId: string) => Promise<void>;
+  onDelete: (runId: string) => Promise<void>;
+  onApprove: (runId: string) => Promise<void>;
+  onReject: (runId: string, reason?: string) => Promise<void>;
+}
+
+function ActiveRunsSection({
+  groups,
+  health,
+  actions,
+}: {
+  groups: ActiveRunGroups;
+  health: Awaited<ReturnType<typeof getHealth>> | undefined;
+  actions: DashboardActionHandlers;
+}): React.ReactElement | null {
+  if (groups.singletonRuns.length === 0 && groups.multiRunGroups.length === 0) return null;
+  return (
+    <section>
+      <h2 className="mb-3 text-sm font-semibold text-text-secondary">Active Workflows</h2>
+      <div className="space-y-6">
+        {groups.singletonRuns.length > 0 && (
+          <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+            {groups.singletonRuns.map(run => (
+              <WorkflowRunCard
+                key={run.id}
+                run={run}
+                isDocker={health?.is_docker}
+                isWsl={health?.is_wsl}
+                wslDistro={health?.wsl_distro}
+                {...actions}
+              />
+            ))}
+          </div>
+        )}
+        {groups.multiRunGroups.map(group => (
+          <WorkflowRunGroup
+            key={group.parentPlatformId ?? 'standalone'}
+            parentPlatformId={group.parentPlatformId}
+            runs={group.runs}
+            isDocker={health?.is_docker}
+            isWsl={health?.is_wsl}
+            wslDistro={health?.wsl_distro}
+            {...actions}
+          />
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function EmptyDashboardRuns(): React.ReactElement {
+  return (
+    <div className="flex flex-col items-center justify-center gap-3 py-16">
+      <Workflow className="h-10 w-10 text-text-tertiary" />
+      <p className="text-sm text-text-tertiary">No workflow runs found</p>
+    </div>
+  );
+}
+
+function PaginationControls({
+  page,
+  pageSize,
+  total,
+  totalPages,
+  hasMore,
+  setPage,
+  setPageSize,
+}: {
+  page: number;
+  pageSize: number;
+  total: number;
+  totalPages: number;
+  hasMore: boolean;
+  setPage: (page: number) => void;
+  setPageSize: (size: number) => void;
+}): React.ReactElement {
+  return (
+    <div className="flex items-center justify-between pt-2">
+      <div className="flex items-center gap-3">
+        <span className="text-xs text-text-tertiary">
+          Showing {String(page * pageSize + 1)}&ndash;
+          {String(Math.min((page + 1) * pageSize, total))} of {String(total)} runs
+        </span>
+        <select
+          value={pageSize}
+          onChange={(e): void => {
+            setPageSize(Number(e.target.value));
+          }}
+          className="rounded-md border border-border bg-surface-elevated px-2 py-1 text-xs text-text-primary focus:border-primary focus:outline-none"
+        >
+          {PAGE_SIZE_OPTIONS.map(size => (
+            <option key={size} value={size}>
+              {String(size)} per page
+            </option>
+          ))}
+        </select>
+      </div>
+      <div className="flex items-center gap-2">
+        <button
+          onClick={(): void => {
+            setPage(page - 1);
+          }}
+          disabled={page === 0}
+          className="rounded-md border border-border bg-surface-elevated px-3 py-1 text-xs text-text-secondary transition-colors hover:bg-surface disabled:opacity-40 disabled:cursor-not-allowed"
+        >
+          Previous
+        </button>
+        <span className="text-xs text-text-tertiary">
+          Page {String(page + 1)} of {String(Math.max(1, totalPages))}
+        </span>
+        <button
+          onClick={(): void => {
+            setPage(page + 1);
+          }}
+          disabled={!hasMore}
+          className="rounded-md border border-border bg-surface-elevated px-3 py-1 text-xs text-text-secondary transition-colors hover:bg-surface disabled:opacity-40 disabled:cursor-not-allowed"
+        >
+          Next
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export function DashboardPage(): React.ReactElement {
   const queryClient = useQueryClient();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -57,12 +229,9 @@ export function DashboardPage(): React.ReactElement {
   const statusFilter = searchParams.get('status') ?? null;
   const searchQuery = searchParams.get('q') ?? '';
   const projectFilter = searchParams.get('project') ?? null;
-  const dateRange: DateRange = (searchParams.get('range') as DateRange) ?? 'all';
+  const dateRange = parseDateRange(searchParams.get('range'));
   const page = Math.max(0, Number(searchParams.get('page') ?? '0'));
-  const pageSizeParam = Number(searchParams.get('pageSize') ?? '0');
-  const pageSize = PAGE_SIZE_OPTIONS.includes(pageSizeParam as (typeof PAGE_SIZE_OPTIONS)[number])
-    ? pageSizeParam
-    : DEFAULT_PAGE_SIZE;
+  const pageSize = parsePageSize(searchParams.get('pageSize'));
 
   // Debounced search: type instantly in the input, but delay the server request
   const [searchInput, setSearchInput] = useState(searchQuery);
@@ -219,53 +388,9 @@ export function DashboardPage(): React.ReactElement {
   });
 
   // Split into active and history (from server-filtered results)
-  const activeRuns = useMemo(
-    () =>
-      runs.filter(r => r.status === 'running' || r.status === 'pending' || r.status === 'paused'),
-    [runs]
-  );
-
-  /**
-   * Group active runs by parent_platform_id.
-   * Multi-run groups (2+ runs from the same chat) get their own row with a header.
-   * Singleton groups (1 run) are collected into a shared grid so they sit side-by-side.
-   */
-  const { multiRunGroups, singletonRuns } = useMemo(() => {
-    const groups = new Map<
-      string,
-      { parentPlatformId: string | null; runs: DashboardRunResponse[] }
-    >();
-    for (const run of activeRuns) {
-      const key = run.parent_platform_id ?? '__standalone__';
-      const existing = groups.get(key);
-      if (existing) {
-        existing.runs.push(run);
-      } else {
-        groups.set(key, {
-          parentPlatformId: run.parent_platform_id,
-          runs: [run],
-        });
-      }
-    }
-    const multi: { parentPlatformId: string | null; runs: DashboardRunResponse[] }[] = [];
-    const singles: DashboardRunResponse[] = [];
-    for (const group of groups.values()) {
-      if (group.runs.length > 1) {
-        multi.push(group);
-      } else {
-        singles.push(group.runs[0]);
-      }
-    }
-    return { multiRunGroups: multi, singletonRuns: singles };
-  }, [activeRuns]);
-
-  const historyRuns = useMemo(
-    () =>
-      runs.filter(
-        r => r.status === 'completed' || r.status === 'failed' || r.status === 'cancelled'
-      ),
-    [runs]
-  );
+  const activeRuns = useMemo(() => runs.filter(activeStatuses), [runs]);
+  const activeGroups = useMemo(() => groupActiveRuns(activeRuns), [activeRuns]);
+  const historyRuns = useMemo(() => runs.filter(historyStatuses), [runs]);
 
   const [actionError, setActionError] = useState<string | null>(null);
 
@@ -306,6 +431,15 @@ export function DashboardPage(): React.ReactElement {
       setActionError(err instanceof Error ? err.message : 'Failed to reject workflow');
     }
   }
+
+  const actions: DashboardActionHandlers = {
+    onCancel: handleCancel,
+    onResume: handleResume,
+    onAbandon: handleAbandon,
+    onDelete: handleDelete,
+    onApprove: handleApprove,
+    onReject: handleReject,
+  };
 
   const totalPages = Math.ceil(total / pageSize);
   const hasMore = page + 1 < totalPages;
@@ -356,111 +490,25 @@ export function DashboardPage(): React.ReactElement {
             </p>
           </div>
         ) : runs.length === 0 ? (
-          <div className="flex flex-col items-center justify-center gap-3 py-16">
-            <Workflow className="h-10 w-10 text-text-tertiary" />
-            <p className="text-sm text-text-tertiary">No workflow runs found</p>
-          </div>
+          <EmptyDashboardRuns />
         ) : (
           <>
-            {/* Active Workflows */}
-            {activeRuns.length > 0 && (
-              <section>
-                <h2 className="mb-3 text-sm font-semibold text-text-secondary">Active Workflows</h2>
-                <div className="space-y-6">
-                  {/* Singleton runs (1 per chat or standalone) share a single grid */}
-                  {singletonRuns.length > 0 && (
-                    <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-                      {singletonRuns.map(run => (
-                        <WorkflowRunCard
-                          key={run.id}
-                          run={run}
-                          isDocker={health?.is_docker}
-                          isWsl={health?.is_wsl}
-                          wslDistro={health?.wsl_distro}
-                          onCancel={handleCancel}
-                          onResume={handleResume}
-                          onAbandon={handleAbandon}
-                          onDelete={handleDelete}
-                          onApprove={handleApprove}
-                          onReject={handleReject}
-                        />
-                      ))}
-                    </div>
-                  )}
-                  {/* Multi-run groups get their own row with a chat header */}
-                  {multiRunGroups.map(group => (
-                    <WorkflowRunGroup
-                      key={group.parentPlatformId ?? 'standalone'}
-                      parentPlatformId={group.parentPlatformId}
-                      runs={group.runs}
-                      isDocker={health?.is_docker}
-                      isWsl={health?.is_wsl}
-                      wslDistro={health?.wsl_distro}
-                      onCancel={handleCancel}
-                      onResume={handleResume}
-                      onAbandon={handleAbandon}
-                      onDelete={handleDelete}
-                      onApprove={handleApprove}
-                      onReject={handleReject}
-                    />
-                  ))}
-                </div>
-              </section>
-            )}
-
-            {/* History */}
+            <ActiveRunsSection groups={activeGroups} health={health} actions={actions} />
             {historyRuns.length > 0 && (
               <section>
                 <h2 className="mb-3 text-sm font-semibold text-text-secondary">History</h2>
                 <WorkflowHistoryTable runs={historyRuns} onDelete={handleDelete} />
               </section>
             )}
-
-            {/* Pagination */}
-            <div className="flex items-center justify-between pt-2">
-              <div className="flex items-center gap-3">
-                <span className="text-xs text-text-tertiary">
-                  Showing {String(page * pageSize + 1)}&ndash;
-                  {String(Math.min((page + 1) * pageSize, total))} of {String(total)} runs
-                </span>
-                <select
-                  value={pageSize}
-                  onChange={(e): void => {
-                    setPageSize(Number(e.target.value));
-                  }}
-                  className="rounded-md border border-border bg-surface-elevated px-2 py-1 text-xs text-text-primary focus:border-primary focus:outline-none"
-                >
-                  {PAGE_SIZE_OPTIONS.map(size => (
-                    <option key={size} value={size}>
-                      {String(size)} per page
-                    </option>
-                  ))}
-                </select>
-              </div>
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={(): void => {
-                    setPage(page - 1);
-                  }}
-                  disabled={page === 0}
-                  className="rounded-md border border-border bg-surface-elevated px-3 py-1 text-xs text-text-secondary transition-colors hover:bg-surface disabled:opacity-40 disabled:cursor-not-allowed"
-                >
-                  Previous
-                </button>
-                <span className="text-xs text-text-tertiary">
-                  Page {String(page + 1)} of {String(Math.max(1, totalPages))}
-                </span>
-                <button
-                  onClick={(): void => {
-                    setPage(page + 1);
-                  }}
-                  disabled={!hasMore}
-                  className="rounded-md border border-border bg-surface-elevated px-3 py-1 text-xs text-text-secondary transition-colors hover:bg-surface disabled:opacity-40 disabled:cursor-not-allowed"
-                >
-                  Next
-                </button>
-              </div>
-            </div>
+            <PaginationControls
+              page={page}
+              pageSize={pageSize}
+              total={total}
+              totalPages={totalPages}
+              hasMore={hasMore}
+              setPage={setPage}
+              setPageSize={setPageSize}
+            />
           </>
         )}
       </div>

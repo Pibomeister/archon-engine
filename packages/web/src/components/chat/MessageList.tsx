@@ -92,6 +92,142 @@ function makeResultMarkdownComponents(
   };
 }
 
+type WorkflowRunData = Awaited<ReturnType<typeof getWorkflowRun>>;
+type LiveWorkflowState =
+  ReturnType<typeof useWorkflowStore.getState>['workflows'] extends Map<string, infer T>
+    ? T
+    : never;
+
+function workflowHeaderTitle(status: string): string {
+  if (status === 'failed') return 'Workflow failed';
+  if (status === 'cancelled') return 'Workflow cancelled';
+  return 'Workflow complete';
+}
+
+function workflowResultCounts(
+  liveState: LiveWorkflowState | undefined,
+  runData: WorkflowRunData | undefined
+): { completedCount: number; totalCount: number } {
+  const dagNodes = liveState?.dagNodes ?? [];
+  if (dagNodes.length > 0) {
+    return {
+      completedCount: dagNodes.filter(node => node.status === 'completed').length,
+      totalCount: dagNodes.filter(
+        node => node.status === 'completed' || node.status === 'failed' || node.status === 'skipped'
+      ).length,
+    };
+  }
+  const events = runData?.events ?? [];
+  return {
+    completedCount: events.filter(event => event.event_type === 'node_completed').length,
+    totalCount: events.filter(
+      event =>
+        event.event_type === 'node_completed' ||
+        event.event_type === 'node_failed' ||
+        event.event_type === 'node_skipped'
+    ).length,
+  };
+}
+
+function eventArtifact(
+  event: NonNullable<WorkflowRunData>['events'][number]
+): WorkflowArtifact | null {
+  if (event.event_type !== 'workflow_artifact') return null;
+  const data = event.data;
+  return {
+    type: (typeof data.artifactType === 'string'
+      ? data.artifactType
+      : 'file_created') as ArtifactType,
+    label: typeof data.label === 'string' ? data.label : '',
+    url: typeof data.url === 'string' ? data.url : undefined,
+    path: typeof data.path === 'string' ? data.path : undefined,
+  };
+}
+
+function workflowResultArtifacts(
+  liveState: LiveWorkflowState | undefined,
+  runData: WorkflowRunData | undefined
+): WorkflowArtifact[] {
+  const storeArtifacts = liveState?.artifacts ?? [];
+  if (storeArtifacts.length > 0) return storeArtifacts;
+  return (runData?.events ?? [])
+    .map(eventArtifact)
+    .filter((artifact): artifact is WorkflowArtifact => artifact !== null);
+}
+
+function workflowDuration(
+  liveState: LiveWorkflowState | undefined,
+  runData: WorkflowRunData | undefined
+): number | null {
+  const startedAt =
+    liveState?.startedAt ??
+    (runData?.run.started_at ? new Date(ensureUtc(runData.run.started_at)).getTime() : null);
+  const completedAt =
+    liveState?.completedAt ??
+    (runData?.run.completed_at ? new Date(ensureUtc(runData.run.completed_at)).getTime() : null);
+  return startedAt != null && completedAt != null ? completedAt - startedAt : null;
+}
+
+function contentPreview(
+  content: string,
+  expanded: boolean
+): { displayContent: string; isTruncatable: boolean } {
+  const lines = content.split('\n');
+  const isTruncatable = content.length > 500 || lines.length > 8;
+  const previewText = lines.slice(0, 8).join('\n').slice(0, 500);
+  const preview = isTruncatable
+    ? previewText + (previewText.length < content.length ? '...' : '')
+    : content;
+  return { displayContent: expanded || !isTruncatable ? content : preview, isTruncatable };
+}
+
+function WorkflowResultHeader({
+  fetchFailed,
+  status,
+  headerTitle,
+  workflowName,
+  completedCount,
+  totalCount,
+  duration,
+  onView,
+}: {
+  fetchFailed: boolean;
+  status: string;
+  headerTitle: string;
+  workflowName: string;
+  completedCount: number;
+  totalCount: number;
+  duration: number | null;
+  onView: () => void;
+}): React.ReactElement {
+  return (
+    <div className="flex items-center gap-2 px-3 py-2 border-b border-border bg-surface-elevated">
+      <span className="shrink-0">
+        <StatusIcon status={fetchFailed ? 'completed' : status} />
+      </span>
+      <span className="text-xs font-medium text-text-primary truncate flex-1">
+        {headerTitle}: {workflowName}
+      </span>
+      {!fetchFailed && totalCount > 0 ? (
+        <span className="shrink-0 text-[10px] text-text-secondary">
+          {completedCount}/{totalCount} nodes
+        </span>
+      ) : null}
+      {!fetchFailed && duration != null ? (
+        <span className="rounded-full bg-surface px-2 py-0.5 text-[10px] text-text-secondary shrink-0">
+          {formatDurationMs(duration)}
+        </span>
+      ) : null}
+      <button
+        onClick={onView}
+        className="text-[10px] text-primary hover:text-accent-bright transition-colors shrink-0"
+      >
+        View full logs &rarr;
+      </button>
+    </div>
+  );
+}
+
 function WorkflowResultCard({
   workflowName,
   runId,
@@ -130,105 +266,28 @@ function WorkflowResultCard({
 
   // Merge: prefer live state when available
   const status = liveState?.status ?? runData?.run.status ?? 'completed';
-  const dagNodes = liveState?.dagNodes ?? [];
-  const storeArtifacts = liveState?.artifacts ?? [];
-  const startedAt =
-    liveState?.startedAt ??
-    (runData?.run.started_at ? new Date(ensureUtc(runData.run.started_at)).getTime() : null);
-  const completedAt =
-    liveState?.completedAt ??
-    (runData?.run.completed_at ? new Date(ensureUtc(runData.run.completed_at)).getTime() : null);
-  const duration = startedAt != null && completedAt != null ? completedAt - startedAt : null;
-
-  // Node counts: prefer live dagNodes (exact), fall back to events (approximation —
-  // totalCount is nodes that reached a terminal state, not the workflow's full node count).
-  let completedCount: number;
-  let totalCount: number;
-  if (dagNodes.length > 0) {
-    completedCount = dagNodes.filter(n => n.status === 'completed').length;
-    // Only count terminal nodes (same semantics as events fallback path)
-    totalCount = dagNodes.filter(
-      n => n.status === 'completed' || n.status === 'failed' || n.status === 'skipped'
-    ).length;
-  } else {
-    const events = runData?.events ?? [];
-    const terminalEvents = events.filter(
-      e =>
-        e.event_type === 'node_completed' ||
-        e.event_type === 'node_failed' ||
-        e.event_type === 'node_skipped'
-    );
-    completedCount = events.filter(e => e.event_type === 'node_completed').length;
-    totalCount = terminalEvents.length;
-  }
-
-  // Artifacts: prefer live store, fall back to events
-  const eventArtifacts: WorkflowArtifact[] = (runData?.events ?? [])
-    .filter(e => e.event_type === 'workflow_artifact')
-    .map(e => {
-      const d = e.data;
-      return {
-        type: (typeof d.artifactType === 'string'
-          ? d.artifactType
-          : 'file_created') as ArtifactType,
-        label: typeof d.label === 'string' ? d.label : '',
-        url: typeof d.url === 'string' ? d.url : undefined,
-        path: typeof d.path === 'string' ? d.path : undefined,
-      };
-    });
-  const artifacts = storeArtifacts.length > 0 ? storeArtifacts : eventArtifacts;
-
-  // If API fetch failed and no live state, show degraded card with just content + link
+  const { completedCount, totalCount } = workflowResultCounts(liveState, runData);
+  const artifacts = workflowResultArtifacts(liveState, runData);
+  const duration = workflowDuration(liveState, runData);
   const fetchFailed = isError && !liveState;
-
-  // Status-aware header title
-  let headerTitle: string;
-  if (status === 'failed') {
-    headerTitle = 'Workflow failed';
-  } else if (status === 'cancelled') {
-    headerTitle = 'Workflow cancelled';
-  } else {
-    headerTitle = 'Workflow complete';
-  }
-
-  // Expand/collapse for text content
-  const lines = content.split('\n');
-  const isTruncatable = content.length > 500 || lines.length > 8;
-  const previewText = lines.slice(0, 8).join('\n').slice(0, 500);
-  const preview = isTruncatable
-    ? previewText + (previewText.length < content.length ? '...' : '')
-    : content;
-  const displayContent = expanded || !isTruncatable ? content : preview;
+  const headerTitle = workflowHeaderTitle(status);
+  const { displayContent, isTruncatable } = contentPreview(content, expanded);
 
   return (
     <>
       <div className="rounded-lg border border-border bg-surface overflow-hidden max-w-3xl">
-        <div className="flex items-center gap-2 px-3 py-2 border-b border-border bg-surface-elevated">
-          <span className="shrink-0">
-            <StatusIcon status={fetchFailed ? 'completed' : status} />
-          </span>
-          <span className="text-xs font-medium text-text-primary truncate flex-1">
-            {headerTitle}: {workflowName}
-          </span>
-          {!fetchFailed && totalCount > 0 && (
-            <span className="shrink-0 text-[10px] text-text-secondary">
-              {completedCount}/{totalCount} nodes
-            </span>
-          )}
-          {!fetchFailed && duration != null && (
-            <span className="rounded-full bg-surface px-2 py-0.5 text-[10px] text-text-secondary shrink-0">
-              {formatDurationMs(duration)}
-            </span>
-          )}
-          <button
-            onClick={(): void => {
-              navigate(`/legacy/workflows/runs/${runId}`);
-            }}
-            className="text-[10px] text-primary hover:text-accent-bright transition-colors shrink-0"
-          >
-            View full logs &rarr;
-          </button>
-        </div>
+        <WorkflowResultHeader
+          fetchFailed={fetchFailed}
+          status={status}
+          headerTitle={headerTitle}
+          workflowName={workflowName}
+          completedCount={completedCount}
+          totalCount={totalCount}
+          duration={duration}
+          onView={() => {
+            navigate(`/legacy/workflows/runs/${runId}`);
+          }}
+        />
         <div className="px-3 py-2">
           {!fetchFailed && artifacts.length > 0 && (
             <div className="mb-2">

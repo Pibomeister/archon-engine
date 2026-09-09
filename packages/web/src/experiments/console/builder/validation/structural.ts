@@ -40,75 +40,92 @@ function checkIds(nodes: BuilderNode[]): Issue[] {
   return issues;
 }
 
-/** Per-variant required-field checks (mirrors the engine's mode-field rules). */
-function checkRequiredFields(node: BuilderNode): Issue[] {
-  const issues: Issue[] = [];
-  const missing = (field: string, message: string): void => {
-    issues.push(
-      makeIssue({
-        rule: 'structural.field.missing',
-        severity: 'error',
-        source: 'client-instant',
-        message,
-        path: { nodeId: node.id, field },
-      })
-    );
-  };
-  // Distinct from `missing`: the field is present but holds an invalid value, so
-  // the UI shouldn't render it as a required-but-empty field.
-  const invalid = (field: string, message: string): void => {
-    issues.push(
-      makeIssue({
-        rule: 'structural.field.invalid',
-        severity: 'error',
-        source: 'client-instant',
-        message,
-        path: { nodeId: node.id, field },
-      })
-    );
-  };
+function missingIssue(node: BuilderNode, field: string, message: string): Issue {
+  return makeIssue({
+    rule: 'structural.field.missing',
+    severity: 'error',
+    source: 'client-instant',
+    message,
+    path: { nodeId: node.id, field },
+  });
+}
 
-  // Messages omit the node id — `path.nodeId` carries it, and display layers
-  // render the path, so an embedded prefix would double-print.
-  switch (node.variant) {
-    case 'prompt':
-      if (node.data.prompt.trim().length === 0) missing('prompt', 'prompt must not be empty');
-      break;
-    case 'command':
-      if (node.data.command.trim().length === 0) missing('command', 'command must not be empty');
-      break;
-    case 'bash':
-      if (node.data.bash.trim().length === 0) missing('bash', 'bash script must not be empty');
-      break;
-    case 'script':
-      if (node.data.script.trim().length === 0) missing('script', 'script must not be empty');
-      if (node.data.runtime !== 'bun' && node.data.runtime !== 'uv')
-        invalid('runtime', "script requires runtime 'bun' or 'uv'");
-      break;
-    case 'loop':
-      // One-of rule (mirrors the engine schema): exactly one prompt source,
-      // and whichever is present must be non-empty.
-      if (node.data.prompt !== undefined && node.data.command !== undefined)
-        invalid('loop.command', "loop accepts exactly one of 'prompt' or 'command', not both");
-      else if (node.data.command !== undefined) {
-        if (node.data.command.trim().length === 0)
-          missing('loop.command', 'loop requires a command name');
-      } else if ((node.data.prompt ?? '').trim().length === 0)
-        missing('loop.prompt', 'loop requires a prompt (or a command file)');
-      if (node.data.until.trim().length === 0)
-        missing('loop.until', "loop requires an 'until' signal");
-      if (!Number.isInteger(node.data.max_iterations) || node.data.max_iterations <= 0)
-        invalid('loop.max_iterations', 'loop requires a positive integer max_iterations');
-      break;
-    case 'approval':
-      if (node.data.message.trim().length === 0)
-        missing('approval.message', 'approval requires a message');
-      break;
-    case 'cancel':
-      if (node.data.reason.trim().length === 0) missing('cancel', 'cancel requires a reason');
-      break;
+function invalidIssue(node: BuilderNode, field: string, message: string): Issue {
+  return makeIssue({
+    rule: 'structural.field.invalid',
+    severity: 'error',
+    source: 'client-instant',
+    message,
+    path: { nodeId: node.id, field },
+  });
+}
+
+function checkScriptRequiredFields(node: Extract<BuilderNode, { variant: 'script' }>): Issue[] {
+  const issues: Issue[] = [];
+  if (node.data.script.trim().length === 0) {
+    issues.push(missingIssue(node, 'script', 'script must not be empty'));
+  }
+  if (node.data.runtime !== 'bun' && node.data.runtime !== 'uv') {
+    issues.push(invalidIssue(node, 'runtime', "script requires runtime 'bun' or 'uv'"));
   }
   return issues;
+}
+
+function checkLoopRequiredFields(node: Extract<BuilderNode, { variant: 'loop' }>): Issue[] {
+  const issues: Issue[] = [];
+  if (node.data.prompt !== undefined && node.data.command !== undefined) {
+    issues.push(
+      invalidIssue(
+        node,
+        'loop.command',
+        "loop accepts exactly one of 'prompt' or 'command', not both"
+      )
+    );
+  } else if (node.data.command?.trim().length === 0) {
+    issues.push(missingIssue(node, 'loop.command', 'loop requires a command name'));
+  } else if ((node.data.prompt ?? '').trim().length === 0) {
+    issues.push(missingIssue(node, 'loop.prompt', 'loop requires a prompt (or a command file)'));
+  }
+
+  if (node.data.until.trim().length === 0) {
+    issues.push(missingIssue(node, 'loop.until', "loop requires an 'until' signal"));
+  }
+  if (!Number.isInteger(node.data.max_iterations) || node.data.max_iterations <= 0) {
+    issues.push(
+      invalidIssue(node, 'loop.max_iterations', 'loop requires a positive integer max_iterations')
+    );
+  }
+  return issues;
+}
+
+/** Per-variant required-field checks (mirrors the engine's mode-field rules). */
+function checkRequiredFields(node: BuilderNode): Issue[] {
+  switch (node.variant) {
+    case 'prompt':
+      return node.data.prompt.trim().length === 0
+        ? [missingIssue(node, 'prompt', 'prompt must not be empty')]
+        : [];
+    case 'command':
+      return node.data.command.trim().length === 0
+        ? [missingIssue(node, 'command', 'command must not be empty')]
+        : [];
+    case 'bash':
+      return node.data.bash.trim().length === 0
+        ? [missingIssue(node, 'bash', 'bash script must not be empty')]
+        : [];
+    case 'script':
+      return checkScriptRequiredFields(node);
+    case 'loop':
+      return checkLoopRequiredFields(node);
+    case 'approval':
+      return node.data.message.trim().length === 0
+        ? [missingIssue(node, 'approval.message', 'approval requires a message')]
+        : [];
+    case 'cancel':
+      return node.data.reason.trim().length === 0
+        ? [missingIssue(node, 'cancel', 'cancel requires a reason')]
+        : [];
+  }
 }
 
 /** Validate node-id hygiene and per-variant required fields. */

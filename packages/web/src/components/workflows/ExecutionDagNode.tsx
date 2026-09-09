@@ -44,14 +44,40 @@ const TYPE_LABELS: Record<string, string> = {
   loop: 'LOOP',
 };
 
-function ExecutionDagNodeRender({ data }: NodeProps<ExecutionFlowNode>): React.ReactElement {
+function nodeClassName(data: ExecutionNodeData): string {
   const style = (data.status && STATUS_STYLES[data.status]) ?? DEFAULT_STYLE;
+  return `rounded-lg border border-border px-3 py-2 min-w-[140px] transition-all duration-300 ${style}${data.selected ? ' ring-2 ring-accent-bright' : ''}`;
+}
+
+function taskSummary(data: ExecutionNodeData): string | null {
+  if (data.totalTaskCount === undefined || data.totalTaskCount <= 0) return null;
+  if (data.activeTaskCount === data.totalTaskCount) {
+    return `${String(data.totalTaskCount)} task${data.totalTaskCount === 1 ? '' : 's'}`;
+  }
+  return `${String(data.activeTaskCount ?? 0)}/${String(data.totalTaskCount)} tasks`;
+}
+
+function NodeActivitySummary({ data }: { data: ExecutionNodeData }): React.ReactElement | null {
+  const tasks = taskSummary(data);
+  const hasHooks = data.hookCount !== undefined && data.hookCount > 0;
+  if (tasks === null && !hasHooks) return null;
+  return (
+    <div className="flex items-center gap-2 text-[10px] text-text-tertiary mt-0.5">
+      {tasks !== null && <span title="Subagent tasks">{tasks}</span>}
+      {hasHooks && (
+        <span title="Hook callbacks">
+          {String(data.hookCount)} hook{data.hookCount === 1 ? '' : 's'}
+        </span>
+      )}
+    </div>
+  );
+}
+
+function ExecutionDagNodeRender({ data }: NodeProps<ExecutionFlowNode>): React.ReactElement {
   const typeLabel = TYPE_LABELS[data.nodeType] ?? 'PROMPT';
 
   return (
-    <div
-      className={`rounded-lg border border-border px-3 py-2 min-w-[140px] transition-all duration-300 ${style}${data.selected ? ' ring-2 ring-accent-bright' : ''}`}
-    >
+    <div className={nodeClassName(data)}>
       <Handle type="target" position={Position.Top} className="!bg-border !w-2 !h-2" />
       <div className="flex items-center gap-2">
         <StatusIcon status={data.status ?? 'pending'} />
@@ -74,23 +100,7 @@ function ExecutionDagNodeRender({ data }: NodeProps<ExecutionFlowNode>): React.R
           {data.currentIteration}/{data.maxIterations} iterations
         </div>
       )}
-      {(data.totalTaskCount !== undefined && data.totalTaskCount > 0) ||
-      (data.hookCount !== undefined && data.hookCount > 0) ? (
-        <div className="flex items-center gap-2 text-[10px] text-text-tertiary mt-0.5">
-          {data.totalTaskCount !== undefined && data.totalTaskCount > 0 && (
-            <span title="Subagent tasks">
-              {data.activeTaskCount === data.totalTaskCount
-                ? `${String(data.totalTaskCount)} task${data.totalTaskCount === 1 ? '' : 's'}`
-                : `${String(data.activeTaskCount ?? 0)}/${String(data.totalTaskCount)} tasks`}
-            </span>
-          )}
-          {data.hookCount !== undefined && data.hookCount > 0 && (
-            <span title="Hook callbacks">
-              {String(data.hookCount)} hook{data.hookCount === 1 ? '' : 's'}
-            </span>
-          )}
-        </div>
-      ) : null}
+      <NodeActivitySummary data={data} />
       {data.error && (
         <div className="text-[10px] text-error mt-1 truncate" title={data.error}>
           {data.error.slice(0, 60)}

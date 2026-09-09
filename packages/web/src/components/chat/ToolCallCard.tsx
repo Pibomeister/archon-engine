@@ -7,6 +7,56 @@ interface ToolCallCardProps {
   tool: ToolCallDisplay;
 }
 
+function durationLabel(duration: number): string {
+  return duration < 1000 ? `${String(duration)}ms` : `${(duration / 1000).toFixed(1)}s`;
+}
+
+function toolSummary(tool: ToolCallDisplay): string {
+  const summary = Object.values(tool.input)[0];
+  if (typeof summary !== 'string') return '';
+  return summary.slice(0, 60) + (summary.length > 60 ? '...' : '');
+}
+
+function outputPreview(output: string | undefined): string | undefined {
+  return output
+    ?.split('\n')
+    .map(line => line.trim())
+    .find(line => line.length > 0)
+    ?.slice(0, 80);
+}
+
+function StatusIcon({ isRunning }: { isRunning: boolean }): React.ReactElement {
+  return isRunning ? (
+    <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-primary" />
+  ) : (
+    <Terminal className="h-3.5 w-3.5 shrink-0 text-text-secondary" />
+  );
+}
+
+function DurationBadge({
+  isRunning,
+  elapsed,
+  duration,
+}: {
+  isRunning: boolean;
+  elapsed: number;
+  duration: number | undefined;
+}): React.ReactElement | null {
+  if (isRunning && elapsed > 0) {
+    return (
+      <span className="rounded-full bg-primary/20 px-2 py-0.5 text-[10px] text-primary">
+        {durationLabel(elapsed)}
+      </span>
+    );
+  }
+  if (duration === undefined) return null;
+  return (
+    <span className="rounded-full bg-surface-elevated px-2 py-0.5 text-[10px] text-text-secondary">
+      {durationLabel(duration)}
+    </span>
+  );
+}
+
 export function ToolCallCard({ tool }: ToolCallCardProps): React.ReactElement {
   const [expanded, setExpanded] = useState(tool.isExpanded);
   const [showAllOutput, setShowAllOutput] = useState(false);
@@ -25,19 +75,11 @@ export function ToolCallCard({ tool }: ToolCallCardProps): React.ReactElement {
     };
   }, [isRunning, tool.startedAt]);
 
-  // Get a brief summary from the input
-  const summary = Object.values(tool.input)[0];
-  const summaryText =
-    typeof summary === 'string' ? summary.slice(0, 60) + (summary.length > 60 ? '...' : '') : '';
-
-  // Limit output display
+  const summaryText = toolSummary(tool);
   const outputLines = tool.output?.split('\n') ?? [];
   const isLongOutput = outputLines.length > 20;
   const displayOutput = showAllOutput ? tool.output : outputLines.slice(0, 20).join('\n');
-  const outputPreview = outputLines
-    .map(line => line.trim())
-    .find(line => line.length > 0)
-    ?.slice(0, 80);
+  const preview = outputPreview(tool.output);
   const statusLabel = isRunning ? 'Running' : tool.output !== undefined ? 'Complete' : 'Done';
 
   return (
@@ -60,32 +102,18 @@ export function ToolCallCard({ tool }: ToolCallCardProps): React.ReactElement {
             expanded && 'rotate-90'
           )}
         />
-        {isRunning ? (
-          <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-primary" />
-        ) : (
-          <Terminal className="h-3.5 w-3.5 shrink-0 text-text-secondary" />
-        )}
+        <StatusIcon isRunning={isRunning} />
         <span className="truncate font-mono text-xs text-text-secondary">{tool.name}</span>
         <span className="shrink-0 rounded-full bg-surface-elevated px-2 py-0.5 text-[10px] text-text-secondary">
           {statusLabel}
         </span>
         {summaryText ? (
           <span className="truncate text-xs text-text-tertiary">{summaryText}</span>
-        ) : outputPreview ? (
-          <span className="truncate text-xs text-text-tertiary">{outputPreview}</span>
+        ) : preview ? (
+          <span className="truncate text-xs text-text-tertiary">{preview}</span>
         ) : null}
         <span className="ml-auto shrink-0">
-          {isRunning && elapsed > 0 ? (
-            <span className="rounded-full bg-primary/20 px-2 py-0.5 text-[10px] text-primary">
-              {elapsed < 1000 ? `${String(elapsed)}ms` : `${(elapsed / 1000).toFixed(1)}s`}
-            </span>
-          ) : tool.duration !== undefined ? (
-            <span className="rounded-full bg-surface-elevated px-2 py-0.5 text-[10px] text-text-secondary">
-              {tool.duration < 1000
-                ? `${String(tool.duration)}ms`
-                : `${(tool.duration / 1000).toFixed(1)}s`}
-            </span>
-          ) : null}
+          <DurationBadge isRunning={isRunning} elapsed={elapsed} duration={tool.duration} />
         </span>
       </button>
 

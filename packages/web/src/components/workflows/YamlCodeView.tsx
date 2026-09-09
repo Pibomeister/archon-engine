@@ -63,83 +63,64 @@ function serializeValue(value: unknown, currentIndent: number): string {
   return JSON.stringify(value);
 }
 
+function appendScalarNodeFields(
+  lines: string[],
+  node: DagNode,
+  pad: string,
+  baseIndent: number
+): void {
+  const fields: [keyof DagNode, string, (value: unknown) => string][] = [
+    ['command', 'command', (value): string => String(value)],
+    ['prompt', 'prompt', (value): string => serializeValue(value, baseIndent + 2)],
+    ['bash', 'bash', (value): string => serializeValue(value, baseIndent + 2)],
+    ['timeout', 'timeout', (value): string => String(value)],
+    ['when', 'when', (value): string => JSON.stringify(value)],
+    ['trigger_rule', 'trigger_rule', (value): string => String(value)],
+    ['provider', 'provider', (value): string => String(value)],
+    ['model', 'model', (value): string => String(value)],
+    ['context', 'context', (value): string => String(value)],
+    ['output_format', 'output_format', (value): string => serializeValue(value, baseIndent + 2)],
+    ['idle_timeout', 'idle_timeout', (value): string => String(value)],
+    ['mcp', 'mcp', (value): string => String(value)],
+  ];
+  for (const [key, label, formatter] of fields) {
+    const value = node[key];
+    if (value !== undefined && value !== null && value !== '')
+      lines.push(`${pad}  ${label}: ${formatter(value)}`);
+  }
+}
+
+function appendStringList(
+  lines: string[],
+  pad: string,
+  label: string,
+  values: readonly string[] | undefined
+): void {
+  if (values === undefined || values.length === 0) return;
+  lines.push(`${pad}  ${label}:`);
+  for (const value of values) lines.push(`${pad}    - ${value}`);
+}
+
+function appendRetry(lines: string[], node: DagNode, pad: string): void {
+  if (!node.retry) return;
+  lines.push(`${pad}  retry:`);
+  lines.push(`${pad}    max_attempts: ${node.retry.max_attempts}`);
+  if (node.retry.delay_ms !== undefined) lines.push(`${pad}    delay_ms: ${node.retry.delay_ms}`);
+  if (node.retry.on_error) lines.push(`${pad}    on_error: ${node.retry.on_error}`);
+}
+
 /** Serialize a DagNode to YAML-like lines. */
 function serializeDagNode(node: DagNode, baseIndent: number): string {
   const lines: string[] = [];
   const pad = ' '.repeat(baseIndent);
 
   lines.push(`${pad}- id: ${node.id}`);
-
-  if ('command' in node && node.command) {
-    lines.push(`${pad}  command: ${node.command}`);
-  }
-  if ('prompt' in node && node.prompt) {
-    lines.push(`${pad}  prompt: ${serializeValue(node.prompt, baseIndent + 2)}`);
-  }
-  if ('bash' in node && node.bash) {
-    lines.push(`${pad}  bash: ${serializeValue(node.bash, baseIndent + 2)}`);
-  }
-  if ('timeout' in node && node.timeout !== undefined) {
-    lines.push(`${pad}  timeout: ${node.timeout}`);
-  }
-  if (node.depends_on && node.depends_on.length > 0) {
-    lines.push(`${pad}  depends_on:`);
-    for (const dep of node.depends_on) {
-      lines.push(`${pad}    - ${dep}`);
-    }
-  }
-  if (node.when) {
-    lines.push(`${pad}  when: ${JSON.stringify(node.when)}`);
-  }
-  if (node.trigger_rule) {
-    lines.push(`${pad}  trigger_rule: ${node.trigger_rule}`);
-  }
-  if (node.provider) {
-    lines.push(`${pad}  provider: ${node.provider}`);
-  }
-  if (node.model) {
-    lines.push(`${pad}  model: ${node.model}`);
-  }
-  if (node.context) {
-    lines.push(`${pad}  context: ${node.context}`);
-  }
-  if (node.output_format) {
-    lines.push(`${pad}  output_format: ${serializeValue(node.output_format, baseIndent + 2)}`);
-  }
-  if (node.allowed_tools) {
-    lines.push(`${pad}  allowed_tools:`);
-    for (const tool of node.allowed_tools) {
-      lines.push(`${pad}    - ${tool}`);
-    }
-  }
-  if (node.denied_tools) {
-    lines.push(`${pad}  denied_tools:`);
-    for (const tool of node.denied_tools) {
-      lines.push(`${pad}    - ${tool}`);
-    }
-  }
-  if (node.idle_timeout !== undefined) {
-    lines.push(`${pad}  idle_timeout: ${node.idle_timeout}`);
-  }
-  if (node.skills && node.skills.length > 0) {
-    lines.push(`${pad}  skills:`);
-    for (const skill of node.skills) {
-      lines.push(`${pad}    - ${skill}`);
-    }
-  }
-  if (node.mcp) {
-    lines.push(`${pad}  mcp: ${node.mcp}`);
-  }
-  if (node.retry) {
-    lines.push(`${pad}  retry:`);
-    lines.push(`${pad}    max_attempts: ${node.retry.max_attempts}`);
-    if (node.retry.delay_ms !== undefined) {
-      lines.push(`${pad}    delay_ms: ${node.retry.delay_ms}`);
-    }
-    if (node.retry.on_error) {
-      lines.push(`${pad}    on_error: ${node.retry.on_error}`);
-    }
-  }
+  appendScalarNodeFields(lines, node, pad, baseIndent);
+  appendStringList(lines, pad, 'depends_on', node.depends_on);
+  appendStringList(lines, pad, 'allowed_tools', node.allowed_tools);
+  appendStringList(lines, pad, 'denied_tools', node.denied_tools);
+  appendStringList(lines, pad, 'skills', node.skills);
+  appendRetry(lines, node, pad);
 
   return lines.join('\n');
 }

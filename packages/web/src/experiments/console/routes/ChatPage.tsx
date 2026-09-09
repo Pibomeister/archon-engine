@@ -29,6 +29,24 @@ const MAX_WAIT_MS = 300_000;
 // — drives both auto-scroll stickiness and the jump-to-bottom button's visibility.
 const NEAR_BOTTOM_PX = 120;
 
+function latestAssistantTool(messages: readonly Message[]): string | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (message === undefined) continue;
+    if (message.role === 'user') break;
+    if (message.role === 'assistant' && message.toolCalls.length > 0) {
+      return message.toolCalls[message.toolCalls.length - 1]?.name ?? null;
+    }
+  }
+  return null;
+}
+
+function loadErrorMessage(error: string | null, loadError: Error | undefined): string | null {
+  if (error !== null) return error;
+  if (loadError === undefined) return null;
+  return `Failed to load chat: ${loadError.message ?? 'unknown error'}`;
+}
+
 /**
  * Project-scoped agent chat. A tab peer of the runs view under a project.
  *
@@ -229,17 +247,8 @@ export function ChatPage(): ReactElement {
 
   // Current activity for the working indicator: the latest tool the agent
   // invoked in the in-flight turn (walk back to the last user message).
-  const currentActivity = useMemo<string | null>(() => {
-    for (let i = messageList.length - 1; i >= 0; i--) {
-      const m = messageList[i];
-      if (m === undefined) continue;
-      if (m.role === 'user') break;
-      if (m.role === 'assistant' && m.toolCalls.length > 0) {
-        return m.toolCalls[m.toolCalls.length - 1]?.name ?? null;
-      }
-    }
-    return null;
-  }, [messageList]);
+  const currentActivity = useMemo(() => latestAssistantTool(messageList), [messageList]);
+  const loadErrorText = loadErrorMessage(error, loadError);
 
   return (
     <section className="flex h-full flex-col">
@@ -305,9 +314,9 @@ export function ChatPage(): ReactElement {
         </div>
       ) : null}
 
-      {error !== null || loadError !== undefined ? (
+      {loadErrorText !== null ? (
         <div className="shrink-0 border-t border-error/30 bg-error/[0.06] px-6 py-2 font-mono text-[11px] text-error">
-          {error ?? `Failed to load chat: ${loadError?.message ?? 'unknown error'}`}
+          {loadErrorText}
         </div>
       ) : null}
 

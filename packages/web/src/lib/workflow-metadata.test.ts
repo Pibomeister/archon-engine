@@ -255,4 +255,8 @@ describe('getWorkflowIconName', () => {
     expect(getWorkflowIconName('unknown-workflow', 'Automation')).toBe('Zap');
     expect(getWorkflowIconName('unknown-workflow', 'Development')).toBe('Rocket');
   });
+
+  test('falls back to Workflow for runtime-unknown categories', () => {
+    expect(getWorkflowIconName('unknown-workflow', 'Docs' as never)).toBe('Workflow');
+  });
 });

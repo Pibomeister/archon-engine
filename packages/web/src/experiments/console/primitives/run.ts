@@ -120,6 +120,43 @@ function readCost(meta: Record<string, unknown> | undefined): number | null {
   return typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? raw : null;
 }
 
+interface ParsedApprovalMetadata {
+  approval: Run['approval'];
+  gateResolved: Run['gateResolved'];
+}
+
+function isApprovalMetadata(value: unknown): value is { nodeId: string; [key: string]: unknown } {
+  return (
+    value !== null &&
+    typeof value === 'object' &&
+    'nodeId' in value &&
+    typeof (value as { nodeId: unknown }).nodeId === 'string'
+  );
+}
+
+function readGateResolution(approval: { nodeId: string; resolved?: unknown }): Run['gateResolved'] {
+  return approval.resolved === 'approved' || approval.resolved === 'rejected'
+    ? approval.resolved
+    : null;
+}
+
+function parseApprovalMetadata(meta: Record<string, unknown> | undefined): ParsedApprovalMetadata {
+  const approval = meta?.approval;
+  if (!isApprovalMetadata(approval)) return { approval: null, gateResolved: null };
+
+  const gateResolved = readGateResolution(approval);
+  if (gateResolved !== null) return { approval: null, gateResolved };
+
+  return {
+    approval: {
+      nodeId: approval.nodeId,
+      message: typeof approval.message === 'string' ? approval.message : '',
+      completionSignaled: approval.completionSignaled === true,
+    },
+    gateResolved,
+  };
+}
+
 /**
  * The platform conversation id that holds this run's messages — the id the
  * `/api/conversations/:id/messages` route accepts. CLI runs expose it as
@@ -134,33 +171,11 @@ export function runMessageConversationId(run: Run | undefined): string | null {
 }
 
 export function toRun(raw: RawWorkflowRun): Run {
-  const approval = raw.metadata?.approval;
-  const isApprovalShape =
-    approval !== null &&
-    typeof approval === 'object' &&
-    approval !== undefined &&
-    'nodeId' in approval &&
-    typeof (approval as { nodeId: unknown }).nodeId === 'string';
   // A resolved gate (approved/rejected, run paused only while awaiting
   // auto-resume — see ApprovalContext.resolved on the server) is NOT a
   // pending approval: surface it via gateResolved instead so approve/reject
   // buttons never render for an already-resolved gate.
-  const resolvedRaw = isApprovalShape ? (approval as { resolved?: unknown }).resolved : undefined;
-  const gateResolved =
-    resolvedRaw === 'approved' || resolvedRaw === 'rejected' ? resolvedRaw : null;
-  const parsedApproval =
-    isApprovalShape && gateResolved === null
-      ? {
-          nodeId: (approval as { nodeId: string }).nodeId,
-          message:
-            'message' in approval && typeof (approval as { message: unknown }).message === 'string'
-              ? (approval as { message: string }).message
-              : '',
-          completionSignaled:
-            (approval as { completionSignaled?: unknown }).completionSignaled === true,
-        }
-      : null;
-
+  const approvalMetadata = parseApprovalMetadata(raw.metadata);
   return {
     id: raw.id,
     projectId: raw.codebase_id,
@@ -178,8 +193,8 @@ export function toRun(raw: RawWorkflowRun): Run {
     userMessage: raw.user_message ?? '',
     currentNode: raw.current_step_name ?? null,
     lastTool: null,
-    approval: parsedApproval,
-    gateResolved,
+    approval: approvalMetadata.approval,
+    gateResolved: approvalMetadata.gateResolved,
     parentRunId: raw.parent_run_id ?? null,
   };
 }

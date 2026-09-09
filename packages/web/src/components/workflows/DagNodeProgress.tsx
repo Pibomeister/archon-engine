@@ -66,6 +66,103 @@ function HookIndicator({ hook }: { hook: DagHookInfo }): React.ReactElement {
   );
 }
 
+function taskStatus(task: DagTaskInfo): DagNodeState['status'] {
+  if (task.activity === 'completed') return 'completed';
+  if (task.activity === 'failed' || task.activity === 'stopped') return 'failed';
+  return 'running';
+}
+
+function ExpandButton({
+  expanded,
+  subItemsId,
+  onToggle,
+}: {
+  expanded: boolean;
+  subItemsId: string;
+  onToggle: (e: React.MouseEvent<HTMLButtonElement>) => void;
+}): React.ReactElement {
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      className="text-text-tertiary hover:text-text-secondary shrink-0 text-xs cursor-pointer"
+      aria-label={expanded ? 'Collapse details' : 'Expand details'}
+      aria-expanded={expanded}
+      aria-controls={subItemsId}
+    >
+      {expanded ? '▼' : '▶'}
+    </button>
+  );
+}
+
+function IterationList({ node }: { node: DagNodeState }): React.ReactElement | null {
+  if ((node.iterations?.length ?? 0) === 0) return null;
+  return (
+    <div className="space-y-0.5">
+      <div className="text-[10px] uppercase tracking-wide text-text-tertiary px-2">Iterations</div>
+      {(node.iterations ?? []).map(iter => (
+        <div key={iter.iteration} className="flex items-center gap-2 px-2 py-1 text-xs">
+          <StatusIcon status={iter.status} />
+          <span className="text-text-secondary flex-1">Iteration {iter.iteration}</span>
+          {iter.duration !== undefined && (
+            <span className="text-text-tertiary">{formatDurationMs(iter.duration)}</span>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function TaskList({ node }: { node: DagNodeState }): React.ReactElement | null {
+  if ((node.tasks?.length ?? 0) === 0) return null;
+  return (
+    <div className="space-y-0.5">
+      <div className="text-[10px] uppercase tracking-wide text-text-tertiary px-2">
+        Subagent tasks ({node.tasks?.length ?? 0})
+      </div>
+      {(node.tasks ?? []).map(task => (
+        <div
+          key={task.taskId}
+          className="flex items-center gap-2 px-2 py-1 text-xs"
+          title={task.summary ?? task.description ?? task.taskId}
+        >
+          <StatusIcon status={taskStatus(task)} />
+          <span className="text-text-secondary flex-1 truncate">
+            <TaskActivityLabel task={task} />
+          </span>
+          <TaskStatusBadge task={task} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function HookList({ node }: { node: DagNodeState }): React.ReactElement | null {
+  if ((node.hooks?.length ?? 0) === 0) return null;
+  return (
+    <div className="space-y-0.5">
+      <div className="text-[10px] uppercase tracking-wide text-text-tertiary px-2">
+        Hooks ({node.hooks?.length ?? 0})
+      </div>
+      {(node.hooks ?? []).map(hook => (
+        <div key={hook.hookId} className="px-2 py-0.5">
+          <HookIndicator hook={hook} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function NodeSubItems({ node, id }: { node: DagNodeState; id: string }): React.ReactElement {
+  return (
+    <div id={id} className="ml-6 mt-0.5 space-y-1">
+      <IterationList node={node} />
+      <TaskList node={node} />
+      <HookList node={node} />
+    </div>
+  );
+}
+
 function DagNodeItem({
   node,
   isActive,
@@ -98,21 +195,16 @@ function DagNodeItem({
         role="row"
       >
         <div className="flex items-center gap-2 text-sm">
-          {hasSubItems && (
-            <button
-              type="button"
-              onClick={(e): void => {
+          {hasSubItems ? (
+            <ExpandButton
+              expanded={expanded}
+              subItemsId={subItemsId}
+              onToggle={e => {
                 e.stopPropagation();
                 setExpanded(prev => !prev);
               }}
-              className="text-text-tertiary hover:text-text-secondary shrink-0 text-xs cursor-pointer"
-              aria-label={expanded ? 'Collapse details' : 'Expand details'}
-              aria-expanded={expanded}
-              aria-controls={subItemsId}
-            >
-              {expanded ? '\u25BC' : '\u25B6'}
-            </button>
-          )}
+            />
+          ) : null}
           <StatusIcon status={node.status} />
           <span className="truncate flex-1">{node.name}</span>
           {node.currentIteration !== undefined && node.maxIterations !== undefined && (
@@ -137,66 +229,7 @@ function DagNodeItem({
           </div>
         )}
       </div>
-      {expanded && hasSubItems && (
-        <div id={subItemsId} className="ml-6 mt-0.5 space-y-1">
-          {hasIterations && (
-            <div className="space-y-0.5">
-              <div className="text-[10px] uppercase tracking-wide text-text-tertiary px-2">
-                Iterations
-              </div>
-              {(node.iterations ?? []).map(iter => (
-                <div key={iter.iteration} className="flex items-center gap-2 px-2 py-1 text-xs">
-                  <StatusIcon status={iter.status} />
-                  <span className="text-text-secondary flex-1">Iteration {iter.iteration}</span>
-                  {iter.duration !== undefined && (
-                    <span className="text-text-tertiary">{formatDurationMs(iter.duration)}</span>
-                  )}
-                </div>
-              ))}
-            </div>
-          )}
-          {hasTasks && (
-            <div className="space-y-0.5">
-              <div className="text-[10px] uppercase tracking-wide text-text-tertiary px-2">
-                Subagent tasks ({node.tasks?.length ?? 0})
-              </div>
-              {(node.tasks ?? []).map(task => (
-                <div
-                  key={task.taskId}
-                  className="flex items-center gap-2 px-2 py-1 text-xs"
-                  title={task.summary ?? task.description ?? task.taskId}
-                >
-                  <StatusIcon
-                    status={
-                      task.activity === 'completed'
-                        ? 'completed'
-                        : task.activity === 'failed' || task.activity === 'stopped'
-                          ? 'failed'
-                          : 'running'
-                    }
-                  />
-                  <span className="text-text-secondary flex-1 truncate">
-                    <TaskActivityLabel task={task} />
-                  </span>
-                  <TaskStatusBadge task={task} />
-                </div>
-              ))}
-            </div>
-          )}
-          {hasHooks && (
-            <div className="space-y-0.5">
-              <div className="text-[10px] uppercase tracking-wide text-text-tertiary px-2">
-                Hooks ({node.hooks?.length ?? 0})
-              </div>
-              {(node.hooks ?? []).map(hook => (
-                <div key={hook.hookId} className="px-2 py-0.5">
-                  <HookIndicator hook={hook} />
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
+      {expanded && hasSubItems && <NodeSubItems node={node} id={subItemsId} />}
     </div>
   );
 }

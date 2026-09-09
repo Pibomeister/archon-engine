@@ -18,6 +18,123 @@ const STATUS_GLYPH: Record<string, string> = {
   cancelled: '◌',
 };
 
+function canOpenRun(run: Run): boolean {
+  return run.projectId !== null && !run.id.startsWith('demo-');
+}
+
+function canOpenRunIde(run: Run, isDocker: boolean): boolean {
+  return (
+    !isDocker && run.workingPath !== null && run.workingPath !== '' && !run.id.startsWith('demo-')
+  );
+}
+
+function canRerunRun(run: Run): boolean {
+  return (
+    run.projectId !== null &&
+    run.workflow !== '' &&
+    !run.id.startsWith('demo-') &&
+    (run.status === 'completed' || run.status === 'failed' || run.status === 'cancelled')
+  );
+}
+
+function StatusCell({ run }: { run: Run }): ReactElement {
+  const glyph = STATUS_GLYPH[run.status] ?? '·';
+  return (
+    <span className="flex items-center gap-[9px]">
+      {run.status === 'failed' ? (
+        <span aria-hidden className={`text-[12px] leading-none ${statusTextClass.failed}`}>
+          {glyph}
+        </span>
+      ) : (
+        <span
+          aria-hidden
+          className={`h-2 w-2 shrink-0 rounded-full ${run.status === 'completed' ? 'bg-success shadow-[0_0_0_3px_color-mix(in_oklch,var(--success),transparent_85%)]' : 'bg-text-tertiary'}`}
+        />
+      )}
+      <span
+        className={`font-mono text-[11px] font-semibold uppercase tracking-[0.05em] ${statusTextClass[run.status]}`}
+      >
+        {run.status}
+      </span>
+    </span>
+  );
+}
+
+function BodyCell({ run }: { run: Run }): ReactElement {
+  return (
+    <span className="flex min-w-0 items-baseline gap-2.5">
+      <span className="shrink-0 truncate font-mono text-[13px] font-bold text-text-primary">
+        {run.workflow}
+      </span>
+      {run.parentRunId ? (
+        <span
+          className="shrink-0 rounded-[5px] border border-border/60 px-1.5 py-px font-mono text-[10px] font-semibold uppercase tracking-[0.04em] text-text-tertiary"
+          title={`Sub-run of ${shortRunId(run.parentRunId)}`}
+        >
+          ↳ child
+        </span>
+      ) : null}
+      {run.userMessage !== '' ? (
+        <span className="min-w-0 truncate text-[12.5px] text-text-tertiary" title={run.userMessage}>
+          {run.userMessage}
+        </span>
+      ) : null}
+    </span>
+  );
+}
+
+function RunActions({
+  run,
+  canRerun,
+  canOpenIde,
+  ideEnv,
+  onRerun,
+}: {
+  run: Run;
+  canRerun: boolean;
+  canOpenIde: boolean;
+  ideEnv: ReturnType<typeof useIdeEnv>;
+  onRerun: () => void;
+}): ReactElement {
+  return (
+    <span className="flex items-center gap-1.5 opacity-0 transition-opacity group-hover:opacity-100">
+      <OriginBadge origin={run.origin} />
+      {canRerun ? (
+        <button
+          type="button"
+          onClick={e => {
+            e.stopPropagation();
+            onRerun();
+          }}
+          title={`Rerun ${run.workflow} with the same message`}
+          aria-label="Rerun"
+          className="rounded p-1 text-text-tertiary transition-colors hover:bg-surface-hover hover:text-text-primary"
+        >
+          <span aria-hidden className="text-[12px] leading-none">
+            ↻
+          </span>
+        </button>
+      ) : null}
+      {canOpenIde && run.workingPath !== null ? (
+        <button
+          type="button"
+          onClick={e => {
+            e.stopPropagation();
+            if (run.workingPath !== null) openInIde(run.workingPath, ideEnv);
+          }}
+          title={`Open ${run.workingPath} in IDE`}
+          aria-label="Open in IDE"
+          className="rounded p-1 text-text-tertiary transition-colors hover:bg-surface-hover hover:text-text-primary"
+        >
+          <span aria-hidden className="font-mono text-[12px] leading-none">
+            ↗
+          </span>
+        </button>
+      ) : null}
+    </span>
+  );
+}
+
 /**
  * Compact one-liner row for terminal-state runs (completed / failed /
  * cancelled). ~36px tall, monospace, data-heavy. Scans like a log.
@@ -34,15 +151,9 @@ export function RecentRunRow({
   const isDocker = useIsDocker();
   const ideEnv = useIdeEnv();
   const elapsed = formatElapsed(elapsedSince(run.startedAt, run.finishedAt ?? undefined));
-  const canOpen = run.projectId !== null && !run.id.startsWith('demo-');
-  const canOpenIde =
-    !isDocker && run.workingPath !== null && run.workingPath !== '' && !run.id.startsWith('demo-');
-  const canRerun =
-    run.projectId !== null &&
-    run.workflow !== '' &&
-    !run.id.startsWith('demo-') &&
-    (run.status === 'completed' || run.status === 'failed' || run.status === 'cancelled');
-  const glyph = STATUS_GLYPH[run.status] ?? '·';
+  const canOpen = canOpenRun(run);
+  const canOpenIde = canOpenRunIde(run, isDocker);
+  const canRerun = canRerunRun(run);
 
   const onClick = (): void => {
     if (canOpen) navigate(`/console/p/${run.projectId}/r/${run.id}`);
@@ -73,50 +184,10 @@ export function RecentRunRow({
       } ${canOpen ? 'cursor-pointer' : ''}`}
     >
       {/* status: dot/glyph + label */}
-      <span className="flex items-center gap-[9px]">
-        {run.status === 'failed' ? (
-          <span aria-hidden className={`text-[12px] leading-none ${statusTextClass.failed}`}>
-            {glyph}
-          </span>
-        ) : (
-          <span
-            aria-hidden
-            className={`h-2 w-2 shrink-0 rounded-full ${
-              run.status === 'completed'
-                ? 'bg-success shadow-[0_0_0_3px_color-mix(in_oklch,var(--success),transparent_85%)]'
-                : 'bg-text-tertiary'
-            }`}
-          />
-        )}
-        <span
-          className={`font-mono text-[11px] font-semibold uppercase tracking-[0.05em] ${statusTextClass[run.status]}`}
-        >
-          {run.status}
-        </span>
-      </span>
+      <StatusCell run={run} />
 
       {/* body: mono workflow name + muted description */}
-      <span className="flex min-w-0 items-baseline gap-2.5">
-        <span className="shrink-0 truncate font-mono text-[13px] font-bold text-text-primary">
-          {run.workflow}
-        </span>
-        {run.parentRunId ? (
-          <span
-            className="shrink-0 rounded-[5px] border border-border/60 px-1.5 py-px font-mono text-[10px] font-semibold uppercase tracking-[0.04em] text-text-tertiary"
-            title={`Sub-run of ${shortRunId(run.parentRunId)}`}
-          >
-            ↳ child
-          </span>
-        ) : null}
-        {run.userMessage !== '' ? (
-          <span
-            className="min-w-0 truncate text-[12.5px] text-text-tertiary"
-            title={run.userMessage}
-          >
-            {run.userMessage}
-          </span>
-        ) : null}
-      </span>
+      <BodyCell run={run} />
 
       {showProject ? (
         <span className="truncate text-[12px] text-text-secondary">{run.projectName ?? ''}</span>
@@ -139,41 +210,13 @@ export function RecentRunRow({
       <span className="flex items-center justify-end gap-1.5">
         {/* Origin + quick actions reveal on hover; the resting row matches the
             design (status · body · id · duration · cost · CLI). */}
-        <span className="flex items-center gap-1.5 opacity-0 transition-opacity group-hover:opacity-100">
-          <OriginBadge origin={run.origin} />
-          {canRerun ? (
-            <button
-              type="button"
-              onClick={e => {
-                e.stopPropagation();
-                onRerun();
-              }}
-              title={`Rerun ${run.workflow} with the same message`}
-              aria-label="Rerun"
-              className="rounded p-1 text-text-tertiary transition-colors hover:bg-surface-hover hover:text-text-primary"
-            >
-              <span aria-hidden className="text-[12px] leading-none">
-                ↻
-              </span>
-            </button>
-          ) : null}
-          {canOpenIde && run.workingPath !== null ? (
-            <button
-              type="button"
-              onClick={e => {
-                e.stopPropagation();
-                if (run.workingPath !== null) openInIde(run.workingPath, ideEnv);
-              }}
-              title={`Open ${run.workingPath} in IDE`}
-              aria-label="Open in IDE"
-              className="rounded p-1 text-text-tertiary transition-colors hover:bg-surface-hover hover:text-text-primary"
-            >
-              <span aria-hidden className="font-mono text-[12px] leading-none">
-                ↗
-              </span>
-            </button>
-          ) : null}
-        </span>
+        <RunActions
+          run={run}
+          canRerun={canRerun}
+          canOpenIde={canOpenIde}
+          ideEnv={ideEnv}
+          onRerun={onRerun}
+        />
         <button
           type="button"
           onClick={e => {

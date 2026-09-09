@@ -104,6 +104,155 @@ function OptionRow({
   );
 }
 
+function modelOptionsForShape({
+  shape,
+  agentId,
+  value,
+  piModels,
+  backends,
+  showAll,
+  ocPhase,
+  ocProviders,
+}: {
+  shape: ReturnType<typeof modelPickerShape>;
+  agentId: string;
+  value: string;
+  piModels: PiModelInfo[] | undefined;
+  backends: ReturnType<typeof usablePiBackends> | null;
+  showAll: boolean;
+  ocPhase: 'idle' | 'loading' | 'loaded' | 'error';
+  ocProviders: OpencodeCredentialProvider[];
+}): { options: ModelOption[]; pi: ReturnType<typeof piModelOptions> | null } {
+  if (shape === 'pi') {
+    const pi = piModelOptions(piModels, value, backends, showAll, PI_SUGGESTION_LIMIT);
+    return { options: pi.options, pi };
+  }
+  if (shape === 'opencode') {
+    return {
+      options:
+        ocPhase === 'loaded' ? filterModelOptions(opencodeBackendOptions(ocProviders), value) : [],
+      pi: null,
+    };
+  }
+  return { options: filterModelOptions(curatedOptionsForAgent(agentId), value), pi: null };
+}
+
+function PiDropdownFooter({
+  pi,
+  piModels,
+  backends,
+  showAll,
+  onToggleAll,
+}: {
+  pi: ReturnType<typeof piModelOptions>;
+  piModels: PiModelInfo[] | undefined;
+  backends: ReturnType<typeof usablePiBackends> | null;
+  showAll: boolean;
+  onToggleAll: () => void;
+}): ReactElement {
+  return (
+    <>
+      {pi.matchTotal > pi.options.length ? (
+        <p className="px-3 py-1.5 font-mono text-[10.5px] text-text-tertiary">
+          …{pi.matchTotal - pi.options.length} more — keep typing to narrow.
+        </p>
+      ) : null}
+      {piModels === undefined ? (
+        <p className="px-3 py-2 font-mono text-[11px] text-text-tertiary">
+          Catalog unavailable — free text is fine.
+        </p>
+      ) : null}
+      {piModels !== undefined && pi.matchTotal === 0 && pi.hiddenByFilter === 0 ? (
+        <p className="px-3 py-2 font-mono text-[11px] text-text-tertiary">
+          No catalog match — custom models.json refs are fine as free text.
+        </p>
+      ) : null}
+      {backends !== null ? (
+        <button type="button" onClick={onToggleAll} className={FOOTER_BUTTON_CLASS}>
+          {showAll
+            ? 'Show connected backends only'
+            : `Show all backends${pi.hiddenByFilter > 0 ? ` (${String(pi.hiddenByFilter)} more match)` : ''}`}
+        </button>
+      ) : null}
+    </>
+  );
+}
+
+function ModelDropdown({
+  shape,
+  options,
+  pi,
+  piModels,
+  backends,
+  showAll,
+  onPick,
+  onToggleAll,
+  ocPhase,
+  ocError,
+  onLoadOpencode,
+}: {
+  shape: ReturnType<typeof modelPickerShape>;
+  options: ModelOption[];
+  pi: ReturnType<typeof piModelOptions> | null;
+  piModels: PiModelInfo[] | undefined;
+  backends: ReturnType<typeof usablePiBackends> | null;
+  showAll: boolean;
+  onPick: (option: ModelOption) => void;
+  onToggleAll: () => void;
+  ocPhase: 'idle' | 'loading' | 'loaded' | 'error';
+  ocError: string | null;
+  onLoadOpencode: () => void;
+}): ReactElement {
+  return (
+    <div
+      className={DROPDOWN_CLASS}
+      onMouseDown={e => {
+        e.preventDefault();
+      }}
+    >
+      {options.map(o => (
+        <OptionRow key={o.value} option={o} onPick={onPick} />
+      ))}
+      {pi !== null ? (
+        <PiDropdownFooter
+          pi={pi}
+          piModels={piModels}
+          backends={backends}
+          showAll={showAll}
+          onToggleAll={onToggleAll}
+        />
+      ) : null}
+      {shape === 'opencode' ? (
+        <OpencodeDropdownFooter
+          phase={ocPhase}
+          error={ocError}
+          optionCount={options.length}
+          onLoad={onLoadOpencode}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+function ModelHints({
+  exactPi,
+  disconnectedHint,
+}: {
+  exactPi: PiModelInfo | undefined;
+  disconnectedHint: string | null;
+}): ReactElement {
+  return (
+    <>
+      {exactPi !== undefined ? (
+        <p className="font-mono text-[10.5px] text-text-tertiary">{piModelHint(exactPi)}</p>
+      ) : null}
+      {disconnectedHint !== null ? (
+        <p className="font-mono text-[10.5px] text-warning">{disconnectedHint}</p>
+      ) : null}
+    </>
+  );
+}
+
 function ModelCombobox({
   agentId,
   value,
@@ -154,17 +303,16 @@ function ModelCombobox({
 
   // Suggestions per shape; the field's text doubles as the search query.
   const backends = shape === 'pi' ? usablePiBackends(agents) : null;
-  const pi =
-    shape === 'pi' ? piModelOptions(piModels, value, backends, showAll, PI_SUGGESTION_LIMIT) : null;
-  let options: ModelOption[];
-  if (pi !== null) {
-    options = pi.options;
-  } else if (shape === 'opencode') {
-    options =
-      ocPhase === 'loaded' ? filterModelOptions(opencodeBackendOptions(ocProviders), value) : [];
-  } else {
-    options = filterModelOptions(curatedOptionsForAgent(agentId), value);
-  }
+  const { options, pi } = modelOptionsForShape({
+    shape,
+    agentId,
+    value,
+    piModels,
+    backends,
+    showAll,
+    ocPhase,
+    ocProviders,
+  });
 
   const pick = (o: ModelOption): void => {
     onChange(o.value);
@@ -204,71 +352,24 @@ function ModelCombobox({
       />
 
       {open && !disabled && hasDropdownContent ? (
-        // preventDefault keeps focus in the input, so option clicks land
-        // before any blur-close — the standard combobox trick.
-        <div
-          className={DROPDOWN_CLASS}
-          onMouseDown={e => {
-            e.preventDefault();
+        <ModelDropdown
+          shape={shape}
+          options={options}
+          pi={pi}
+          piModels={piModels}
+          backends={backends}
+          showAll={showAll}
+          onPick={pick}
+          onToggleAll={() => {
+            setShowAll(s => !s);
           }}
-        >
-          {options.map(o => (
-            <OptionRow key={o.value} option={o} onPick={pick} />
-          ))}
-
-          {pi !== null ? (
-            <>
-              {pi.matchTotal > options.length ? (
-                <p className="px-3 py-1.5 font-mono text-[10.5px] text-text-tertiary">
-                  …{pi.matchTotal - options.length} more — keep typing to narrow.
-                </p>
-              ) : null}
-              {/* Two distinct empty states: an undefined catalog (still
-                  loading, or the fetch failed — all panels read K.piModels
-                  best-effort and drop the error) is NOT "no match". */}
-              {piModels === undefined ? (
-                <p className="px-3 py-2 font-mono text-[11px] text-text-tertiary">
-                  Catalog unavailable — free text is fine.
-                </p>
-              ) : null}
-              {piModels !== undefined && pi.matchTotal === 0 && pi.hiddenByFilter === 0 ? (
-                <p className="px-3 py-2 font-mono text-[11px] text-text-tertiary">
-                  No catalog match — custom models.json refs are fine as free text.
-                </p>
-              ) : null}
-              {backends !== null ? (
-                <button
-                  type="button"
-                  onClick={() => {
-                    setShowAll(s => !s);
-                  }}
-                  className={FOOTER_BUTTON_CLASS}
-                >
-                  {showAll
-                    ? 'Show connected backends only'
-                    : `Show all backends${pi.hiddenByFilter > 0 ? ` (${String(pi.hiddenByFilter)} more match)` : ''}`}
-                </button>
-              ) : null}
-            </>
-          ) : null}
-
-          {shape === 'opencode' ? (
-            <OpencodeDropdownFooter
-              phase={ocPhase}
-              error={ocError}
-              optionCount={options.length}
-              onLoad={() => void loadOpencode()}
-            />
-          ) : null}
-        </div>
+          ocPhase={ocPhase}
+          ocError={ocError}
+          onLoadOpencode={() => void loadOpencode()}
+        />
       ) : null}
 
-      {exactPi !== undefined ? (
-        <p className="font-mono text-[10.5px] text-text-tertiary">{piModelHint(exactPi)}</p>
-      ) : null}
-      {disconnectedHint !== null ? (
-        <p className="font-mono text-[10.5px] text-warning">{disconnectedHint}</p>
-      ) : null}
+      <ModelHints exactPi={exactPi} disconnectedHint={disconnectedHint} />
     </span>
   );
 }

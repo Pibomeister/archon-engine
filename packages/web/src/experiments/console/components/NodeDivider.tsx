@@ -46,6 +46,51 @@ const STATUS_COLOR: Record<NodeDividerProps['status'], string> = {
  *
  * The id targets a scrollIntoView from the graph panel.
  */
+function optionalMetric(
+  value: number | null | undefined,
+  formatter: (value: number) => string
+): string {
+  return value !== null && value !== undefined && value > 0 ? ` · ${formatter(value)}` : '';
+}
+
+function costLabel(costUsd: number): string {
+  return `$${costUsd >= 0.01 ? costUsd.toFixed(2) : costUsd.toFixed(4)}`;
+}
+
+function hasDetail(value: string | null | undefined): value is string {
+  return value !== null && value !== undefined && value.length > 0;
+}
+
+function StopDetail({ stopReason }: { stopReason: string }): ReactElement {
+  return (
+    <div className="ml-[68px] flex flex-wrap items-baseline gap-x-2 font-mono text-[10px] text-text-tertiary">
+      <span>stop</span>
+      <span className="text-text-secondary">{stopReason}</span>
+    </div>
+  );
+}
+
+function SkipDetail({
+  skipReason,
+  skipExpr,
+}: {
+  skipReason: string;
+  skipExpr?: string | null;
+}): ReactElement {
+  return (
+    <div className="ml-[68px] flex flex-wrap items-baseline gap-x-2 font-mono text-[10px] text-text-tertiary">
+      <span>reason</span>
+      <span className="text-text-secondary">{skipReason}</span>
+      {hasDetail(skipExpr) ? (
+        <>
+          <span>expr</span>
+          <span className="text-text-secondary">{skipExpr}</span>
+        </>
+      ) : null}
+    </div>
+  );
+}
+
 export function NodeDivider({
   nodeId,
   nodeName,
@@ -62,32 +107,13 @@ export function NodeDivider({
   const { runStartedAt } = useStreamContext();
   const displayed = formatRelativeToBaseline(timestamp, runStartedAt);
   const wallClock = formatClock(timestamp);
-  const dur =
-    durationMs !== null && durationMs > 0
-      ? ` · ${formatElapsed(Math.floor(durationMs / 1000))}`
-      : '';
-  // Per-node spend, surfaced inline next to the status. Sub-cent costs keep
-  // more precision so cheap nodes don't all read "$0.00".
-  const cost =
-    costUsd !== null && costUsd !== undefined && costUsd > 0
-      ? ` · $${costUsd >= 0.01 ? costUsd.toFixed(2) : costUsd.toFixed(4)}`
-      : '';
-  const turns =
-    numTurns !== null && numTurns !== undefined && numTurns > 0 ? ` · ${numTurns}t` : '';
-
-  const hasStopDetail =
-    status !== 'skipped' &&
-    showDetail &&
-    stopReason !== null &&
-    stopReason !== undefined &&
-    stopReason.length > 0;
-
-  const hasSkipDetail =
-    status === 'skipped' &&
-    showDetail &&
-    skipReason !== null &&
-    skipReason !== undefined &&
-    skipReason.length > 0;
+  const dur = optionalMetric(durationMs, (value: number) =>
+    formatElapsed(Math.floor(value / 1000))
+  );
+  const cost = optionalMetric(costUsd, costLabel);
+  const turns = optionalMetric(numTurns, (value: number) => `${value}t`);
+  const showStopDetail = status !== 'skipped' && showDetail && hasDetail(stopReason);
+  const showSkipDetail = status === 'skipped' && showDetail && hasDetail(skipReason);
 
   // One divider per node now, so the scroll-anchor id is always present and
   // keyed by nodeId (matches the graph panel's getElementById target).
@@ -121,24 +147,8 @@ export function NodeDivider({
           {turns}
         </span>
       </div>
-      {hasStopDetail ? (
-        <div className="ml-[68px] flex flex-wrap items-baseline gap-x-2 font-mono text-[10px] text-text-tertiary">
-          <span>stop</span>
-          <span className="text-text-secondary">{stopReason}</span>
-        </div>
-      ) : null}
-      {hasSkipDetail ? (
-        <div className="ml-[68px] flex flex-wrap items-baseline gap-x-2 font-mono text-[10px] text-text-tertiary">
-          <span>reason</span>
-          <span className="text-text-secondary">{skipReason}</span>
-          {skipExpr !== null && skipExpr !== undefined && skipExpr.length > 0 ? (
-            <>
-              <span>expr</span>
-              <span className="text-text-secondary">{skipExpr}</span>
-            </>
-          ) : null}
-        </div>
-      ) : null}
+      {showStopDetail ? <StopDetail stopReason={stopReason} /> : null}
+      {showSkipDetail ? <SkipDetail skipReason={skipReason} skipExpr={skipExpr} /> : null}
     </div>
   );
 }

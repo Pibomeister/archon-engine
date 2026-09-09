@@ -21,153 +21,298 @@ interface WorkflowLogsProps {
   nodeScrollTrigger?: number;
 }
 
+interface MessageMetadata {
+  error?: ErrorDisplay;
+  toolCalls?: {
+    name: string;
+    input: Record<string, unknown>;
+    output?: string;
+    duration?: number;
+  }[];
+}
+
+function parseMessageMetadata(row: MessageResponse): MessageMetadata {
+  try {
+    return JSON.parse(row.metadata) as MessageMetadata;
+  } catch {
+    console.warn('[WorkflowLogs] Corrupted message metadata', { messageId: row.id });
+    return {};
+  }
+}
+
+function persistedToolCalls(
+  row: MessageResponse,
+  meta: MessageMetadata,
+  timestamp: number
+): ToolCallDisplay[] | undefined {
+  return meta.toolCalls?.map((tc, i) => ({
+    id: `${row.id}-tool-${String(i)}`,
+    name: tc.name,
+    input: tc.input,
+    output: tc.output,
+    duration: tc.duration,
+    startedAt: timestamp,
+    isExpanded: false,
+  }));
+}
+
+function hydrateMessage(row: MessageResponse): ChatMessage {
+  const meta = parseMessageMetadata(row);
+  const timestamp = new Date(ensureUtc(row.created_at)).getTime();
+  return {
+    id: row.id,
+    role: row.role,
+    content: row.content,
+    error: meta.error,
+    toolCalls: persistedToolCalls(row, meta, timestamp),
+    timestamp,
+    isStreaming: false,
+  };
+}
+
+function metadataToolIndex(messages: ChatMessage[]): { name: string; timestamp: number }[] {
+  return messages.flatMap(message =>
+    (message.toolCalls ?? []).map(tool => ({ name: tool.name, timestamp: tool.startedAt }))
+  );
+}
+
+function isDuplicateToolEvent(
+  event: ToolEvent,
+  timestamp: number,
+  metadataTools: readonly { name: string; timestamp: number }[],
+  claimedMetadata: Set<number>
+): boolean {
+  const matchIndex = metadataTools.findIndex(
+    (tool, index) =>
+      !claimedMetadata.has(index) &&
+      tool.name === event.name &&
+      Math.abs(tool.timestamp - timestamp) < 60_000
+  );
+  if (matchIndex < 0) return false;
+  claimedMetadata.add(matchIndex);
+  return true;
+}
+
+function toolCallFromEvent(event: ToolEvent, timestamp: number): ToolCallDisplay {
+  return {
+    id: event.id,
+    name: event.name,
+    input: event.input,
+    startedAt: timestamp,
+    isExpanded: false,
+    duration: event.duration,
+  };
+}
+
+function findToolTarget(messages: ChatMessage[], timestamp: number): ChatMessage | undefined {
+  let target: ChatMessage | undefined;
+  for (const message of messages) {
+    if (message.timestamp <= timestamp) target = message;
+    else break;
+  }
+  return target ?? messages[0];
+}
+
+function attachToolEvent(
+  messages: ChatMessage[],
+  event: ToolEvent,
+  metadataTools: readonly { name: string; timestamp: number }[],
+  claimedMetadata: Set<number>,
+  unattached: ToolCallDisplay[]
+): void {
+  const timestamp = new Date(ensureUtc(event.createdAt)).getTime();
+  if (isDuplicateToolEvent(event, timestamp, metadataTools, claimedMetadata)) return;
+  const toolCall = toolCallFromEvent(event, timestamp);
+  const target = findToolTarget(messages, timestamp);
+  if (target === undefined) {
+    unattached.push(toolCall);
+    return;
+  }
+  target.toolCalls ??= [];
+  if (!target.toolCalls.some(tc => tc.id === event.id)) target.toolCalls.push(toolCall);
+}
+
+function appendSyntheticToolMessage(messages: ChatMessage[], unattached: ToolCallDisplay[]): void {
+  if (unattached.length === 0) return;
+  const earliestTs = Math.min(...unattached.map(tc => tc.startedAt));
+  messages.push({
+    id: `synthetic-tools-${String(earliestTs)}`,
+    role: 'assistant',
+    content: '',
+    toolCalls: unattached,
+    timestamp: earliestTs,
+    isStreaming: false,
+  });
+  messages.sort((a, b) => a.timestamp - b.timestamp);
+}
+
+function attachWorkflowToolEvents(messages: ChatMessage[], toolEvents?: ToolEvent[]): void {
+  if (toolEvents === undefined || toolEvents.length === 0) return;
+  const assistantMsgs = messages.filter(m => m.role === 'assistant');
+  const metadataTools = metadataToolIndex(assistantMsgs);
+  const claimedMetadata = new Set<number>();
+  const unattached: ToolCallDisplay[] = [];
+  for (const event of toolEvents) {
+    attachToolEvent(assistantMsgs, event, metadataTools, claimedMetadata, unattached);
+  }
+  appendSyntheticToolMessage(messages, unattached);
+}
+
 function hydrateMessages(
   rows: MessageResponse[],
   startedAt?: number,
   toolEvents?: ToolEvent[]
 ): ChatMessage[] {
-  const hydrated: ChatMessage[] = rows.map(row => {
-    let meta: {
-      error?: ErrorDisplay;
-      toolCalls?: {
-        name: string;
-        input: Record<string, unknown>;
-        output?: string;
-        duration?: number;
-      }[];
-    } = {};
-    try {
-      meta = JSON.parse(row.metadata) as typeof meta;
-    } catch {
-      console.warn('[WorkflowLogs] Corrupted message metadata', { messageId: row.id });
-    }
-    const ts = new Date(ensureUtc(row.created_at)).getTime();
-    // Restore tool calls persisted in message metadata (written by persistence.ts flush).
-    // This ensures historical tool calls are visible immediately on page load,
-    // without waiting for the toolEvents prop from the workflow_events table.
-    const persistedTools: ToolCallDisplay[] | undefined = meta.toolCalls?.map((tc, i) => ({
-      id: `${row.id}-tool-${String(i)}`,
-      name: tc.name,
-      input: tc.input,
-      output: tc.output,
-      duration: tc.duration,
-      startedAt: ts,
-      isExpanded: false,
-    }));
-    return {
-      id: row.id,
-      role: row.role,
-      content: row.content,
-      error: meta.error,
-      toolCalls: persistedTools,
-      timestamp: ts,
-      isStreaming: false,
-    };
-  });
-
+  const hydrated = rows.map(hydrateMessage);
   const filtered = startedAt ? hydrated.filter(m => m.timestamp >= startedAt) : hydrated;
+  attachWorkflowToolEvents(filtered, toolEvents);
+  return filtered;
+}
 
-  // Attach tool events from workflow_events table to assistant messages.
-  //
-  // Dedup strategy: Messages may already have tool calls from metadata (persisted by
-  // persistence.ts flush). Tool events from workflow_events cover the same tool calls
-  // but with different IDs (UUIDs vs msgId-tool-N) and different duration measurements.
-  // To avoid duplicates, we match tool events against metadata tool calls by name and
-  // timestamp proximity — if a metadata tool call with the same name exists within 60s
-  // of the tool event, we consider them the same and skip the event.
-  //
-  // During active execution before flush, no messages have metadata tool calls, so all
-  // tool events attach normally. After flush, metadata is authoritative and tool events
-  // are skipped. For partially-flushed state, only unmatched tool events are shown.
-  if (toolEvents && toolEvents.length > 0) {
-    const assistantMsgs = filtered.filter(m => m.role === 'assistant');
+function activeToolCalls(message: ChatMessage): ToolCallDisplay[] {
+  return (message.toolCalls ?? []).filter(tc => tc.duration === undefined && !tc.output);
+}
 
-    // Build a lookup of all metadata tool calls for dedup matching.
-    // Each entry records the tool name and the message timestamp (approximate start time).
-    const metadataTools: { name: string; timestamp: number }[] = [];
-    for (const m of assistantMsgs) {
-      if (m.toolCalls && m.toolCalls.length > 0) {
-        for (const tc of m.toolCalls) {
-          metadataTools.push({ name: tc.name, timestamp: tc.startedAt });
-        }
-      }
+function pruneSseMessage(message: ChatMessage): { message: ChatMessage | null; changed: boolean } {
+  if (message.isStreaming) return { message, changed: false };
+  const activeTools = activeToolCalls(message);
+  if (activeTools.length === 0) return { message: null, changed: true };
+  const changed = activeTools.length < (message.toolCalls?.length ?? 0);
+  return { message: changed ? { ...message, toolCalls: activeTools } : message, changed };
+}
+
+function pruneSseMessages(prev: ChatMessage[]): ChatMessage[] {
+  let changed = false;
+  const result: ChatMessage[] = [];
+  for (const message of prev) {
+    const pruned = pruneSseMessage(message);
+    changed ||= pruned.changed;
+    if (pruned.message !== null) result.push(pruned.message);
+  }
+  return changed ? result : prev;
+}
+
+function completedDbTools(messages: ChatMessage[]): { name: string; duration: number }[] {
+  return messages.flatMap(message =>
+    (message.toolCalls ?? [])
+      .filter(tool => tool.duration !== undefined)
+      .map(tool => ({ name: tool.name, duration: tool.duration ?? 0 }))
+  );
+}
+
+function sseInFlightToolCounts(messages: ChatMessage[]): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const message of messages) {
+    for (const tool of activeToolCalls(message))
+      counts.set(tool.name, (counts.get(tool.name) ?? 0) + 1);
+  }
+  return counts;
+}
+
+function suppressInFlightDbTools(
+  message: ChatMessage,
+  counts: Map<string, number>,
+  suppressed: Map<string, number>,
+  now: number
+): ChatMessage {
+  if (!message.toolCalls?.length) return message;
+  let hasUnsuppressedInFlight = false;
+  const filteredTools = message.toolCalls.filter(tool => {
+    if (tool.duration !== undefined || !!tool.output) return true;
+    const limit = counts.get(tool.name) ?? 0;
+    const current = suppressed.get(tool.name) ?? 0;
+    if (current < limit) {
+      suppressed.set(tool.name, current + 1);
+      return false;
     }
-
-    // Track which metadata tools have been "claimed" by a tool event match
-    // to prevent one metadata tool from deduping multiple distinct tool events.
-    const claimedMetadata = new Set<number>();
-
-    const unattached: ToolCallDisplay[] = [];
-    for (const te of toolEvents) {
-      const teTimestamp = new Date(ensureUtc(te.createdAt)).getTime();
-
-      // Check if this tool event matches an existing metadata tool call.
-      // Match by same name and timestamp within 60s (tool events fire at start,
-      // messages are created after completion, so timestamps can differ significantly).
-      let isDuplicate = false;
-      for (let i = 0; i < metadataTools.length; i++) {
-        if (claimedMetadata.has(i)) continue;
-        const mt = metadataTools[i];
-        if (mt.name === te.name && Math.abs(mt.timestamp - teTimestamp) < 60_000) {
-          isDuplicate = true;
-          claimedMetadata.add(i);
-          break;
-        }
+    hasUnsuppressedInFlight = true;
+    return true;
+  });
+  if (filteredTools.length === 0) return { ...message, toolCalls: undefined };
+  const changed = filteredTools.length !== message.toolCalls.length || hasUnsuppressedInFlight;
+  return changed
+    ? {
+        ...message,
+        toolCalls: filteredTools,
+        ...(hasUnsuppressedInFlight ? { timestamp: now } : {}),
       }
-      if (isDuplicate) continue;
+    : message;
+}
 
-      // Find the last assistant message that started before this tool event
-      let target: ChatMessage | undefined;
-      for (const m of assistantMsgs) {
-        if (m.timestamp <= teTimestamp) target = m;
-        else break;
-      }
-      if (!target) target = assistantMsgs[0];
-      if (target) {
-        if (!target.toolCalls) target.toolCalls = [];
-        if (!target.toolCalls.some(tc => tc.id === te.id)) {
-          target.toolCalls.push({
-            id: te.id,
-            name: te.name,
-            input: te.input,
-            startedAt: teTimestamp,
-            isExpanded: false,
-            duration: te.duration,
-          });
-        }
-      } else {
-        // No assistant message to attach to — collect for synthetic message
-        unattached.push({
-          id: te.id,
-          name: te.name,
-          input: te.input,
-          startedAt: teTimestamp,
-          isExpanded: false,
-          duration: te.duration,
-        });
-      }
+function filterDbMessagesForLiveTools(
+  dbMessages: ChatMessage[],
+  sseMessages: ChatMessage[],
+  isRunning: boolean
+): ChatMessage[] {
+  const counts = sseInFlightToolCounts(sseMessages);
+  if (counts.size === 0 && !isRunning) return dbMessages;
+  const suppressed = new Map<string, number>();
+  const now = Date.now();
+  const mapped = dbMessages.map(message =>
+    suppressInFlightDbTools(message, counts, suppressed, now)
+  );
+  return mapped.every((message, index) => message === dbMessages[index]) ? dbMessages : mapped;
+}
+
+function dbTextContentSet(messages: ChatMessage[]): Set<string> {
+  return new Set(
+    messages
+      .filter(message => message.role === 'assistant' && message.content)
+      .map(message => message.content)
+  );
+}
+
+function isToolInDb(
+  tool: ToolCallDisplay,
+  dbTools: readonly { name: string; duration: number }[]
+): boolean {
+  const duration = tool.duration;
+  if (duration === undefined) return false;
+  return dbTools.some(dt => dt.name === tool.name && Math.abs(dt.duration - duration) < 500);
+}
+
+function shouldSkipSseText(message: ChatMessage, dbTextContents: Set<string>): boolean {
+  if (!message.content) return false;
+  if (dbTextContents.has(message.content)) return true;
+  return [...dbTextContents].some(content => content.startsWith(message.content));
+}
+
+function dedupeSseMessages(sseMessages: ChatMessage[], dbMessages: ChatMessage[]): ChatMessage[] {
+  const dbTools = completedDbTools(dbMessages);
+  const dbTextContents = dbTextContentSet(dbMessages);
+  const deduped: ChatMessage[] = [];
+  for (const message of sseMessages) {
+    if (!message.toolCalls?.length) {
+      if (!shouldSkipSseText(message, dbTextContents) && (message.isStreaming || message.content))
+        deduped.push(message);
+      continue;
     }
-
-    // Create a synthetic assistant message for unattached tool events.
-    // This handles the case where the persistence buffer hasn't flushed yet
-    // during active workflow execution — tool events exist in the DB but
-    // the assistant messages containing them haven't been persisted.
-    if (unattached.length > 0) {
-      const earliestTs = Math.min(...unattached.map(tc => tc.startedAt));
-      filtered.push({
-        id: `synthetic-tools-${String(earliestTs)}`,
-        role: 'assistant',
-        content: '',
-        toolCalls: unattached,
-        timestamp: earliestTs,
-        isStreaming: false,
-      });
-      // Re-sort since we inserted a message
-      filtered.sort((a, b) => a.timestamp - b.timestamp);
+    const uniqueTools = message.toolCalls.filter(tool => !isToolInDb(tool, dbTools));
+    if (uniqueTools.length > 0 || message.isStreaming || message.content) {
+      deduped.push({ ...message, toolCalls: uniqueTools.length > 0 ? uniqueTools : undefined });
     }
   }
+  return deduped;
+}
 
-  return filtered;
+function mergeWorkflowMessages(
+  queryMessages: ChatMessage[] | undefined,
+  sseMessages: ChatMessage[],
+  isRunning: boolean | undefined,
+  gracePolling: boolean
+): ChatMessage[] {
+  const dbMessages = queryMessages ?? [];
+  if (!isRunning && !gracePolling) return dbMessages;
+  if (sseMessages.length === 0) return dbMessages;
+  if (dbMessages.length === 0) return sseMessages;
+  const filteredDbMessages = filterDbMessagesForLiveTools(
+    dbMessages,
+    sseMessages,
+    isRunning === true
+  );
+  const dedupedSse = dedupeSseMessages(sseMessages, filteredDbMessages);
+  if (dedupedSse.length === 0) return filteredDbMessages;
+  return [...filteredDbMessages, ...dedupedSse].sort((a, b) => a.timestamp - b.timestamp);
 }
 
 /**
@@ -258,35 +403,7 @@ export function WorkflowLogs({
   // This mirrors ChatInterface's hydration merge pattern.
   useEffect(() => {
     if (!queryMessages || queryMessages.length === 0) return;
-    setSseMessages(prev => {
-      let changed = false;
-      const result: ChatMessage[] = [];
-      for (const m of prev) {
-        if (m.isStreaming) {
-          // Actively streaming text — keep as-is (DB doesn't have this yet)
-          result.push(m);
-          continue;
-        }
-        const hasActiveTool = m.toolCalls?.some(tc => tc.duration === undefined && !tc.output);
-        if (!hasActiveTool) {
-          // All tools complete, not streaming — DB has this, drop it
-          changed = true;
-          continue;
-        }
-        // Has at least one in-progress tool — keep only the active tools,
-        // strip completed ones that are already in DB via persistence flush.
-        const activeTools = (m.toolCalls ?? []).filter(
-          tc => tc.duration === undefined && !tc.output
-        );
-        if (activeTools.length < (m.toolCalls?.length ?? 0)) {
-          changed = true;
-          result.push({ ...m, toolCalls: activeTools });
-        } else {
-          result.push(m);
-        }
-      }
-      return changed ? result : prev;
-    });
+    setSseMessages(pruneSseMessages);
   }, [queryMessages]);
 
   // Merge DB messages (canonical) with SSE-only messages (live streaming).
@@ -295,143 +412,10 @@ export function WorkflowLogs({
   // pruned by the effect above whenever new DB data arrives, so only active
   // (streaming / in-progress) SSE messages remain. This prevents duplicates
   // where both DB and SSE contain the same completed tool calls.
-  const messages = useMemo((): ChatMessage[] => {
-    const dbMessages = queryMessages ?? [];
-
-    // After workflow completes, use DB only — clean, no duplicates.
-    if (!isRunning && !gracePolling) return dbMessages;
-
-    // While running with no SSE data yet, show DB messages.
-    if (sseMessages.length === 0) return dbMessages;
-
-    // No DB messages yet — show SSE only.
-    if (dbMessages.length === 0) return sseMessages;
-
-    // Collect DB tool calls for dedup against SSE tools.
-    // SSE and DB compute durations independently (client vs server Date.now()),
-    // so durations can differ by a few ms. We match by name + duration ±500ms.
-    const dbTools: { name: string; duration: number }[] = [];
-    for (const dm of dbMessages) {
-      for (const tc of dm.toolCalls ?? []) {
-        if (tc.duration !== undefined) {
-          dbTools.push({ name: tc.name, duration: tc.duration });
-        }
-      }
-    }
-
-    const isInDb = (name: string, duration: number): boolean =>
-      dbTools.some(dt => dt.name === name && Math.abs(dt.duration - duration) < 500);
-
-    // Collect in-flight SSE tool counts (tool_call received, tool_result not yet received).
-    // These are tools SSE is actively tracking with a running spinner.
-    // Uses a counted map (not a Set) to handle concurrent same-name tools (e.g., parallel Read calls).
-    const sseInFlightCounts = new Map<string, number>();
-    for (const m of sseMessages) {
-      for (const tc of m.toolCalls ?? []) {
-        if (tc.duration === undefined && !tc.output) {
-          sseInFlightCounts.set(tc.name, (sseInFlightCounts.get(tc.name) ?? 0) + 1);
-        }
-      }
-    }
-
-    // Handle in-flight DB tool calls to prevent duplicates and ordering glitches.
-    // When a tool is in-flight, workflow_events has a tool_called row (no duration yet),
-    // which hydrateMessages surfaces into queryMessages. Without handling, that DB
-    // entry and the SSE entry both appear — the race condition described in issue #744.
-    //
-    // Two strategies applied:
-    // 1. SUPPRESS in-flight DB tools that SSE is actively tracking (cardinality-aware)
-    // 2. REPOSITION remaining in-flight DB tools to sort at the end (timestamp bump)
-    //    This prevents the ordering glitch where DB's earlier server timestamp causes
-    //    in-flight tools to jump above completed SSE tools during the prune timing gap.
-    const now = Date.now();
-    let filteredDbMessages: ChatMessage[];
-    if (sseInFlightCounts.size > 0 || isRunning) {
-      const dbSuppressedCounts = new Map<string, number>();
-      const mapped = dbMessages.map(m => {
-        if (!m.toolCalls?.length) return m; // No tool calls to filter — return as-is
-        let messageChanged = false;
-        const filteredTools = m.toolCalls.filter(tc => {
-          if (tc.duration !== undefined || !!tc.output) return true;
-          // In-flight DB tool — suppress if SSE is actively tracking one with this name
-          if (sseInFlightCounts.size > 0) {
-            const limit = sseInFlightCounts.get(tc.name) ?? 0;
-            const suppressed = dbSuppressedCounts.get(tc.name) ?? 0;
-            if (suppressed < limit) {
-              dbSuppressedCounts.set(tc.name, suppressed + 1);
-              return false; // SSE owns this tool's live display
-            }
-          }
-          // In-flight DB tool NOT tracked by SSE — keep it visible but flag for
-          // timestamp bump so it sorts at the end instead of jumping above completed tools
-          messageChanged = true;
-          return true;
-        });
-        if (filteredTools.length === 0) {
-          return { ...m, toolCalls: undefined };
-        }
-        if (filteredTools.length !== m.toolCalls.length) {
-          // Some tools were suppressed. If remaining tools include unsuppressed
-          // in-flight ones, bump timestamp so they sort at the end (REPOSITION).
-          return { ...m, toolCalls: filteredTools, ...(messageChanged ? { timestamp: now } : {}) };
-        }
-        // No tools suppressed — if this message has in-flight tools, bump its
-        // timestamp so it sorts at the end (matching where SSE would place it)
-        if (messageChanged) {
-          return { ...m, timestamp: now };
-        }
-        return m;
-      });
-      // Preserve memo stability: return original array if nothing was actually filtered
-      filteredDbMessages = mapped.every((m, i) => m === dbMessages[i]) ? dbMessages : mapped;
-    } else {
-      filteredDbMessages = dbMessages;
-    }
-
-    // Collect DB text content for dedup against SSE text messages.
-    // During live execution, the same text (e.g., "🚀 Starting workflow...") can appear
-    // in both DB (from REST fetch on mount) and SSE (from event buffer replay).
-    // Without dedup, the text shows up twice in the message list.
-    const dbTextContents = new Set<string>();
-    for (const dm of filteredDbMessages) {
-      if (dm.role === 'assistant' && dm.content) {
-        dbTextContents.add(dm.content);
-      }
-    }
-
-    // Strip SSE tool calls that already appear in DB messages (completed).
-    // Also strip SSE text messages that are already in DB (prevents duplicate text).
-    const dedupedSse: ChatMessage[] = [];
-    for (const m of sseMessages) {
-      if (!m.toolCalls?.length) {
-        // Skip SSE text-only messages whose content already exists in DB.
-        if (m.content && dbTextContents.has(m.content)) {
-          continue;
-        }
-        // Also skip if DB has a message that starts with the SSE content
-        // (SSE text was flushed to DB before SSE finished accumulating).
-        if (m.content && [...dbTextContents].some(dc => dc.startsWith(m.content))) {
-          continue;
-        }
-        if (m.isStreaming || m.content) dedupedSse.push(m);
-        continue;
-      }
-      const uniqueTools = m.toolCalls.filter(
-        tc => tc.duration === undefined || !isInDb(tc.name, tc.duration)
-      );
-      if (uniqueTools.length > 0 || m.isStreaming || m.content) {
-        dedupedSse.push({
-          ...m,
-          toolCalls: uniqueTools.length > 0 ? uniqueTools : undefined,
-        });
-      }
-    }
-
-    if (dedupedSse.length === 0) return filteredDbMessages;
-    const combined = [...filteredDbMessages, ...dedupedSse];
-    combined.sort((a, b) => a.timestamp - b.timestamp);
-    return combined;
-  }, [queryMessages, sseMessages, isRunning, gracePolling]);
+  const messages = useMemo(
+    (): ChatMessage[] => mergeWorkflowMessages(queryMessages, sseMessages, isRunning, gracePolling),
+    [queryMessages, sseMessages, isRunning, gracePolling]
+  );
 
   const onText = useCallback((content: string): void => {
     setSseMessages(prev => {

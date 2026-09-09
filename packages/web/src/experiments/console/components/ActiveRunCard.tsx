@@ -25,6 +25,107 @@ interface ActiveRunCardProps {
   inputPromoted?: boolean;
 }
 
+function canOpenRun(run: Run): boolean {
+  return run.projectId !== null && !run.id.startsWith('demo-');
+}
+
+function canOpenRunIde(run: Run, isDocker: boolean): boolean {
+  return (
+    !isDocker && run.workingPath !== null && run.workingPath !== '' && !run.id.startsWith('demo-')
+  );
+}
+
+function cardBorderColor(run: Run, selected: boolean): string {
+  if (selected) return 'color-mix(in oklch, var(--accent-bright), transparent 30%)';
+  return run.status === 'running'
+    ? 'color-mix(in oklch, var(--warning), transparent 70%)'
+    : 'var(--border)';
+}
+
+function CardStatusDot({ status }: { status: Run['status'] }): ReactElement {
+  return status === 'running' ? (
+    <LiveDot />
+  ) : (
+    <span aria-hidden className="h-2.5 w-2.5 shrink-0 animate-pulse rounded-full bg-warning" />
+  );
+}
+
+function CardDetailGrid({ run }: { run: Run }): ReactElement | null {
+  if (run.userMessage === '' && run.status !== 'running') return null;
+  return (
+    <div className="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 text-[12px]">
+      {run.userMessage !== '' ? (
+        <>
+          <span className="font-mono text-text-tertiary">input</span>
+          <span className="truncate font-mono text-text-secondary" title={run.userMessage}>
+            {run.userMessage}
+          </span>
+        </>
+      ) : null}
+      {run.status === 'running' && hasValue(run.currentNode) ? (
+        <>
+          <span className="font-mono text-text-tertiary">node</span>
+          <span className="font-mono text-text-primary">{run.currentNode}</span>
+        </>
+      ) : null}
+      {run.status === 'running' && hasValue(run.lastTool) ? (
+        <>
+          <span className="font-mono text-text-tertiary">tool</span>
+          <span className="font-mono text-text-primary">
+            {run.lastTool}
+            <span aria-hidden className="ml-1 inline-block animate-pulse">
+              ▏
+            </span>
+          </span>
+        </>
+      ) : null}
+    </div>
+  );
+}
+
+function ApprovalSurface({
+  run,
+  inputPromoted,
+}: {
+  run: Run;
+  inputPromoted: boolean;
+}): ReactElement | null {
+  if (run.status !== 'paused' || run.approval === null || run.approval === undefined) return null;
+  if (inputPromoted) {
+    return (
+      <div className="mt-2 flex items-center gap-2 rounded border border-warning/25 bg-warning/[0.05] px-3 py-2 text-[12px] text-warning">
+        <span aria-hidden className="leading-none">
+          ⚠
+        </span>
+        <span>Waiting for your input — see the banner at the top.</span>
+      </div>
+    );
+  }
+  return (
+    <>
+      <ApprovalContext run={run} />
+      <ApprovalPanel run={run} />
+    </>
+  );
+}
+
+function ResolvedGateHint({ run }: { run: Run }): ReactElement | null {
+  if (run.status !== 'paused' || run.gateResolved === null || run.gateResolved === undefined)
+    return null;
+  return (
+    <div className="mt-2 flex items-center gap-2 rounded border border-border bg-surface-hover/40 px-3 py-2 text-[12px] text-text-secondary">
+      <span aria-hidden className="inline-block animate-pulse leading-none">
+        ▸
+      </span>
+      <span>
+        {run.gateResolved === 'approved'
+          ? 'Approved — resuming…'
+          : 'Rejected — running on-reject rework…'}
+      </span>
+    </div>
+  );
+}
+
 /**
  * Rich card for `running` and `paused` runs. These get attention.
  *
@@ -50,10 +151,8 @@ export function ActiveRunCard({
   const isDocker = useIsDocker();
   const ideEnv = useIdeEnv();
   const elapsed = formatElapsed(elapsedSince(run.startedAt));
-  const canOpen = run.projectId !== null && !run.id.startsWith('demo-');
-  const canOpenIde =
-    !isDocker && run.workingPath !== null && run.workingPath !== '' && !run.id.startsWith('demo-');
-  const showDetailGrid = run.userMessage !== '' || run.status === 'running';
+  const canOpen = canOpenRun(run);
+  const canOpenIde = canOpenRunIde(run, isDocker);
 
   const onCardClick = (): void => {
     if (canOpen) navigate(`/console/p/${run.projectId}/r/${run.id}`);
@@ -84,25 +183,14 @@ export function ActiveRunCard({
       // repaints Tailwind border utilities (see theme.css). Running cards
       // get the design's amber tint.
       style={{
-        borderColor: selected
-          ? 'color-mix(in oklch, var(--accent-bright), transparent 30%)'
-          : run.status === 'running'
-            ? 'color-mix(in oklch, var(--warning), transparent 70%)'
-            : 'var(--border)',
+        borderColor: cardBorderColor(run, selected),
       }}
     >
       <StatusStrip status={run.status} />
       <div className="pl-4 pr-4 py-3">
         {/* Header */}
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-          {run.status === 'running' ? (
-            <LiveDot />
-          ) : (
-            <span
-              aria-hidden
-              className="h-2.5 w-2.5 shrink-0 animate-pulse rounded-full bg-warning"
-            />
-          )}
+          <CardStatusDot status={run.status} />
           <span
             className={`shrink-0 text-[10px] font-semibold uppercase tracking-[0.12em] ${statusTextClass[run.status]}`}
           >
@@ -146,71 +234,13 @@ export function ActiveRunCard({
 
         {/* Provenance + activity detail: the triggering input (when present, truncated —
             full text on hover), plus live node/tool rows while running. */}
-        {showDetailGrid ? (
-          <div className="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 text-[12px]">
-            {run.userMessage !== '' ? (
-              <>
-                <span className="font-mono text-text-tertiary">input</span>
-                <span className="truncate font-mono text-text-secondary" title={run.userMessage}>
-                  {run.userMessage}
-                </span>
-              </>
-            ) : null}
-            {run.status === 'running' && hasValue(run.currentNode) ? (
-              <>
-                <span className="font-mono text-text-tertiary">node</span>
-                <span className="font-mono text-text-primary">{run.currentNode}</span>
-              </>
-            ) : null}
-            {run.status === 'running' && hasValue(run.lastTool) ? (
-              <>
-                <span className="font-mono text-text-tertiary">tool</span>
-                <span className="font-mono text-text-primary">
-                  {run.lastTool}
-                  <span aria-hidden className="ml-1 inline-block animate-pulse">
-                    ▏
-                  </span>
-                </span>
-              </>
-            ) : null}
-          </div>
-        ) : null}
+        <CardDetailGrid run={run} />
 
-        {/* Approval surface — paused only.
-            The context block shows the actual question the agent asked (pulled
-            from the last text event), because the approval node's own
-            `message` is usually just a pointer ("answer the questions above"). */}
-        {run.status === 'paused' && run.approval !== null && run.approval !== undefined ? (
-          inputPromoted ? (
-            <div className="mt-2 flex items-center gap-2 rounded border border-warning/25 bg-warning/[0.05] px-3 py-2 text-[12px] text-warning">
-              <span aria-hidden className="leading-none">
-                ⚠
-              </span>
-              <span>Waiting for your input — see the banner at the top.</span>
-            </div>
-          ) : (
-            <>
-              <ApprovalContext run={run} />
-              <ApprovalPanel run={run} />
-            </>
-          )
-        ) : null}
+        {/* Approval surface — paused only. */}
+        <ApprovalSurface run={run} inputPromoted={inputPromoted} />
 
-        {/* Resolved gate awaiting auto-resume — the run is still 'paused' in the
-            DB for the second or so between approve/reject and the executor
-            flipping it to running. Show a hint instead of stale gate buttons. */}
-        {run.status === 'paused' && run.gateResolved !== null && run.gateResolved !== undefined ? (
-          <div className="mt-2 flex items-center gap-2 rounded border border-border bg-surface-hover/40 px-3 py-2 text-[12px] text-text-secondary">
-            <span aria-hidden className="inline-block animate-pulse leading-none">
-              ▸
-            </span>
-            <span>
-              {run.gateResolved === 'approved'
-                ? 'Approved — resuming…'
-                : 'Rejected — running on-reject rework…'}
-            </span>
-          </div>
-        ) : null}
+        {/* Resolved gate awaiting auto-resume. */}
+        <ResolvedGateHint run={run} />
       </div>
     </article>
   );

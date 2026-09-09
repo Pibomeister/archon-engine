@@ -263,6 +263,144 @@ function RunsFeed({
   );
 }
 
+function retainedDismissed(prev: ReadonlySet<string>, pendingRuns: Run[]): ReadonlySet<string> {
+  if (prev.size === 0) return prev;
+  const pendingIds = new Set(pendingRuns.map(run => run.id));
+  const next = new Set<string>();
+  let changed = false;
+  for (const id of prev) {
+    if (pendingIds.has(id)) next.add(id);
+    else changed = true;
+  }
+  return changed ? next : prev;
+}
+
+function scopedProject(
+  scope: Scope,
+  project: Project | null | undefined
+): { id: string; path: string } | null {
+  return scope !== 'all' && project !== undefined && project !== null
+    ? { id: project.id, path: project.path }
+    : null;
+}
+
+function emptyRunsTitle(filter: Filter): string {
+  if (filter === 'running') return 'Nothing running right now.';
+  if (filter === 'all') return 'No runs yet.';
+  return `No ${filter} runs.`;
+}
+
+function RunsHeader({
+  heading,
+  scope,
+  project,
+  demoMode,
+  query,
+  searchRef,
+  onQueryChange,
+}: {
+  heading: string;
+  scope: Scope;
+  project: Project | null | undefined;
+  demoMode: boolean;
+  query: string;
+  searchRef: React.RefObject<HTMLInputElement | null>;
+  onQueryChange: (value: string) => void;
+}): ReactElement {
+  return (
+    <header className="flex flex-col gap-3 border-b border-border px-6 py-4">
+      <div className="flex items-baseline justify-between gap-4">
+        <div className="min-w-0">
+          <h1 className="truncate text-base font-medium text-text-primary">{heading}</h1>
+          <p className="text-xs text-text-tertiary">
+            {scope === 'all' ? 'Every run, across every project.' : (project?.path ?? 'Loading…')}
+            {demoMode ? (
+              <span className="ml-2 rounded border border-warning/40 bg-warning/10 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-widest text-warning">
+                demo mocks on
+              </span>
+            ) : null}
+          </p>
+        </div>
+        <div
+          className="flex h-[38px] w-[300px] max-w-[34vw] shrink-0 items-center gap-2 rounded-[10px] border bg-surface-elevated px-3 text-text-tertiary transition-colors focus-within:text-text-secondary"
+          style={{ borderColor: 'var(--border)' }}
+        >
+          <span aria-hidden className="font-mono text-[13px] leading-none">
+            ⌕
+          </span>
+          <input
+            ref={searchRef}
+            type="text"
+            value={query}
+            onChange={event => {
+              onQueryChange(event.target.value);
+            }}
+            onKeyDown={event => {
+              if (event.key === 'Escape') {
+                event.currentTarget.blur();
+                onQueryChange('');
+              }
+            }}
+            placeholder="Search workflow, project, run id…"
+            spellCheck={false}
+            className="min-w-0 flex-1 bg-transparent font-mono text-[12.5px] text-text-primary outline-none placeholder:text-text-tertiary"
+          />
+        </div>
+      </div>
+      {scope === 'all' ? (
+        <div className="rounded border border-dashed border-border bg-surface-inset/60 px-3 py-2 text-[12px] text-text-tertiary">
+          Pick a project on the left to start a run.
+        </div>
+      ) : (
+        <ProjectViewTabs projectId={scope} active="runs" />
+      )}
+    </header>
+  );
+}
+
+function RunsBody({
+  error,
+  loading,
+  demoMode,
+  runs,
+  draftProject,
+  filter,
+  scope,
+  selectedRunId,
+  promotedRunIds,
+}: {
+  error: Error | undefined;
+  loading: boolean;
+  demoMode: boolean;
+  runs: Run[];
+  draftProject: { id: string; path: string } | null;
+  filter: Filter;
+  scope: Scope;
+  selectedRunId: string | null;
+  promotedRunIds: ReadonlySet<string>;
+}): ReactElement {
+  if (error !== undefined && !demoMode)
+    return <EmptyState title="Could not load runs." hint={error.message} />;
+  if (loading && !demoMode) return <EmptyState title="Loading…" />;
+  if (runs.length === 0 && draftProject === null) {
+    return (
+      <EmptyState
+        title={emptyRunsTitle(filter)}
+        hint={scope === 'all' ? 'Start one from a project.' : undefined}
+      />
+    );
+  }
+  return (
+    <RunsFeed
+      runs={runs}
+      showProject={scope === 'all'}
+      draftProject={draftProject}
+      selectedRunId={selectedRunId}
+      promotedRunIds={promotedRunIds}
+    />
+  );
+}
+
 export function RunsPage(): ReactElement {
   const { projectId } = useParams<{ projectId?: string }>();
   const navigate = useNavigate();
@@ -325,17 +463,7 @@ export function RunsPage(): ReactElement {
   // (a later approval node, or a repeating interactive loop gate) re-surfaces
   // instead of staying suppressed for the rest of the session.
   useEffect(() => {
-    setDismissed(prev => {
-      if (prev.size === 0) return prev;
-      const pendingIds = new Set(pendingRuns.map(r => r.id));
-      let changed = false;
-      const next = new Set<string>();
-      for (const id of prev) {
-        if (pendingIds.has(id)) next.add(id);
-        else changed = true;
-      }
-      return changed ? next : prev;
-    });
+    setDismissed(prev => retainedDismissed(prev, pendingRuns));
   }, [pendingRuns]);
 
   const visiblePending = useMemo(
@@ -345,8 +473,7 @@ export function RunsPage(): ReactElement {
   const promotedRunIds = useMemo(() => new Set(visiblePending.map(r => r.id)), [visiblePending]);
 
   const heading = scope === 'all' ? 'All projects' : (project?.name ?? 'Project');
-  const hasScopedProject = scope !== 'all' && project !== undefined && project !== null;
-  const draftProject = hasScopedProject ? { id: project.id, path: project.path } : null;
+  const draftProject = scopedProject(scope, project);
 
   // Clamp selection when the visible run set changes so j/k never lands on
   // an out-of-range index after a filter / search shrinks the list.
@@ -475,58 +602,15 @@ export function RunsPage(): ReactElement {
 
   return (
     <section className="flex h-full flex-col">
-      <header className="flex flex-col gap-3 border-b border-border px-6 py-4">
-        <div className="flex items-baseline justify-between gap-4">
-          <div className="min-w-0">
-            <h1 className="truncate text-base font-medium text-text-primary">{heading}</h1>
-            <p className="text-xs text-text-tertiary">
-              {scope === 'all' ? 'Every run, across every project.' : (project?.path ?? 'Loading…')}
-              {demoMode ? (
-                <span className="ml-2 rounded border border-warning/40 bg-warning/10 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-widest text-warning">
-                  demo mocks on
-                </span>
-              ) : null}
-            </p>
-          </div>
-          <div
-            className="flex h-[38px] w-[300px] max-w-[34vw] shrink-0 items-center gap-2 rounded-[10px] border bg-surface-elevated px-3 text-text-tertiary transition-colors focus-within:text-text-secondary"
-            // Inline because the console scope's wildcard border-color rule
-            // repaints Tailwind border utilities (see theme.css).
-            style={{ borderColor: 'var(--border)' }}
-          >
-            <span aria-hidden className="font-mono text-[13px] leading-none">
-              ⌕
-            </span>
-            <input
-              ref={searchRef}
-              type="text"
-              value={query}
-              onChange={e => {
-                setQuery(e.target.value);
-              }}
-              onKeyDown={e => {
-                // Esc unfocuses + clears so `/` → type → esc returns control
-                // to the global keymap without trapping the user in the box.
-                if (e.key === 'Escape') {
-                  e.currentTarget.blur();
-                  setQuery('');
-                }
-              }}
-              placeholder="Search workflow, project, run id…"
-              spellCheck={false}
-              className="min-w-0 flex-1 bg-transparent font-mono text-[12.5px] text-text-primary outline-none placeholder:text-text-tertiary"
-            />
-          </div>
-        </div>
-
-        {scope === 'all' ? (
-          <div className="rounded border border-dashed border-border bg-surface-inset/60 px-3 py-2 text-[12px] text-text-tertiary">
-            Pick a project on the left to start a run.
-          </div>
-        ) : (
-          <ProjectViewTabs projectId={scope} active="runs" />
-        )}
-      </header>
+      <RunsHeader
+        heading={heading}
+        scope={scope}
+        project={project}
+        demoMode={demoMode}
+        query={query}
+        searchRef={searchRef}
+        onQueryChange={setQuery}
+      />
 
       {/* Status sub-tabs — their own strip; the active underline overlaps the
           hairline below (design: .subtabs). */}
@@ -547,30 +631,17 @@ export function RunsPage(): ReactElement {
       />
 
       <div className="flex-1 overflow-y-auto px-[30px] pb-[30px] pt-[22px]">
-        {error !== undefined && !demoMode ? (
-          <EmptyState title="Could not load runs." hint={error.message} />
-        ) : loading && !demoMode ? (
-          <EmptyState title="Loading…" />
-        ) : runs.length === 0 && draftProject === null ? (
-          <EmptyState
-            title={
-              filter === 'running'
-                ? 'Nothing running right now.'
-                : filter === 'all'
-                  ? 'No runs yet.'
-                  : `No ${filter} runs.`
-            }
-            hint={scope === 'all' ? 'Start one from a project.' : undefined}
-          />
-        ) : (
-          <RunsFeed
-            runs={runs}
-            showProject={scope === 'all'}
-            draftProject={draftProject}
-            selectedRunId={selectedRunId}
-            promotedRunIds={promotedRunIds}
-          />
-        )}
+        <RunsBody
+          error={error}
+          loading={loading}
+          demoMode={demoMode}
+          runs={runs}
+          draftProject={draftProject}
+          filter={filter}
+          scope={scope}
+          selectedRunId={selectedRunId}
+          promotedRunIds={promotedRunIds}
+        />
       </div>
     </section>
   );

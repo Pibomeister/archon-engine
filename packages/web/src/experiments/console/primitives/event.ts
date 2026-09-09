@@ -142,6 +142,173 @@ const NODE_TRANSITION_BY_EVENT: Record<string, NodeTransitionEvent['transition']
   node_skipped_prior_success: 'skipped',
 };
 
+const WORKFLOW_EVENT_LABELS: Record<string, string> = {
+  workflow_started: 'Workflow started',
+  workflow_completed: 'Workflow completed',
+  workflow_failed: 'Workflow failed',
+  workflow_resumed: 'Workflow resumed (prior error cleared)',
+};
+
+const CONTAINER_EVENT_LABELS: Record<string, string> = {
+  container_created: 'Container created',
+  container_stopped: 'Container stopped (paused)',
+  container_resumed: 'Container resumed',
+  container_destroyed: 'Container removed',
+  writeback_requested: 'Write-back requested',
+  writeback_applied: 'Changes applied to live folder',
+  writeback_discarded: 'Changes discarded',
+};
+
+type RunEventBaseInput = Omit<RunEventBase, 'kind'>;
+
+function toNodeTransitionEvent(
+  base: RunEventBaseInput,
+  raw: RawWorkflowEvent
+): NodeTransitionEvent | null {
+  const transition = NODE_TRANSITION_BY_EVENT[raw.event_type];
+  if (transition === undefined) return null;
+  const output = readStringOrNull(raw.data, 'node_output');
+  return {
+    ...base,
+    kind: 'node_transition',
+    nodeName: readString(raw.data, 'name') || (raw.step_name ?? ''),
+    transition,
+    durationMs: readNumberOrNull(raw.data, 'duration_ms'),
+    skipReason: transition === 'skipped' ? readStringOrNull(raw.data, 'reason') : null,
+    skipExpr: transition === 'skipped' ? readStringOrNull(raw.data, 'expr') : null,
+    outputPreview: output === null ? null : output.slice(0, 300),
+    costUsd: readNumberOrNull(raw.data, 'cost_usd'),
+    stopReason: readStringOrNull(raw.data, 'stop_reason'),
+    numTurns: readNumberOrNull(raw.data, 'num_turns'),
+  };
+}
+
+function toToolCallEvent(base: RunEventBaseInput, raw: RawWorkflowEvent): ToolCallEvent | null {
+  if (raw.event_type !== 'tool_called' && raw.event_type !== 'tool_completed') return null;
+  return {
+    ...base,
+    kind: 'tool_call',
+    tool: readString(raw.data, 'tool_name'),
+    argsSummary: readString(raw.data, 'argsSummary'),
+    args: raw.data.tool_input,
+    result:
+      raw.event_type === 'tool_called'
+        ? null
+        : { ok: true, durationMs: readNumberOrNull(raw.data, 'duration_ms') ?? 0 },
+  };
+}
+
+function toArtifactEvent(base: RunEventBaseInput, raw: RawWorkflowEvent): ArtifactEvent | null {
+  if (raw.event_type !== 'workflow_artifact') return null;
+  return {
+    ...base,
+    kind: 'artifact',
+    artifactType: readString(raw.data, 'artifactType'),
+    label: readString(raw.data, 'label'),
+    url: readStringOrNull(raw.data, 'url'),
+    path: readStringOrNull(raw.data, 'path'),
+  };
+}
+
+function toApprovalEvent(base: RunEventBaseInput, raw: RawWorkflowEvent): ApprovalEvent | null {
+  if (raw.event_type === 'approval_requested') {
+    return { ...base, kind: 'approval', prompt: readString(raw.data, 'message'), resolution: null };
+  }
+  if (raw.event_type !== 'approval_received') return null;
+
+  return {
+    ...base,
+    kind: 'approval',
+    prompt: '',
+    resolution: approvalResolution(raw),
+  };
+}
+
+function approvalResolution(raw: RawWorkflowEvent): ApprovalEvent['resolution'] {
+  const decision = readString(raw.data, 'decision');
+  if (decision === 'approved') {
+    return { kind: 'approved', at: raw.created_at, comment: readStringOrNull(raw.data, 'comment') };
+  }
+  if (decision === 'rejected') {
+    return { kind: 'rejected', at: raw.created_at, reason: readString(raw.data, 'reason') };
+  }
+  return null;
+}
+
+function toErrorEvent(base: RunEventBaseInput, raw: RawWorkflowEvent): ErrorEvent | null {
+  if (raw.event_type !== 'error') return null;
+  return {
+    ...base,
+    kind: 'error',
+    message: readString(raw.data, 'error') || readString(raw.data, 'message'),
+    recoverable: Boolean(raw.data.recoverable),
+  };
+}
+
+function toWorkflowSystemEvent(base: RunEventBaseInput, raw: RawWorkflowEvent): SystemEvent | null {
+  const label = WORKFLOW_EVENT_LABELS[raw.event_type];
+  if (label === undefined) return null;
+  return {
+    ...base,
+    kind: 'system',
+    label,
+    detail:
+      readString(raw.data, 'name') ||
+      readString(raw.data, 'workflow') ||
+      readString(raw.data, 'message') ||
+      readString(raw.data, 'error'),
+  };
+}
+
+function toContainerSystemEvent(
+  base: RunEventBaseInput,
+  raw: RawWorkflowEvent
+): SystemEvent | null {
+  const label = CONTAINER_EVENT_LABELS[raw.event_type];
+  if (label === undefined) return null;
+  return { ...base, kind: 'system', label, detail: containerEventDetail(raw) };
+}
+
+function containerEventDetail(raw: RawWorkflowEvent): string {
+  if (raw.event_type === 'writeback_applied') {
+    const filesApplied = readNumberOrNull(raw.data, 'files_applied') ?? 0;
+    const filesDeleted = readNumberOrNull(raw.data, 'files_deleted') ?? 0;
+    return `${filesApplied} written, ${filesDeleted} deleted`;
+  }
+  if (raw.event_type === 'writeback_requested') {
+    const totalCount = readNumberOrNull(raw.data, 'total_count');
+    return totalCount !== null ? `${totalCount} file(s) changed` : '';
+  }
+  const containerId = readString(raw.data, 'containerId');
+  return containerId ? containerId.slice(0, 12) : '';
+}
+
+function toParseWarningsEvent(base: RunEventBaseInput, raw: RawWorkflowEvent): TextEvent | null {
+  if (raw.event_type !== 'workflow_parse_warnings') return null;
+  const warnings = Array.isArray(raw.data.warnings)
+    ? raw.data.warnings.filter((w): w is string => typeof w === 'string')
+    : [];
+  return {
+    ...base,
+    kind: 'text',
+    content:
+      warnings.length > 0
+        ? `⚠️ This workflow declares keys the engine ignores:\n${warnings.map(w => `- ${w}`).join('\n')}`
+        : '⚠️ This workflow declares keys the engine ignores.',
+  };
+}
+
+function toFallbackTextEvent(base: RunEventBaseInput, raw: RawWorkflowEvent): TextEvent {
+  return {
+    ...base,
+    kind: 'text',
+    content:
+      readString(raw.data, 'text') ||
+      readString(raw.data, 'message') ||
+      `${raw.event_type} — ${JSON.stringify(raw.data).slice(0, 200)}`,
+  };
+}
+
 /**
  * Best-effort normalizer from a raw workflow_events row to a typed RunEvent.
  * Unknown event types fall through as text events with the raw payload —
@@ -154,205 +321,18 @@ export function toRunEvent(raw: RawWorkflowEvent): RunEvent {
     timestamp: raw.created_at,
     nodeId: raw.step_name,
   };
-  const data = raw.data;
-  const et = raw.event_type;
 
-  if (
-    et === 'node_started' ||
-    et === 'node_completed' ||
-    et === 'node_failed' ||
-    et === 'node_skipped' ||
-    et === 'node_skipped_prior_success'
-  ) {
-    // Guard above restricts `et` to the map's keys; `?? 'skipped'` is only a
-    // defensive default if a new node_* type is added to the guard but not the map.
-    const transition = NODE_TRANSITION_BY_EVENT[et] ?? 'skipped';
-    const output = readStringOrNull(data, 'node_output');
-    return {
-      ...base,
-      kind: 'node_transition',
-      nodeName: readString(data, 'name') || (raw.step_name ?? ''),
-      transition,
-      // Server persists `duration_ms` (NOT `duration`); reading the wrong key here
-      // left every node duration null in the UI.
-      durationMs: readNumberOrNull(data, 'duration_ms'),
-      skipReason: transition === 'skipped' ? readStringOrNull(data, 'reason') : null,
-      skipExpr: transition === 'skipped' ? readStringOrNull(data, 'expr') : null,
-      outputPreview: output === null ? null : output.slice(0, 300),
-      costUsd: readNumberOrNull(data, 'cost_usd'),
-      stopReason: readStringOrNull(data, 'stop_reason'),
-      numTurns: readNumberOrNull(data, 'num_turns'),
-    };
-  }
-
-  if (et === 'tool_called' || et === 'tool_completed') {
-    // Server writes snake_case fields (tool_name, tool_input, duration_ms);
-    // the start event carries the input, the completed event carries only
-    // the duration. RunStream pairs them by step + order to fill durationMs.
-    const toolName = readString(data, 'tool_name');
-    const toolInput = data.tool_input;
-    const argsSummary = readString(data, 'argsSummary');
-    return {
-      ...base,
-      kind: 'tool_call',
-      tool: toolName,
-      argsSummary,
-      args: toolInput,
-      result:
-        et === 'tool_called'
-          ? null
-          : { ok: true, durationMs: readNumberOrNull(data, 'duration_ms') ?? 0 },
-    };
-  }
-
-  if (et === 'workflow_artifact') {
-    return {
-      ...base,
-      kind: 'artifact',
-      artifactType: readString(data, 'artifactType'),
-      label: readString(data, 'label'),
-      url: readStringOrNull(data, 'url'),
-      path: readStringOrNull(data, 'path'),
-    };
-  }
-
-  // The server writes two rows around a human gate: `approval_requested` (carries
-  // the prompt in `message`) and `approval_received` (carries the outcome in
-  // `decision` + `comment`/`reason`). The prompt does NOT ride the received row;
-  // these two are emitted as separate events and a future renderer would pair them
-  // by nodeId. (Today nothing renders `approval` events in the run stream — paused
-  // gates are driven from `run.approval` metadata — so this is correctness of
-  // classification, not display.) The old code checked `approval_pending`/
-  // `approval_resolved` and read a `resolution` key, none of which the server ever
-  // writes, so approvals fell through to the raw-JSON fallback below.
-  if (et === 'approval_requested') {
-    return {
-      ...base,
-      kind: 'approval',
-      prompt: readString(data, 'message'),
-      resolution: null,
-    };
-  }
-
-  if (et === 'approval_received') {
-    const decision = readString(data, 'decision');
-    // Match the decision explicitly. An unknown/missing value must NOT default to
-    // "approved" (that would silently render a rejected gate as approved — the exact
-    // silent-mismatch class this normalizer exists to prevent); leave it unresolved.
-    const resolution: ApprovalEvent['resolution'] =
-      decision === 'approved'
-        ? { kind: 'approved', at: raw.created_at, comment: readStringOrNull(data, 'comment') }
-        : decision === 'rejected'
-          ? { kind: 'rejected', at: raw.created_at, reason: readString(data, 'reason') }
-          : null;
-    return {
-      ...base,
-      kind: 'approval',
-      prompt: '',
-      resolution,
-    };
-  }
-
-  if (et === 'error') {
-    return {
-      ...base,
-      kind: 'error',
-      message: readString(data, 'error') || readString(data, 'message'),
-      recoverable: Boolean(data.recoverable),
-    };
-  }
-
-  if (
-    et === 'workflow_started' ||
-    et === 'workflow_completed' ||
-    et === 'workflow_failed' ||
-    et === 'workflow_resumed'
-  ) {
-    // `workflow_resumed` is written only when a resume CLEARED a prior error
-    // (#2348), and carries that error in `data.error` — the same key
-    // `workflow_failed` uses, so the shared `detail` fallback below surfaces it.
-    const label =
-      et === 'workflow_started'
-        ? 'Workflow started'
-        : et === 'workflow_completed'
-          ? 'Workflow completed'
-          : et === 'workflow_resumed'
-            ? 'Workflow resumed (prior error cleared)'
-            : 'Workflow failed';
-    const detail =
-      readString(data, 'name') ||
-      readString(data, 'workflow') ||
-      readString(data, 'message') ||
-      readString(data, 'error');
-    return {
-      ...base,
-      kind: 'system',
-      label,
-      detail,
-    };
-  }
-
-  // Container isolation lifecycle (folder-project container runs). Persisted with
-  // DB-side names, NOT the emitter's `container_lifecycle` type — this normalizer
-  // reads DB rows. Surfaced behind the System toggle. created/destroyed bracket the
-  // run; stopped/resumed bracket a suspend across a pause; writeback_* track the
-  // write-back gate (Phase C).
-  const CONTAINER_EVENT_LABELS: Record<string, string> = {
-    container_created: 'Container created',
-    container_stopped: 'Container stopped (paused)',
-    container_resumed: 'Container resumed',
-    container_destroyed: 'Container removed',
-    writeback_requested: 'Write-back requested',
-    writeback_applied: 'Changes applied to live folder',
-    writeback_discarded: 'Changes discarded',
-  };
-  if (et in CONTAINER_EVENT_LABELS) {
-    const containerId = readString(data, 'containerId');
-    let detail = containerId ? containerId.slice(0, 12) : '';
-    if (et === 'writeback_applied') {
-      const filesApplied = readNumberOrNull(data, 'files_applied') ?? 0;
-      const filesDeleted = readNumberOrNull(data, 'files_deleted') ?? 0;
-      detail = `${filesApplied} written, ${filesDeleted} deleted`;
-    } else if (et === 'writeback_requested') {
-      const totalCount = readNumberOrNull(data, 'total_count');
-      detail = totalCount !== null ? `${totalCount} file(s) changed` : '';
-    }
-    return {
-      ...base,
-      kind: 'system',
-      label: CONTAINER_EVENT_LABELS[et] ?? et,
-      detail,
-    };
-  }
-
-  // Keys the engine dropped from this run's YAML (#2213). Mapped explicitly —
-  // the fallback below would render the raw `{"warnings":[…]}` payload. Rendered
-  // as `text`, NOT `system`: system rows sit behind the System toggle (off by
-  // default), and a silently dropped `interactive:` gate is exactly what the
-  // author needs to see without opting in.
-  if (et === 'workflow_parse_warnings') {
-    const warnings = Array.isArray(data.warnings)
-      ? data.warnings.filter((w): w is string => typeof w === 'string')
-      : [];
-    return {
-      ...base,
-      kind: 'text',
-      content:
-        warnings.length > 0
-          ? `⚠️ This workflow declares keys the engine ignores:\n${warnings.map(w => `- ${w}`).join('\n')}`
-          : '⚠️ This workflow declares keys the engine ignores.',
-    };
-  }
-
-  // Fallback: render anything else as a text event with the payload summary.
-  return {
-    ...base,
-    kind: 'text',
-    content:
-      readString(data, 'text') ||
-      readString(data, 'message') ||
-      `${et} — ${JSON.stringify(data).slice(0, 200)}`,
-  };
+  return (
+    toNodeTransitionEvent(base, raw) ??
+    toToolCallEvent(base, raw) ??
+    toArtifactEvent(base, raw) ??
+    toApprovalEvent(base, raw) ??
+    toErrorEvent(base, raw) ??
+    toWorkflowSystemEvent(base, raw) ??
+    toContainerSystemEvent(base, raw) ??
+    toParseWarningsEvent(base, raw) ??
+    toFallbackTextEvent(base, raw)
+  );
 }
 
 /**
@@ -388,56 +368,73 @@ export interface NodeRun {
  * matching the dedup `countTerminalNodes` relies on. Null-`nodeId` transitions are
  * skipped (can't be keyed). Returned sorted by `startedAt`.
  */
-export function foldNodeRuns(events: RunEvent[]): NodeRun[] {
-  const byNode = new Map<string, NodeTransitionEvent[]>();
-  for (const e of events) {
-    if (e.kind !== 'node_transition' || e.nodeId === null) continue;
-    const list = byNode.get(e.nodeId) ?? [];
-    list.push(e);
-    byNode.set(e.nodeId, list);
+function transitionBuckets(transitions: NodeTransitionEvent[]): {
+  completed: NodeTransitionEvent | null;
+  failed: NodeTransitionEvent | null;
+  skipped: NodeTransitionEvent | null;
+  nodeName: string;
+  startedAt: string;
+} {
+  let completed: NodeTransitionEvent | null = null;
+  let failed: NodeTransitionEvent | null = null;
+  let skipped: NodeTransitionEvent | null = null;
+  let nodeName = '';
+  let startedAt = transitions[0]?.timestamp ?? '';
+
+  for (const transition of transitions) {
+    if (new Date(transition.timestamp).getTime() < new Date(startedAt).getTime()) {
+      startedAt = transition.timestamp;
+    }
+    if (nodeName === '' && transition.nodeName !== '') nodeName = transition.nodeName;
+    if (transition.transition === 'completed') completed = transition;
+    else if (transition.transition === 'failed') failed = transition;
+    else if (transition.transition === 'skipped') skipped = transition;
   }
 
-  const runs: NodeRun[] = [];
-  for (const [nodeId, transitions] of byNode) {
-    // Last-of-each-kind wins; precedence is applied below, not by event order.
-    let completed: NodeTransitionEvent | null = null;
-    let failed: NodeTransitionEvent | null = null;
-    let skipped: NodeTransitionEvent | null = null;
-    let nodeName = '';
-    let startedAt = transitions[0]?.timestamp ?? '';
-    for (const t of transitions) {
-      if (new Date(t.timestamp).getTime() < new Date(startedAt).getTime()) startedAt = t.timestamp;
-      if (nodeName === '' && t.nodeName !== '') nodeName = t.nodeName;
-      if (t.transition === 'completed') completed = t;
-      else if (t.transition === 'failed') failed = t;
-      else if (t.transition === 'skipped') skipped = t;
-    }
-    const terminal = completed ?? failed ?? skipped;
-    // Precedence in documented order: ever-completed wins, then failed, then
-    // skipped, else still running.
-    let status: NodeRun['status'];
-    if (completed !== null) status = 'completed';
-    else if (failed !== null) status = 'failed';
-    else if (skipped !== null) status = 'skipped';
-    else status = 'running';
-    runs.push({
-      nodeId,
-      nodeName: nodeName !== '' ? nodeName : nodeId,
-      status,
-      startedAt,
-      // Position/duration come from whichever terminal transition exists...
-      endedAt: terminal?.timestamp ?? null,
-      durationMs: terminal?.durationMs ?? null,
-      // ...but cost/turns/stop are only ever written on `node_completed`, so read
-      // them from that transition (a failed/skipped terminal carries none).
-      costUsd: completed?.costUsd ?? null,
-      numTurns: completed?.numTurns ?? null,
-      stopReason: completed?.stopReason ?? null,
-      skipReason: skipped?.skipReason ?? null,
-      skipExpr: skipped?.skipExpr ?? null,
-    });
+  return { completed, failed, skipped, nodeName, startedAt };
+}
+
+function nodeRunStatus(
+  completed: NodeTransitionEvent | null,
+  failed: NodeTransitionEvent | null,
+  skipped: NodeTransitionEvent | null
+): NodeRun['status'] {
+  if (completed !== null) return 'completed';
+  if (failed !== null) return 'failed';
+  if (skipped !== null) return 'skipped';
+  return 'running';
+}
+
+function toNodeRun(nodeId: string, transitions: NodeTransitionEvent[]): NodeRun {
+  const { completed, failed, skipped, nodeName, startedAt } = transitionBuckets(transitions);
+  const terminal = completed ?? failed ?? skipped;
+  return {
+    nodeId,
+    nodeName: nodeName !== '' ? nodeName : nodeId,
+    status: nodeRunStatus(completed, failed, skipped),
+    startedAt,
+    endedAt: terminal?.timestamp ?? null,
+    durationMs: terminal?.durationMs ?? null,
+    costUsd: completed?.costUsd ?? null,
+    numTurns: completed?.numTurns ?? null,
+    stopReason: completed?.stopReason ?? null,
+    skipReason: skipped?.skipReason ?? null,
+    skipExpr: skipped?.skipExpr ?? null,
+  };
+}
+
+export function foldNodeRuns(events: RunEvent[]): NodeRun[] {
+  const byNode = new Map<string, NodeTransitionEvent[]>();
+  for (const event of events) {
+    if (event.kind !== 'node_transition' || event.nodeId === null) continue;
+    const bucket = byNode.get(event.nodeId) ?? [];
+    bucket.push(event);
+    byNode.set(event.nodeId, bucket);
   }
-  return runs.sort((a, b) => new Date(a.startedAt).getTime() - new Date(b.startedAt).getTime());
+
+  return [...byNode.entries()]
+    .map(([nodeId, transitions]) => toNodeRun(nodeId, transitions))
+    .sort((a, b) => new Date(a.startedAt).getTime() - new Date(b.startedAt).getTime());
 }
 
 /**

@@ -34,7 +34,8 @@ function makeActions(): BuilderKeyboardActions & {
 
 function makeEvent(
   key: string,
-  target: { tagName?: string; isContentEditable?: boolean; role?: string } | null
+  target: { tagName?: string; isContentEditable?: boolean; role?: string } | null,
+  init: Partial<Pick<KeyboardEvent, 'metaKey' | 'ctrlKey' | 'shiftKey'>> = {}
 ): KeyboardEvent {
   const el =
     target === null
@@ -48,9 +49,9 @@ function makeEvent(
   return {
     key,
     target: el,
-    metaKey: false,
-    ctrlKey: false,
-    shiftKey: false,
+    metaKey: init.metaKey ?? false,
+    ctrlKey: init.ctrlKey ?? false,
+    shiftKey: init.shiftKey ?? false,
     preventDefault: mock(() => {}),
   } as unknown as KeyboardEvent;
 }
@@ -126,6 +127,28 @@ describe('handleBuilderKeydown — delete invariant', () => {
   test('Delete in ARIA textbox does NOT trigger onDeleteSelected', () => {
     handleBuilderKeydown(makeEvent('Delete', { tagName: 'DIV', role: 'textbox' }), actions);
     expect(actions.calls.onDeleteSelected).toBeUndefined();
+  });
+
+  test('modifier canvas shortcuts prevent default', () => {
+    const duplicate = makeEvent('d', { tagName: 'DIV' }, { metaKey: true });
+    const fit = makeEvent('0', { tagName: 'DIV' }, { ctrlKey: true });
+    const selectAll = makeEvent('a', { tagName: 'DIV' }, { metaKey: true });
+
+    handleBuilderKeydown(duplicate, actions);
+    handleBuilderKeydown(fit, actions);
+    handleBuilderKeydown(selectAll, actions);
+
+    expect(duplicate.preventDefault).toHaveBeenCalledTimes(1);
+    expect(fit.preventDefault).toHaveBeenCalledTimes(1);
+    expect(selectAll.preventDefault).toHaveBeenCalledTimes(1);
+    expect(actions.calls.onDuplicateSelected).toBe(1);
+    expect(actions.calls.onFitView).toBe(1);
+    expect(actions.calls.onSelectAll).toBe(1);
+  });
+
+  test('unrecognized modifier combinations still fall through to single-key shortcuts', () => {
+    handleBuilderKeydown(makeEvent('p', { tagName: 'DIV' }, { ctrlKey: true }), actions);
+    expect(actions.calls.onAddPrompt).toBe(1);
   });
 
   test('enabled=false suppresses all shortcuts', () => {

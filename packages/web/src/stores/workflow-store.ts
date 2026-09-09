@@ -175,6 +175,117 @@ function stopPolling(): void {
   hasRunInitialCheck = false;
 }
 
+function optionalTaskFields(
+  event: WorkflowTaskActivityEvent,
+  previous?: DagTaskInfo
+): Partial<DagTaskInfo> {
+  return {
+    ...(event.description !== undefined && previous?.description === undefined
+      ? { description: event.description }
+      : {}),
+    ...(event.taskType !== undefined && previous?.taskType === undefined
+      ? { taskType: event.taskType }
+      : {}),
+    ...(event.summary !== undefined ? { summary: event.summary } : {}),
+    ...(event.lastToolName !== undefined ? { lastToolName: event.lastToolName } : {}),
+    ...(event.usage !== undefined ? { usage: event.usage } : {}),
+  };
+}
+
+function upsertTask(tasks: DagTaskInfo[], event: WorkflowTaskActivityEvent): void {
+  const taskIdx = tasks.findIndex(t => t.taskId === event.taskId);
+  const previous = taskIdx >= 0 ? tasks[taskIdx] : undefined;
+  if (event.activity === 'started') {
+    const started = startTaskRow(event, previous);
+    if (taskIdx >= 0) tasks[taskIdx] = started;
+    else tasks.push(started);
+    return;
+  }
+
+  const next = updateTaskRow(event, previous);
+  if (taskIdx >= 0) tasks[taskIdx] = next;
+  else tasks.push(next);
+}
+
+function startTaskRow(event: WorkflowTaskActivityEvent, previous?: DagTaskInfo): DagTaskInfo {
+  return {
+    ...(previous ?? { taskId: event.taskId }),
+    activity:
+      previous?.activity === undefined || previous.activity === 'started'
+        ? 'started'
+        : previous.activity,
+    startedAt: event.timestamp,
+    updatedAt: event.timestamp,
+    ...optionalTaskFields(event, previous),
+  };
+}
+
+function updateTaskRow(event: WorkflowTaskActivityEvent, previous?: DagTaskInfo): DagTaskInfo {
+  return {
+    ...(previous ?? { taskId: event.taskId, startedAt: event.timestamp }),
+    activity: event.activity,
+    updatedAt: event.timestamp,
+    ...optionalTaskFields(event, previous),
+  };
+}
+
+function applyTaskActivity(wf: WorkflowState, event: WorkflowTaskActivityEvent): WorkflowState {
+  const dagNodes = [...wf.dagNodes];
+  const nodeIdx = dagNodes.findIndex(n => n.nodeId === event.nodeId);
+  if (nodeIdx < 0) return wf;
+  const existing = dagNodes[nodeIdx];
+  const tasks: DagTaskInfo[] = [...(existing.tasks ?? [])];
+  upsertTask(tasks, event);
+  dagNodes[nodeIdx] = { ...existing, tasks };
+  return { ...wf, dagNodes };
+}
+
+function startHookRow(event: WorkflowHookActivityEvent, previous?: DagHookInfo): DagHookInfo {
+  return {
+    ...(previous ?? { hookId: event.hookId }),
+    hookName: previous?.hookName || event.hookName,
+    hookEvent: previous?.hookEvent || event.hookEvent,
+    activity:
+      previous?.activity === undefined || previous.activity === 'started'
+        ? 'started'
+        : previous.activity,
+    startedAt: event.timestamp,
+    updatedAt: event.timestamp,
+  };
+}
+
+function responseHookRow(event: WorkflowHookActivityEvent, previous?: DagHookInfo): DagHookInfo {
+  return {
+    ...(previous ?? { hookId: event.hookId, startedAt: event.timestamp }),
+    hookName: event.hookName || previous?.hookName || '',
+    hookEvent: event.hookEvent || previous?.hookEvent || '',
+    activity: 'response',
+    ...(event.outcome !== undefined ? { outcome: event.outcome } : {}),
+    ...(event.exitCode !== undefined ? { exitCode: event.exitCode } : {}),
+    updatedAt: event.timestamp,
+  };
+}
+
+function upsertHook(hooks: DagHookInfo[], event: WorkflowHookActivityEvent): void {
+  const hookIdx = hooks.findIndex(h => h.hookId === event.hookId);
+  const previous = hookIdx >= 0 ? hooks[hookIdx] : undefined;
+  const next =
+    event.activity === 'started' ? startHookRow(event, previous) : responseHookRow(event, previous);
+  if (hookIdx >= 0) hooks[hookIdx] = next;
+  else hooks.push(next);
+}
+
+function applyHookActivity(wf: WorkflowState, event: WorkflowHookActivityEvent): WorkflowState {
+  const dagNodes = [...wf.dagNodes];
+  const nodeIdx = dagNodes.findIndex(n => n.nodeId === event.nodeId);
+  if (nodeIdx < 0) return wf;
+  const existing = dagNodes[nodeIdx];
+  const hooks: DagHookInfo[] = [...(existing.hooks ?? [])];
+  upsertHook(hooks, event);
+  dagNodes[nodeIdx] = { ...existing, hooks };
+  return { ...wf, dagNodes };
+}
+
 // --- Store ---
 
 export const useWorkflowStore = create<WorkflowStoreState>()(
@@ -328,176 +439,16 @@ export const useWorkflowStore = create<WorkflowStoreState>()(
       },
 
       handleTaskActivity: (event: WorkflowTaskActivityEvent): void => {
-        // Aggregate per-task activity under the parent DAG node. Tasks arrive
-        // as a stream (started → progress* → completed/failed/stopped) keyed
-        // by `taskId`; we keep one row per task, mutating in place as the
-        // event stream progresses so a `task_progress` updates the same row
-        // the user already sees expanded.
         set(
-          state =>
-            updateWorkflow(state, event.runId, wf => {
-              const dagNodes = [...wf.dagNodes];
-              const nodeIdx = dagNodes.findIndex(n => n.nodeId === event.nodeId);
-              if (nodeIdx < 0) return wf; // Node not yet in store — silent drop, same as loop iteration ordering tolerance.
-
-              const existing = dagNodes[nodeIdx];
-              const tasks: DagTaskInfo[] = [...(existing.tasks ?? [])];
-              const taskIdx = tasks.findIndex(t => t.taskId === event.taskId);
-              const now = event.timestamp;
-
-              if (event.activity === 'started') {
-                if (taskIdx >= 0) {
-                  // A `started` can arrive after a progress/terminal event was
-                  // already seeded out-of-order. Merge rather than replace so we
-                  // neither regress the activity nor drop accumulated metadata
-                  // (summary / usage / lastToolName).
-                  const prev = tasks[taskIdx];
-                  tasks[taskIdx] = {
-                    ...prev,
-                    activity: prev.activity === 'started' ? 'started' : prev.activity,
-                    startedAt: now,
-                    updatedAt: now,
-                    ...(prev.description === undefined && event.description !== undefined
-                      ? { description: event.description }
-                      : {}),
-                    ...(prev.taskType === undefined && event.taskType !== undefined
-                      ? { taskType: event.taskType }
-                      : {}),
-                  };
-                } else {
-                  tasks.push({
-                    taskId: event.taskId,
-                    activity: 'started',
-                    startedAt: now,
-                    updatedAt: now,
-                    ...(event.description !== undefined ? { description: event.description } : {}),
-                    ...(event.taskType !== undefined ? { taskType: event.taskType } : {}),
-                  });
-                }
-              } else {
-                if (taskIdx < 0) {
-                  // Notification / progress / terminal arrived before started
-                  // (out-of-order replay). Seed a row carrying this event's
-                  // metadata so nothing is dropped before `started` lands.
-                  tasks.push({
-                    taskId: event.taskId,
-                    activity: event.activity,
-                    startedAt: now,
-                    updatedAt: now,
-                    ...(event.description !== undefined ? { description: event.description } : {}),
-                    ...(event.taskType !== undefined ? { taskType: event.taskType } : {}),
-                    ...(event.summary !== undefined ? { summary: event.summary } : {}),
-                    ...(event.lastToolName !== undefined
-                      ? { lastToolName: event.lastToolName }
-                      : {}),
-                    ...(event.usage !== undefined ? { usage: event.usage } : {}),
-                  });
-                } else {
-                  const prev = tasks[taskIdx];
-                  tasks[taskIdx] = {
-                    ...prev,
-                    activity: event.activity,
-                    updatedAt: now,
-                    // Keep the first-seen description / taskType so a progress
-                    // event (which may not carry description) doesn't blank
-                    // the row. Same for taskType.
-                    ...(event.description !== undefined && prev.description === undefined
-                      ? { description: event.description }
-                      : {}),
-                    ...(event.taskType !== undefined && prev.taskType === undefined
-                      ? { taskType: event.taskType }
-                      : {}),
-                    ...(event.summary !== undefined ? { summary: event.summary } : {}),
-                    ...(event.lastToolName !== undefined
-                      ? { lastToolName: event.lastToolName }
-                      : {}),
-                    ...(event.usage !== undefined ? { usage: event.usage } : {}),
-                  };
-                }
-              }
-
-              dagNodes[nodeIdx] = { ...existing, tasks };
-              return { ...wf, dagNodes };
-            }),
+          state => updateWorkflow(state, event.runId, wf => applyTaskActivity(wf, event)),
           undefined,
           'workflow/taskActivity'
         );
       },
 
       handleHookActivity: (event: WorkflowHookActivityEvent): void => {
-        // Hooks arrive as started/response pairs sharing `hookId`. Collapse
-        // into a single row per hook so the UI can render the outcome inline
-        // (e.g. "PreToolUse(Bash) → approved") without a separate "in-flight"
-        // state machine.
         set(
-          state =>
-            updateWorkflow(state, event.runId, wf => {
-              const dagNodes = [...wf.dagNodes];
-              const nodeIdx = dagNodes.findIndex(n => n.nodeId === event.nodeId);
-              if (nodeIdx < 0) return wf; // Same ordering tolerance as taskActivity.
-
-              const existing = dagNodes[nodeIdx];
-              const hooks: DagHookInfo[] = [...(existing.hooks ?? [])];
-              const hookIdx = hooks.findIndex(h => h.hookId === event.hookId);
-              const now = event.timestamp;
-
-              if (event.activity === 'started') {
-                if (hookIdx >= 0) {
-                  // A `started` can arrive after the response was seeded
-                  // out-of-order. Merge so we neither regress 'response' →
-                  // 'started' nor drop the captured outcome / exitCode.
-                  const prev = hooks[hookIdx];
-                  hooks[hookIdx] = {
-                    ...prev,
-                    hookName: prev.hookName || event.hookName,
-                    hookEvent: prev.hookEvent || event.hookEvent,
-                    activity: prev.activity === 'started' ? 'started' : prev.activity,
-                    startedAt: now,
-                    updatedAt: now,
-                  };
-                } else {
-                  hooks.push({
-                    hookId: event.hookId,
-                    hookName: event.hookName,
-                    hookEvent: event.hookEvent,
-                    activity: 'started',
-                    startedAt: now,
-                    updatedAt: now,
-                  });
-                }
-              } else {
-                if (hookIdx < 0) {
-                  // Response arrived before started (out-of-order). Seed
-                  // a row so the outcome isn't dropped.
-                  hooks.push({
-                    hookId: event.hookId,
-                    hookName: event.hookName,
-                    hookEvent: event.hookEvent,
-                    activity: 'response',
-                    ...(event.outcome !== undefined ? { outcome: event.outcome } : {}),
-                    ...(event.exitCode !== undefined ? { exitCode: event.exitCode } : {}),
-                    startedAt: now,
-                    updatedAt: now,
-                  });
-                } else {
-                  const prev = hooks[hookIdx];
-                  hooks[hookIdx] = {
-                    ...prev,
-                    // Prefer the response's hookName/hookEvent if a started
-                    // event carried empty strings (rare; defensive).
-                    hookName: event.hookName || prev.hookName,
-                    hookEvent: event.hookEvent || prev.hookEvent,
-                    activity: 'response',
-                    ...(event.outcome !== undefined ? { outcome: event.outcome } : {}),
-                    ...(event.exitCode !== undefined ? { exitCode: event.exitCode } : {}),
-                    updatedAt: now,
-                  };
-                }
-              }
-
-              dagNodes[nodeIdx] = { ...existing, hooks };
-              return { ...wf, dagNodes };
-            }),
+          state => updateWorkflow(state, event.runId, wf => applyHookActivity(wf, event)),
           undefined,
           'workflow/hookActivity'
         );

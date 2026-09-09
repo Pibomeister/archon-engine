@@ -98,6 +98,112 @@ function mapMessageRow(row: MessageResponse): ChatMessage {
   };
 }
 
+function ChatErrors({
+  conversationsError,
+  codebasesError,
+}: {
+  conversationsError: boolean;
+  codebasesError: boolean;
+}): React.ReactElement | null {
+  if (!conversationsError && !codebasesError) return null;
+  return (
+    <div className="flex gap-2 px-4 py-1">
+      {conversationsError ? (
+        <span className="text-xs text-red-400">Failed to load conversations</span>
+      ) : null}
+      {codebasesError ? (
+        <span className="text-xs text-red-400">Failed to load projects</span>
+      ) : null}
+    </div>
+  );
+}
+
+function ChatView({
+  isNewChat,
+  headerTitle,
+  headerSubtitle,
+  currentCodebase,
+  contextCodebase,
+  connected,
+  isDocker,
+  isWsl,
+  wslDistro,
+  conversationsError,
+  codebasesError,
+  messages,
+  isStreaming,
+  inputRef,
+  handleSend,
+  locked,
+  hasSentMessage,
+  queuePosition,
+  sending,
+  currentConv,
+}: {
+  isNewChat: boolean;
+  headerTitle: string;
+  headerSubtitle: string | undefined;
+  currentCodebase: CodebaseResponse | undefined;
+  contextCodebase: CodebaseResponse | undefined;
+  connected: boolean;
+  isDocker: boolean;
+  isWsl: boolean;
+  wslDistro: string | undefined;
+  conversationsError: boolean;
+  codebasesError: boolean;
+  messages: ChatMessage[];
+  isStreaming: boolean;
+  inputRef: React.RefObject<MessageInputHandle | null>;
+  handleSend: (message: string, uploadedFiles?: File[]) => Promise<void>;
+  locked: boolean;
+  hasSentMessage: boolean;
+  queuePosition: number | undefined;
+  sending: boolean;
+  currentConv: ConversationResponse | undefined;
+}): React.ReactElement {
+  const projectName = currentCodebase?.name ?? contextCodebase?.name;
+  const disabled =
+    sending ||
+    locked ||
+    isStreaming ||
+    (currentConv != null && currentConv.platform_type !== 'web');
+  const disabledReason =
+    currentConv != null && currentConv.platform_type !== 'web'
+      ? 'Continuing chats from other platforms in the Web UI is coming soon'
+      : undefined;
+  return (
+    <div className="flex flex-1 flex-col overflow-hidden min-h-0">
+      <Header
+        title={isNewChat ? 'New Chat' : headerTitle}
+        subtitle={headerSubtitle}
+        projectName={projectName}
+        connected={isNewChat ? undefined : connected}
+        isDocker={isDocker}
+        isWsl={isWsl}
+        wslDistro={wslDistro}
+      />
+      <ChatErrors conversationsError={conversationsError} codebasesError={codebasesError} />
+      <MessageList
+        messages={messages}
+        isStreaming={isStreaming}
+        isNewChat={isNewChat}
+        projectName={projectName}
+        onQuickAction={action => {
+          if (action === 'focus') inputRef.current?.focus();
+          else void handleSend(action);
+        }}
+      />
+      <LockIndicator locked={locked && hasSentMessage} queuePosition={queuePosition} />
+      <MessageInput
+        ref={inputRef}
+        onSend={handleSend}
+        disabled={disabled}
+        disabledReason={disabledReason}
+      />
+    </div>
+  );
+}
+
 interface ChatInterfaceProps {
   conversationId: string;
   cwdOverride?: string | null;
@@ -703,53 +809,27 @@ export function ChatInterface({
   const isStreaming = messages.some(m => m.isStreaming);
 
   return (
-    <div className="flex flex-1 flex-col overflow-hidden min-h-0">
-      <Header
-        title={isNewChat ? 'New Chat' : headerTitle}
-        subtitle={headerSubtitle}
-        projectName={currentCodebase?.name ?? contextCodebase?.name}
-        connected={isNewChat ? undefined : connected}
-        isDocker={isDocker}
-        isWsl={isWsl}
-        wslDistro={wslDistro}
-      />
-      {(conversationsError || codebasesError) && (
-        <div className="flex gap-2 px-4 py-1">
-          {conversationsError && (
-            <span className="text-xs text-red-400">Failed to load conversations</span>
-          )}
-          {codebasesError && <span className="text-xs text-red-400">Failed to load projects</span>}
-        </div>
-      )}
-      <MessageList
-        messages={messages}
-        isStreaming={isStreaming}
-        isNewChat={isNewChat}
-        projectName={currentCodebase?.name ?? contextCodebase?.name}
-        onQuickAction={(action): void => {
-          if (action === 'focus') {
-            inputRef.current?.focus();
-          } else {
-            void handleSend(action);
-          }
-        }}
-      />
-      <LockIndicator locked={locked && hasSentMessage} queuePosition={queuePosition} />
-      <MessageInput
-        ref={inputRef}
-        onSend={handleSend}
-        disabled={
-          sending ||
-          locked ||
-          isStreaming ||
-          (currentConv != null && currentConv.platform_type !== 'web')
-        }
-        disabledReason={
-          currentConv != null && currentConv.platform_type !== 'web'
-            ? 'Continuing chats from other platforms in the Web UI is coming soon'
-            : undefined
-        }
-      />
-    </div>
+    <ChatView
+      isNewChat={isNewChat}
+      headerTitle={headerTitle}
+      headerSubtitle={headerSubtitle}
+      currentCodebase={currentCodebase}
+      contextCodebase={contextCodebase}
+      connected={connected}
+      isDocker={isDocker}
+      isWsl={isWsl}
+      wslDistro={wslDistro}
+      conversationsError={conversationsError}
+      codebasesError={codebasesError}
+      messages={messages}
+      isStreaming={isStreaming}
+      inputRef={inputRef}
+      handleSend={handleSend}
+      locked={locked}
+      hasSentMessage={hasSentMessage}
+      queuePosition={queuePosition}
+      sending={sending}
+      currentConv={currentConv}
+    />
   );
 }

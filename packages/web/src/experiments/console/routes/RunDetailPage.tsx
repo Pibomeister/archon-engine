@@ -107,6 +107,183 @@ function writeNodeFilter(v: string): void {
   }
 }
 
+function terminalToolCallCount(events: RunEvent[], inlineToolCount: number): number {
+  if (inlineToolCount !== 0) return 0;
+  return events.filter(event => event.kind === 'tool_call' && event.result === null).length;
+}
+
+function renderPausedApproval(run: Run): ReactElement | null {
+  if (run.status !== 'paused' || run.approval === null || run.approval === undefined) return null;
+  return (
+    <div className="mt-6 rounded border border-warning/30 bg-warning/[0.04] p-4">
+      <div className="mb-2 flex items-center gap-2">
+        <span aria-hidden className="h-2 w-2 animate-pulse rounded-full bg-warning" />
+        <span className="text-[11px] font-semibold uppercase tracking-[0.14em] text-warning">
+          Waiting for approval
+        </span>
+      </div>
+      <ApprovalContext run={run} />
+      <div className="mt-2">
+        <ApprovalPanel run={run} />
+      </div>
+    </div>
+  );
+}
+
+function renderRunDetailContent({
+  view,
+  scrollRef,
+  toolbar,
+  run,
+  messages,
+  events,
+  showToolCalls,
+  showSystem,
+  selectedNodeId,
+  project,
+  runId,
+  onGraphNodeSelect,
+}: {
+  view: DetailView;
+  scrollRef: React.RefObject<HTMLDivElement | null>;
+  toolbar: ReactElement;
+  run: Run;
+  messages: Message[];
+  events: RunEvent[];
+  showToolCalls: boolean;
+  showSystem: boolean;
+  selectedNodeId: string;
+  project: Project | null | undefined;
+  runId: string;
+  onGraphNodeSelect: (nodeId: string) => void;
+}): ReactElement {
+  if (view === 'log')
+    return (
+      <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto">
+        <div className="w-full px-6">
+          <div className="sticky top-0 z-10 -mx-6 bg-surface px-6">{toolbar}</div>
+          <div className="py-4">
+            <RunStartedLine run={run} />
+            <div className="mt-2">
+              <RunStream
+                messages={messages}
+                events={events}
+                showToolCalls={showToolCalls}
+                showSystem={showSystem}
+                selectedNodeId={selectedNodeId}
+              />
+            </div>
+            <RunFinishedLine run={run} />
+            {renderPausedApproval(run)}
+          </div>
+        </div>
+      </div>
+    );
+  if (view === 'graph')
+    return (
+      <>
+        <div className="px-6">{toolbar}</div>
+        {project !== undefined && project !== null ? (
+          <RunGraphPanel
+            workflowName={run.workflow}
+            projectCwd={project.path}
+            events={events}
+            onNodeSelect={onGraphNodeSelect}
+          />
+        ) : (
+          <div className="p-6 text-[12px] text-text-tertiary">Loading project…</div>
+        )}
+      </>
+    );
+  return (
+    <>
+      <div className="px-6">{toolbar}</div>
+      <ArtifactPanel runId={runId} />
+    </>
+  );
+}
+
+function useRunDetailKeymap({
+  isPaused,
+  goBack,
+  setViewPersist,
+  toggleToolCalls,
+  toggleSystem,
+  clickApprove,
+  clickReject,
+}: {
+  isPaused: boolean;
+  goBack: () => void;
+  setViewPersist: (next: DetailView) => void;
+  toggleToolCalls: () => void;
+  toggleSystem: () => void;
+  clickApprove: () => void;
+  clickReject: () => void;
+}): void {
+  const bindings = useMemo<readonly Binding[]>(
+    () => [
+      {
+        keys: ['1'],
+        label: 'Log tab',
+        run: (): void => {
+          setViewPersist('log');
+        },
+      },
+      {
+        keys: ['2'],
+        label: 'Graph tab',
+        run: (): void => {
+          setViewPersist('graph');
+        },
+      },
+      {
+        keys: ['3'],
+        label: 'Artifacts tab',
+        run: (): void => {
+          setViewPersist('artifacts');
+        },
+      },
+      { keys: ['t'], label: 'Toggle tool calls', run: toggleToolCalls },
+      { keys: ['s'], label: 'Toggle system', run: toggleSystem },
+      { keys: ['a'], label: 'Approve', when: (): boolean => isPaused, run: clickApprove },
+      { keys: ['r'], label: 'Reject', when: (): boolean => isPaused, run: clickReject },
+      { keys: ['Escape'], label: 'Back to runs', run: goBack },
+      { keys: ['h'], label: 'Back to runs', run: goBack },
+    ],
+    [isPaused, goBack, setViewPersist, toggleToolCalls, toggleSystem, clickApprove, clickReject]
+  );
+  useKeymap({ bindings });
+}
+
+function shouldHeartbeatRun(runId: string | undefined, status: Run['status'] | undefined): boolean {
+  return runId !== undefined && (status === 'running' || status === 'paused');
+}
+
+function useRunHeartbeat(
+  runId: string | undefined,
+  status: Run['status'] | undefined,
+  conversationPlatformId: string | null
+): void {
+  useEffect(() => {
+    if (!shouldHeartbeatRun(runId, status) || runId === undefined) return;
+    const id = setInterval(() => {
+      invalidate(K.run(runId));
+      if (conversationPlatformId !== null) invalidate(K.messages(conversationPlatformId));
+    }, 30000);
+    return (): void => {
+      clearInterval(id);
+    };
+  }, [runId, status, conversationPlatformId]);
+}
+
+function entityKey(
+  value: string | undefined,
+  makeKey: (id: string) => string,
+  empty: string
+): string {
+  return value === undefined ? empty : makeKey(value);
+}
+
 export function RunDetailPage(): ReactElement {
   const { projectId, runId } = useParams<{ projectId: string; runId: string }>();
   const navigate = useNavigate();
@@ -133,12 +310,12 @@ export function RunDetailPage(): ReactElement {
   // downstream readers (they can guard explicitly instead of meeting a
   // mis-typed value).
   const { data: project } = useEntity<Project | null>(
-    projectId !== undefined ? K.project(projectId) : 'noop:no-project-id',
+    entityKey(projectId, K.project, 'noop:no-project-id'),
     () => (projectId !== undefined ? skill.getProject(projectId) : Promise.resolve(null))
   );
 
   const { data: detail, error: detailError } = useEntity<RunDetailView | null>(
-    runId !== undefined ? K.run(runId) : 'noop:no-run-id',
+    entityKey(runId, K.run, 'noop:no-run-id'),
     () => (runId !== undefined ? skill.getRun(runId) : Promise.resolve(null))
   );
 
@@ -171,25 +348,13 @@ export function RunDetailPage(): ReactElement {
   // while status is non-terminal catches that without being polling proper —
   // it stops the moment the run hits a terminal state.
   const status = detail?.run.status;
-  useEffect(() => {
-    if (runId === undefined) return;
-    if (status !== 'running' && status !== 'paused') return;
-    const id = setInterval(() => {
-      invalidate(K.run(runId));
-      if (conversationPlatformId !== null) {
-        invalidate(K.messages(conversationPlatformId));
-      }
-    }, 30000);
-    return (): void => {
-      clearInterval(id);
-    };
-  }, [runId, status, conversationPlatformId]);
+  useRunHeartbeat(runId, status, conversationPlatformId);
 
   // Surface the artifact count on the tab even when the user hasn't visited
   // the panel yet. Cheap call — the server walks one directory. Must live
   // above any early return so the hook order stays stable across renders.
   const { data: artifactFiles } = useEntity<ArtifactFile[]>(
-    runId !== undefined ? K.artifacts(runId) : 'noop:no-run-id',
+    entityKey(runId, K.artifacts, 'noop:no-run-id'),
     () =>
       runId !== undefined ? skill.listRunArtifacts(runId) : Promise.resolve([] as ArtifactFile[])
   );
@@ -266,49 +431,15 @@ export function RunDetailPage(): ReactElement {
     const el = document.querySelector<HTMLButtonElement>('[data-keymap-reject]');
     if (el !== null && !el.disabled) el.click();
   }, []);
-  const bindings = useMemo<readonly Binding[]>(
-    () => [
-      {
-        keys: ['1'],
-        label: 'Log tab',
-        run: (): void => {
-          setViewPersist('log');
-        },
-      },
-      {
-        keys: ['2'],
-        label: 'Graph tab',
-        run: (): void => {
-          setViewPersist('graph');
-        },
-      },
-      {
-        keys: ['3'],
-        label: 'Artifacts tab',
-        run: (): void => {
-          setViewPersist('artifacts');
-        },
-      },
-      { keys: ['t'], label: 'Toggle tool calls', run: toggleToolCalls },
-      { keys: ['s'], label: 'Toggle system', run: toggleSystem },
-      {
-        keys: ['a'],
-        label: 'Approve',
-        when: (): boolean => isPaused,
-        run: clickApprove,
-      },
-      {
-        keys: ['r'],
-        label: 'Reject',
-        when: (): boolean => isPaused,
-        run: clickReject,
-      },
-      { keys: ['Escape'], label: 'Back to runs', run: goBack },
-      { keys: ['h'], label: 'Back to runs', run: goBack },
-    ],
-    [isPaused, goBack, setViewPersist, toggleToolCalls, toggleSystem, clickApprove, clickReject]
-  );
-  useKeymap({ bindings });
+  useRunDetailKeymap({
+    isPaused,
+    goBack,
+    setViewPersist,
+    toggleToolCalls,
+    toggleSystem,
+    clickApprove,
+    clickReject,
+  });
 
   if (projectId === undefined || runId === undefined) {
     return (
@@ -340,19 +471,13 @@ export function RunDetailPage(): ReactElement {
   const inlineToolCount = messageList.reduce((acc, m) => acc + m.toolCalls.length, 0);
   // Mirror RunStream's source-of-truth rule: when no inline tool calls exist
   // on messages, the workflow tool_called events become the canonical count.
-  const workflowToolCount =
-    inlineToolCount === 0
-      ? events.filter(e => e.kind === 'tool_call' && e.result === null).length
-      : 0;
+  const workflowToolCount = terminalToolCallCount(events, inlineToolCount);
   const toolCallCount = inlineToolCount + workflowToolCount;
 
   const toolbar = (
     <StreamToolbar
       view={view}
-      onChangeView={next => {
-        setView(next);
-        writeView(next);
-      }}
+      onChangeView={setViewPersist}
       showToolCalls={showToolCalls}
       onToggleToolCalls={next => {
         setShowToolCalls(next);
@@ -381,75 +506,25 @@ export function RunDetailPage(): ReactElement {
         <RunDetailHeader run={run} projectId={projectId} projectName={project?.name ?? projectId} />
 
         <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-          {view === 'log' ? (
-            <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto">
-              <div className="w-full px-6">
-                <div className="sticky top-0 z-10 -mx-6 bg-surface px-6">{toolbar}</div>
-
-                <div className="py-4">
-                  <RunStartedLine run={run} />
-
-                  <div className="mt-2">
-                    <RunStream
-                      messages={messageList}
-                      events={events}
-                      showToolCalls={showToolCalls}
-                      showSystem={showSystem}
-                      selectedNodeId={selectedNodeId}
-                    />
-                  </div>
-
-                  <RunFinishedLine run={run} />
-
-                  {run.status === 'paused' &&
-                  run.approval !== null &&
-                  run.approval !== undefined ? (
-                    <div className="mt-6 rounded border border-warning/30 bg-warning/[0.04] p-4">
-                      <div className="mb-2 flex items-center gap-2">
-                        <span
-                          aria-hidden
-                          className="h-2 w-2 animate-pulse rounded-full bg-warning"
-                        />
-                        <span className="text-[11px] font-semibold uppercase tracking-[0.14em] text-warning">
-                          Waiting for approval
-                        </span>
-                      </div>
-                      <ApprovalContext run={run} />
-                      <div className="mt-2">
-                        <ApprovalPanel run={run} />
-                      </div>
-                    </div>
-                  ) : null}
-                </div>
-              </div>
-            </div>
-          ) : view === 'graph' ? (
-            <>
-              <div className="px-6">{toolbar}</div>
-              {project !== undefined && project !== null ? (
-                <RunGraphPanel
-                  workflowName={run.workflow}
-                  projectCwd={project.path}
-                  events={events}
-                  onNodeSelect={(nodeId): void => {
-                    setView('log');
-                    writeView('log');
-                    // Defer scroll until the log view has mounted.
-                    requestAnimationFrame(() => {
-                      scrollToNode(nodeId);
-                    });
-                  }}
-                />
-              ) : (
-                <div className="p-6 text-[12px] text-text-tertiary">Loading project…</div>
-              )}
-            </>
-          ) : (
-            <>
-              <div className="px-6">{toolbar}</div>
-              <ArtifactPanel runId={runId} />
-            </>
-          )}
+          {renderRunDetailContent({
+            view,
+            scrollRef,
+            toolbar,
+            run,
+            messages: messageList,
+            events,
+            showToolCalls,
+            showSystem,
+            selectedNodeId,
+            project,
+            runId,
+            onGraphNodeSelect: nodeId => {
+              setViewPersist('log');
+              requestAnimationFrame(() => {
+                scrollToNode(nodeId);
+              });
+            },
+          })}{' '}
         </div>
 
         <RunActionBar run={run} />
