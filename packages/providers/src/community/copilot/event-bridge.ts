@@ -149,6 +149,31 @@ export interface EventMapperContext {
   markErrored: (errorMsg: string) => void;
 }
 
+function mapCopilotToolComplete(
+  event: Extract<SessionEvent, { type: 'tool.execution_complete' }>,
+  ctx: EventMapperContext
+): MessageChunk[] {
+  const { toolCallId, success, result } = event.data;
+  const toolName = ctx.toolCallIdToName.get(toolCallId) ?? 'unknown';
+  // Prefer detailedContent (full output) over content (truncated for LLM).
+  const rawOutput = result?.detailedContent ?? result?.content ?? '';
+  const chunks: MessageChunk[] = [];
+  if (!success) {
+    chunks.push({
+      type: 'system',
+      content: `⚠️ Tool ${toolName} failed`,
+    });
+  }
+  chunks.push({
+    type: 'tool_result',
+    toolName,
+    toolOutput: success ? rawOutput : `❌ ${rawOutput}`,
+    toolCallId,
+    toolOutcome: success ? 'success' : 'error',
+  });
+  return chunks;
+}
+
 /**
  * Translate one Copilot SDK `SessionEvent` into zero or more Archon
  * `MessageChunk`s, mutating the supplied context (tool-call id → name map,
@@ -186,25 +211,7 @@ export function mapCopilotEvent(event: SessionEvent, ctx: EventMapperContext): M
       ];
     }
     case 'tool.execution_complete': {
-      const { toolCallId, success, result } = event.data;
-      const toolName = ctx.toolCallIdToName.get(toolCallId) ?? 'unknown';
-      // Prefer detailedContent (full output) over content (truncated for LLM).
-      const rawOutput = result?.detailedContent ?? result?.content ?? '';
-      const chunks: MessageChunk[] = [];
-      if (!success) {
-        chunks.push({
-          type: 'system',
-          content: `⚠️ Tool ${toolName} failed`,
-        });
-      }
-      chunks.push({
-        type: 'tool_result',
-        toolName,
-        toolOutput: success ? rawOutput : `❌ ${rawOutput}`,
-        toolCallId,
-        toolOutcome: success ? 'success' : 'error',
-      });
-      return chunks;
+      return mapCopilotToolComplete(event, ctx);
     }
     case 'session.error': {
       // Don't emit a system chunk here — defer until after sendAndWait
@@ -248,6 +255,125 @@ export type BridgeQueueItem =
   | { kind: 'done' }
   | { kind: 'error'; error: Error };
 
+interface CopilotBridgeState {
+  capturedTokens: TokenUsage | undefined;
+  errorMessage: string | undefined;
+  assistantBuffer: string;
+  sawAssistantContent: boolean;
+}
+
+function createCopilotBridgeMapperState(state: CopilotBridgeState): {
+  ctx: EventMapperContext;
+  toolCallIdToName: Map<string, string>;
+} {
+  const toolCallIdToName = new Map<string, string>();
+  return {
+    toolCallIdToName,
+    ctx: {
+      toolCallIdToName,
+      captureUsage: (u: TokenUsage): void => {
+        state.capturedTokens = u;
+      },
+      markErrored: (msg: string): void => {
+        state.errorMessage = msg;
+      },
+    },
+  };
+}
+
+async function abortCopilotBeforeStart(
+  session: CopilotSession,
+  queue: AsyncQueue<BridgeQueueItem>,
+  unsubscribe: () => void,
+  onAbort: () => void
+): Promise<never> {
+  const log = getLog();
+  onAbort();
+  queue.close();
+  try {
+    unsubscribe();
+  } catch (err) {
+    log.debug({ err }, 'copilot.unsubscribe_failed');
+  }
+  try {
+    await session.disconnect();
+  } catch (err) {
+    log.debug({ err, sessionId: session.sessionId }, 'copilot.disconnect_failed');
+  }
+  throw new DOMException('Copilot sendQuery aborted before start', 'AbortError');
+}
+
+async function emitCopilotFallbackContent(
+  sendResult: AssistantMessageEvent | undefined,
+  state: CopilotBridgeState,
+  wantsStructured: boolean
+): Promise<MessageChunk | undefined> {
+  if (state.sawAssistantContent || !sendResult?.data?.content) return undefined;
+  if (wantsStructured) state.assistantBuffer += sendResult.data.content;
+  state.sawAssistantContent = true;
+  return { type: 'assistant', content: sendResult.data.content };
+}
+
+function deferredCopilotErrorWarning(state: CopilotBridgeState): MessageChunk | undefined {
+  if (state.sawAssistantContent || !state.errorMessage) return undefined;
+  return { type: 'system', content: `⚠️ ${state.errorMessage}` };
+}
+
+function buildCopilotTerminalResult(
+  session: CopilotSession,
+  state: CopilotBridgeState,
+  wantsStructured: boolean
+): MessageChunk {
+  const result: MessageChunk = { type: 'result', sessionId: session.sessionId };
+  if (state.capturedTokens) result.tokens = state.capturedTokens;
+  if (!state.sawAssistantContent && state.errorMessage) {
+    result.isError = true;
+    result.errors = [state.errorMessage];
+  }
+  if (wantsStructured) {
+    const parsed = tryParseStructuredOutput(state.assistantBuffer);
+    if (parsed !== undefined) result.structuredOutput = parsed;
+    else {
+      getLog().warn(
+        { bufferLength: state.assistantBuffer.length, sessionId: session.sessionId },
+        'copilot.structured_output_parse_failed'
+      );
+    }
+  }
+  return result;
+}
+
+async function cleanupCopilotBridge(
+  session: CopilotSession,
+  queue: AsyncQueue<BridgeQueueItem>,
+  unsubscribe: () => void,
+  abortSignal: AbortSignal | undefined,
+  onAbort: () => void,
+  sendPromise: Promise<void>
+): Promise<void> {
+  const log = getLog();
+  queue.close();
+  try {
+    unsubscribe();
+  } catch (err) {
+    log.debug({ err }, 'copilot.unsubscribe_failed');
+  }
+  if (abortSignal) abortSignal.removeEventListener('abort', onAbort);
+  try {
+    await session.abort();
+  } catch (err) {
+    log.debug({ err, sessionId: session.sessionId }, 'copilot.abort_cleanup_failed');
+  }
+  try {
+    await session.disconnect();
+  } catch (err) {
+    log.debug({ err, sessionId: session.sessionId }, 'copilot.disconnect_failed');
+  }
+  await sendPromise.catch(() => {
+    /* already surfaced via queue */
+  });
+}
+
 /**
  * Bridge a CopilotSession into an async generator of MessageChunks.
  *
@@ -277,31 +403,21 @@ export async function* bridgeSession(
 ): AsyncGenerator<MessageChunk> {
   const log = getLog();
   const queue = new AsyncQueue<BridgeQueueItem>();
-  const toolCallIdToName = new Map<string, string>();
-  let capturedTokens: TokenUsage | undefined;
-  let errorMessage: string | undefined;
-
-  // Structured-output buffer. Populated only when the caller supplied a
-  // schema; parsed into the terminal result chunk after the run completes.
   const wantsStructured = jsonSchema !== undefined;
-  let assistantBuffer = '';
-
-  const ctx: EventMapperContext = {
-    toolCallIdToName,
-    captureUsage: (u: TokenUsage): void => {
-      capturedTokens = u;
-    },
-    markErrored: (msg: string): void => {
-      errorMessage = msg;
-    },
+  const state: CopilotBridgeState = {
+    capturedTokens: undefined,
+    errorMessage: undefined,
+    assistantBuffer: '',
+    sawAssistantContent: false,
   };
+  const { ctx } = createCopilotBridgeMapperState(state);
 
   const unsubscribe = session.on((event: SessionEvent) => {
     try {
       const chunks = mapCopilotEvent(event, ctx);
       for (const chunk of chunks) {
         if (wantsStructured && chunk.type === 'assistant') {
-          assistantBuffer += chunk.content;
+          state.assistantBuffer += chunk.content;
         }
         queue.push({ kind: 'chunk', chunk });
       }
@@ -321,19 +437,7 @@ export async function* bridgeSession(
   // as a clean cancellation. Clean up listeners + queue first so the throw
   // doesn't leak resources.
   if (abortSignal?.aborted) {
-    onAbort();
-    queue.close();
-    try {
-      unsubscribe();
-    } catch (err) {
-      log.debug({ err }, 'copilot.unsubscribe_failed');
-    }
-    try {
-      await session.disconnect();
-    } catch (err) {
-      log.debug({ err, sessionId: session.sessionId }, 'copilot.disconnect_failed');
-    }
-    throw new DOMException('Copilot sendQuery aborted before start', 'AbortError');
+    await abortCopilotBeforeStart(session, queue, unsubscribe, onAbort);
   }
   if (abortSignal) {
     abortSignal.addEventListener('abort', onAbort, { once: true });
@@ -352,84 +456,38 @@ export async function* bridgeSession(
     }
   );
 
-  let sawAssistantContent = false;
   try {
     for await (const item of queue) {
       if (item.kind === 'done') break;
       if (item.kind === 'error') throw item.error;
-      if (item.chunk.type === 'assistant') sawAssistantContent = true;
+      if (item.chunk.type === 'assistant') state.sawAssistantContent = true;
       yield item.chunk;
     }
 
     // Safety net: if `streaming: true` didn't produce deltas for some reason
     // (older SDK, model quirks, BYOK provider), emit the accumulated final
     // content from sendAndWait's return value so the user doesn't lose output.
-    if (!sawAssistantContent && sendResult?.data?.content) {
-      if (wantsStructured) assistantBuffer += sendResult.data.content;
-      yield { type: 'assistant', content: sendResult.data.content };
-      sawAssistantContent = true;
-    }
+    const fallback = await emitCopilotFallbackContent(sendResult, state, wantsStructured);
+    if (fallback) yield fallback;
 
     // Emit the deferred session.error warning only if no assistant content
     // reached the consumer. When the SDK auto-recovers and still delivers a
     // fallback message (the common case for transient upstream errors), the
     // ⚠️ chunk is noise and gets suppressed.
-    if (!sawAssistantContent && errorMessage) {
-      yield { type: 'system', content: `⚠️ ${errorMessage}` };
-    }
+    const warning = deferredCopilotErrorWarning(state);
+    if (warning) yield warning;
 
     // Terminal result chunk — always emit, even on error, so the executor
     // gets a session ID back (useful for resume).
-    const result: MessageChunk = {
-      type: 'result',
-      sessionId: session.sessionId,
-    };
-    if (capturedTokens) result.tokens = capturedTokens;
-    if (!sawAssistantContent && errorMessage) {
-      result.isError = true;
-      result.errors = [errorMessage];
-    }
-    if (wantsStructured) {
-      const parsed = tryParseStructuredOutput(assistantBuffer);
-      if (parsed !== undefined) {
-        result.structuredOutput = parsed;
-      } else {
-        log.warn(
-          { bufferLength: assistantBuffer.length, sessionId: session.sessionId },
-          'copilot.structured_output_parse_failed'
-        );
-      }
-    }
-    yield result;
+    yield buildCopilotTerminalResult(session, state, wantsStructured);
   } finally {
-    queue.close();
-    try {
-      unsubscribe();
-    } catch (err) {
-      log.debug({ err }, 'copilot.unsubscribe_failed');
-    }
-    if (abortSignal) {
-      abortSignal.removeEventListener('abort', onAbort);
-    }
     // Abort before disconnect: if the consumer closed the generator early
     // (return() / break), sendAndWait is still running in the background.
     // Without an explicit abort, the finally would wait on sendPromise for up
     // to SEND_AND_WAIT_TIMEOUT_MS. abort() tells the SDK to cancel the run;
     // disconnect() tears down the connection.
-    try {
-      await session.abort();
-    } catch (err) {
-      log.debug({ err, sessionId: session.sessionId }, 'copilot.abort_cleanup_failed');
-    }
-    try {
-      await session.disconnect();
-    } catch (err) {
-      log.debug({ err, sessionId: session.sessionId }, 'copilot.disconnect_failed');
-    }
     // Let the SDK's sendPromise settle so we don't leave a dangling promise.
     // Any error was already pushed to the queue.
-    await sendPromise.catch(() => {
-      /* already surfaced via queue */
-    });
+    await cleanupCopilotBridge(session, queue, unsubscribe, abortSignal, onAbort, sendPromise);
   }
 }

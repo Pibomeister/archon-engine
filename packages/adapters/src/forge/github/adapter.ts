@@ -32,6 +32,7 @@ import {
   addSafeDirectory,
   toRepoPath,
   toBranchName,
+  type GitError,
 } from '@archon/git';
 import * as db from '@archon/core/db/conversations';
 import * as codebaseDb from '@archon/core/db/codebases';
@@ -53,6 +54,29 @@ const MAX_LENGTH = 65000; // GitHub comment limit (~65,536, leave buffer for saf
 
 /** Hidden marker added to bot comments to prevent self-triggering loops */
 const BOT_RESPONSE_MARKER = '<!-- archon-bot-response -->';
+
+interface GitHubParsedEvent {
+  owner: string;
+  repo: string;
+  number: number;
+  comment: string;
+  eventType: 'issue' | 'issue_comment' | 'pull_request';
+  issue?: WebhookEvent['issue'];
+  pullRequest?: WebhookEvent['pull_request'];
+  isCloseEvent?: boolean;
+  isMerged?: boolean;
+}
+
+interface GitHubWebhookMessage {
+  conversationId: string;
+  owner: string;
+  repo: string;
+  number: number;
+  finalMessage: string;
+  contextToAppend?: string;
+  isolationHints: IsolationHints;
+  archonUserId?: string;
+}
 
 export class GitHubAdapter implements IPlatformAdapter {
   /**
@@ -486,17 +510,7 @@ export class GitHubAdapter implements IPlatformAdapter {
    * Does NOT handle:
    * - issues.opened / pull_request.opened → returns null (see #96)
    */
-  private parseEvent(event: WebhookEvent): {
-    owner: string;
-    repo: string;
-    number: number;
-    comment: string;
-    eventType: 'issue' | 'issue_comment' | 'pull_request';
-    issue?: WebhookEvent['issue'];
-    pullRequest?: WebhookEvent['pull_request'];
-    isCloseEvent?: boolean;
-    isMerged?: boolean;
-  } | null {
+  private parseEvent(event: WebhookEvent): GitHubParsedEvent | null {
     const owner = event.repository.owner.login;
     const repo = event.repository.name;
 
@@ -622,6 +636,101 @@ export class GitHubAdapter implements IPlatformAdapter {
     return { owner: match[1], repo: match[2], number: parseInt(match[3], 10) };
   }
 
+  private async syncExistingRepo(repoPath: string, defaultBranch: string): Promise<void> {
+    getLog().info({ repoPath, defaultBranch }, 'github.repo_syncing');
+    const syncResult = await syncRepository(toRepoPath(repoPath), toBranchName(defaultBranch));
+    if (syncResult.ok) return;
+
+    getLog().error({ error: syncResult.error, repoPath, defaultBranch }, 'github.repo_sync_failed');
+    const detail =
+      syncResult.error.code === 'branch_not_found'
+        ? `Branch '${defaultBranch}' not found`
+        : 'message' in syncResult.error
+          ? syncResult.error.message
+          : syncResult.error.code;
+    throw new Error(
+      `Failed to sync repository to ${defaultBranch}. Try /reset or check if the branch exists. Details: ${detail}`
+    );
+  }
+
+  private async resolveCloneToken(owner: string, repo: string): Promise<string | undefined> {
+    if (this.auth.kind !== 'app') return process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
+    try {
+      return await this.auth.provider.getInstallationToken(owner, repo);
+    } catch (err) {
+      if (err instanceof AppNotInstalledError) {
+        getLog().error({ err, owner, repo }, 'github.repo_clone_app_not_installed');
+      }
+      throw err;
+    }
+  }
+
+  private throwCloneError(owner: string, repo: string, error: GitError): never {
+    if (error.code === 'not_a_repo') {
+      throw new Error(
+        `Repository ${owner}/${repo} not found or is private. Check repository access.`
+      );
+    }
+    if (error.code === 'permission_denied') {
+      const authHint =
+        this.auth.kind === 'app'
+          ? 'Check that the Archon GitHub App is installed on the org and has the Contents:Read permission.'
+          : 'Check GITHUB_TOKEN permissions.';
+      throw new Error(`Authentication failed for ${owner}/${repo}. ${authHint}`);
+    }
+    throw new Error(
+      `Failed to clone ${owner}/${repo}: ${'message' in error ? error.message : error.code}`
+    );
+  }
+
+  private async cloneRepoIntoPath(owner: string, repo: string, repoPath: string): Promise<void> {
+    getLog().info({ owner, repo, repoPath }, 'github.repo_cloning');
+    await ensureProjectStructure(owner, repo);
+    const ghToken = await this.resolveCloneToken(owner, repo);
+    const repoUrl = `https://github.com/${owner}/${repo}.git`;
+    const cloneResult = await cloneRepository(
+      repoUrl,
+      toRepoPath(repoPath),
+      ghToken ? { token: ghToken } : undefined
+    );
+    if (!cloneResult.ok) {
+      getLog().error(
+        { error: cloneResult.error, owner, repo, repoPath },
+        'github.repo_clone_failed'
+      );
+      this.throwCloneError(owner, repo, cloneResult.error);
+    }
+  }
+
+  private async installAppCredentialHelper(
+    owner: string,
+    repo: string,
+    repoPath: string
+  ): Promise<void> {
+    if (this.auth.kind !== 'app') return;
+    const result = await installCredentialHelper(repoPath);
+    switch (result.kind) {
+      case 'installed':
+        getLog().info(
+          { repoPath, owner, repo, helperPath: result.helperPath },
+          'github_auth.credential_helper_installed'
+        );
+        break;
+      case 'skipped':
+        getLog().warn(
+          { repoPath, owner, repo, reason: result.reason, sourcePath: result.sourcePath },
+          'github_auth.credential_helper_skipped'
+        );
+        break;
+      case 'failed':
+        getLog().warn(
+          { err: result.error, repoPath, owner, repo },
+          'github_auth.credential_helper_install_failed'
+        );
+        break;
+    }
+  }
+
   /**
    * Ensure repository is cloned and ready
    * For new codebases: clone (directory won't exist)
@@ -635,7 +744,6 @@ export class GitHubAdapter implements IPlatformAdapter {
     repoPath: string,
     shouldSync: boolean
   ): Promise<void> {
-    // Check if directory exists
     let directoryExists = false;
     try {
       await access(repoPath);
@@ -643,119 +751,21 @@ export class GitHubAdapter implements IPlatformAdapter {
     } catch (error) {
       const err = error as NodeJS.ErrnoException;
       if (err.code !== 'ENOENT') {
-        // Real error - permission denied, I/O failure, etc.
         getLog().error({ repoPath, errorCode: err.code, err }, 'github.repo_path_access_failed');
         throw new Error(
-          `Cannot access repository at ${repoPath}: ${err.code ?? err.message}. ` +
-            'Check permissions and disk health.'
+          `Cannot access repository at ${repoPath}: ${err.code ?? err.message}. Check permissions and disk health.`
         );
       }
-      // ENOENT means directory doesn't exist - we'll clone below
     }
 
     if (directoryExists) {
-      if (shouldSync) {
-        getLog().info({ repoPath, defaultBranch }, 'github.repo_syncing');
-        const syncResult = await syncRepository(toRepoPath(repoPath), toBranchName(defaultBranch));
-        if (!syncResult.ok) {
-          getLog().error(
-            { error: syncResult.error, repoPath, defaultBranch },
-            'github.repo_sync_failed'
-          );
-          throw new Error(
-            `Failed to sync repository to ${defaultBranch}. ` +
-              `Try /reset or check if the branch exists. Details: ${syncResult.error.code === 'branch_not_found' ? `Branch '${defaultBranch}' not found` : 'message' in syncResult.error ? syncResult.error.message : syncResult.error.code}`
-          );
-        }
-      }
+      if (shouldSync) await this.syncExistingRepo(repoPath, defaultBranch);
       return;
     }
 
-    // Directory doesn't exist - clone the repository
-    getLog().info({ owner, repo, repoPath }, 'github.repo_cloning');
-
-    // Create project structure (source/, worktrees/, artifacts/, logs/) before
-    // cloning so worktree paths resolve correctly on first webhook clone.
-    await ensureProjectStructure(owner, repo);
-
-    // Resolve the right auth token per mode. App mode talks to the auth
-    // provider (installation token, ~1h validity); PAT mode reads env directly.
-    let ghToken: string | undefined;
-    if (this.auth.kind === 'app') {
-      try {
-        ghToken = await this.auth.provider.getInstallationToken(owner, repo);
-      } catch (err) {
-        if (err instanceof AppNotInstalledError) {
-          getLog().error({ err, owner, repo }, 'github.repo_clone_app_not_installed');
-          throw err;
-        }
-        throw err;
-      }
-    } else {
-      ghToken = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
-    }
-    const repoUrl = `https://github.com/${owner}/${repo}.git`;
-
-    const cloneResult = await cloneRepository(
-      repoUrl,
-      toRepoPath(repoPath),
-      ghToken ? { token: ghToken } : undefined
-    );
-
-    if (!cloneResult.ok) {
-      getLog().error(
-        { error: cloneResult.error, owner, repo, repoPath },
-        'github.repo_clone_failed'
-      );
-
-      if (cloneResult.error.code === 'not_a_repo') {
-        throw new Error(
-          `Repository ${owner}/${repo} not found or is private. Check repository access.`
-        );
-      } else if (cloneResult.error.code === 'permission_denied') {
-        const authHint =
-          this.auth.kind === 'app'
-            ? 'Check that the Archon GitHub App is installed on the org and has the Contents:Read permission.'
-            : 'Check GITHUB_TOKEN permissions.';
-        throw new Error(`Authentication failed for ${owner}/${repo}. ${authHint}`);
-      }
-      throw new Error(
-        `Failed to clone ${owner}/${repo}: ${'message' in cloneResult.error ? cloneResult.error.message : cloneResult.error.code}`
-      );
-    }
-
+    await this.cloneRepoIntoPath(owner, repo, repoPath);
     await addSafeDirectory(toRepoPath(repoPath));
-
-    // App mode: install the git credential helper on the newly cloned worktree
-    // so workflows that outlive the 1h installation-token expiry can refresh
-    // credentials in-place. Non-fatal — workflows that complete in <1h still
-    // succeed via the URL-embedded token from the clone above. The result
-    // discriminator tells us whether the install actually happened so we
-    // don't log a false "installed" line in builds where the helper script
-    // isn't on disk.
-    if (this.auth.kind === 'app') {
-      const result = await installCredentialHelper(repoPath);
-      switch (result.kind) {
-        case 'installed':
-          getLog().info(
-            { repoPath, owner, repo, helperPath: result.helperPath },
-            'github_auth.credential_helper_installed'
-          );
-          break;
-        case 'skipped':
-          getLog().warn(
-            { repoPath, owner, repo, reason: result.reason, sourcePath: result.sourcePath },
-            'github_auth.credential_helper_skipped'
-          );
-          break;
-        case 'failed':
-          getLog().warn(
-            { err: result.error, repoPath, owner, repo },
-            'github_auth.credential_helper_install_failed'
-          );
-          break;
-      }
-    }
+    await this.installAppCredentialHelper(owner, repo, repoPath);
   }
 
   /**
@@ -928,334 +938,360 @@ ${userComment}`;
    * @param deliveryId - GitHub's X-GitHub-Delivery GUID; dedup fallback when
    *   the payload carries no comment identity
    */
-  async handleWebhook(payload: string, signature: string, deliveryId?: string): Promise<void> {
-    // 1. Verify signature
+
+  private parseAuthorizedWebhook(payload: string, signature: string): WebhookEvent | undefined {
     if (!this.verifySignature(payload, signature)) {
       getLog().error(
         { signaturePrefix: signature?.substring(0, 15) + '...', payloadSize: payload.length },
         'github.invalid_webhook_signature'
       );
-      return;
+      return undefined;
     }
 
-    // 2. Parse event
     const event = JSON.parse(payload) as WebhookEvent;
-
-    // 2b. Authorization check - verify sender is in whitelist
     const senderUsername = event.sender?.login;
     if (!isGitHubUserAuthorized(senderUsername, this.allowedUsers)) {
-      // Log unauthorized attempt (mask username for privacy)
       const maskedUser = senderUsername ? `${senderUsername.slice(0, 3)}***` : 'unknown';
       getLog().info({ maskedUser }, 'github.unauthorized_webhook');
-      return; // Silent rejection - no error response
+      return undefined;
     }
+    return event;
+  }
 
-    const parsed = this.parseEvent(event);
-    if (!parsed) return;
-
-    const { owner, repo, number, comment, eventType, issue, pullRequest, isCloseEvent, isMerged } =
-      parsed;
-
-    // App-mode optimisation: the webhook payload already includes the
-    // installation id. Priming the lookup cache skips one HTTP round trip
-    // (`GET /repos/{owner}/{repo}/installation`) before the first outbound API
-    // call to this repo after a restart. No-op when payload lacks installation.
+  private primeGitHubInstallation(event: WebhookEvent, parsed: GitHubParsedEvent): void {
     if (this.auth.kind === 'app' && event.installation?.id !== undefined) {
-      this.auth.provider.primeInstallationLookup(owner, repo, event.installation.id);
+      this.auth.provider.primeInstallationLookup(parsed.owner, parsed.repo, event.installation.id);
     }
+  }
 
-    // 3. Handle close/merge events (cleanup worktree)
-    if (isCloseEvent) {
-      const mergeLabel = isMerged ? 'merge' : 'close';
-      getLog().info({ event: mergeLabel, owner, repo, number }, 'github.close_event_received');
-      await this.cleanupWorktree(owner, repo, number, isMerged ?? false);
-      return; // Don't process as a message
-    }
-
-    // 4. Ignore bot's own comments to prevent self-triggering
-    // Primary: Check for hidden marker in comment body (works with user's PAT)
+  private shouldIgnoreGitHubComment(event: WebhookEvent, comment: string): boolean {
     const commentBody = event.comment?.body ?? '';
     if (commentBody.includes(BOT_RESPONSE_MARKER)) {
       getLog().debug(
         { commentAuthor: event.comment?.user?.login },
         'github.ignoring_marked_comment'
       );
-      return;
+      return true;
     }
-    // Secondary: Check comment author. In App mode the bot account is
-    // `<slug>[bot]`; in PAT mode it's whatever the operator named via
-    // botMention. Comparing against `botLogin` (not `botMention`) keeps the
-    // filter narrow — comments posted under a user's own GitHub login from a
-    // user-to-server token would otherwise be misfiltered.
     const commentAuthor = event.comment?.user?.login;
     if (commentAuthor?.toLowerCase() === this.botLogin.toLowerCase()) {
       getLog().debug({ commentAuthor }, 'github.ignoring_own_comment');
-      return;
+      return true;
     }
+    return !this.hasMention(comment);
+  }
 
-    // 5. Check @mention
-    if (!this.hasMention(comment)) return;
-
-    // 5a. Ingest idempotency. Key on comment identity (id + updated_at), not
-    // the delivery GUID: dual subscriptions (repo + App webhooks) deliver the
-    // same comment under different GUIDs. Both fields required — id alone
-    // would dedup an edit against the original. GUID is the fallback.
+  private seenGitHubDelivery(
+    event: WebhookEvent,
+    parsed: GitHubParsedEvent,
+    deliveryId: string | undefined
+  ): boolean {
     const dedupKey =
       event.comment?.id !== undefined && event.comment.updated_at
-        ? `comment:${owner}/${repo}#${String(number)}:${String(event.comment.id)}:${event.comment.updated_at}`
+        ? `comment:${parsed.owner}/${parsed.repo}#${String(parsed.number)}:${String(event.comment.id)}:${event.comment.updated_at}`
         : deliveryId
           ? `delivery:${deliveryId}`
           : undefined;
-    // seen() claims the key BEFORE the downstream work: dual-subscription
-    // duplicates arrive near-simultaneously, so marking only after success
-    // would let both pass and double-process. Tradeoff: a redelivery whose
-    // first attempt failed within the TTL is dropped — acceptable for this
-    // fire-and-forget route, where failures are logged rather than retried.
-    if (dedupKey && this.deliveryDedup.seen(dedupKey)) {
-      getLog().info(
-        { eventType, owner, repo, number, deliveryId },
-        'github.duplicate_delivery_dropped'
+    if (!dedupKey || !this.deliveryDedup.seen(dedupKey)) return false;
+    getLog().info(
+      {
+        eventType: parsed.eventType,
+        owner: parsed.owner,
+        repo: parsed.repo,
+        number: parsed.number,
+        deliveryId,
+      },
+      'github.duplicate_delivery_dropped'
+    );
+    return true;
+  }
+
+  private async resolveGitHubUserId(
+    attributedLogin: string | undefined
+  ): Promise<string | undefined> {
+    if (!attributedLogin) return undefined;
+    try {
+      const user = await userDb.findOrCreateUserByPlatformIdentity(
+        'github',
+        attributedLogin,
+        attributedLogin
       );
-      return;
+      return user.id;
+    } catch (err) {
+      getLog().warn(
+        { err: toError(err), githubLogin: attributedLogin },
+        'github.user_resolve_failed'
+      );
+      return undefined;
     }
+  }
 
-    getLog().info({ eventType, owner, repo, number }, 'github.webhook_processing');
-
-    // 5b. Resolve GitHub login → Archon user (auto-create on first sight).
-    // Comment author may differ from event.sender for PR-review comments; prefer
-    // the comment author when present so individual reviewers get their own row.
-    // Resolution failure must not drop the webhook — warn-log and continue with
-    // archonUserId undefined so the conversation/run rows fall back to NULL.
-    const attributedLogin = event.comment?.user?.login ?? senderUsername;
-    let archonUserId: string | undefined;
-    if (attributedLogin) {
-      try {
-        const user = await userDb.findOrCreateUserByPlatformIdentity(
-          'github',
-          attributedLogin,
-          attributedLogin
-        );
-        archonUserId = user.id;
-      } catch (err) {
-        getLog().warn(
-          { err: toError(err), githubLogin: attributedLogin },
-          'github.user_resolve_failed'
-        );
-      }
-    }
-
-    // 4. Build conversationId
-    const conversationId = this.buildConversationId(owner, repo, number);
-
-    // Remember the triggering user so the bot's reply on this thread can be
-    // authored under their GitHub identity (App mode + per-user tokens only).
+  private rememberGitHubActor(conversationId: string, archonUserId: string | undefined): void {
     if (this.auth.kind === 'app' && this.getUserToken && archonUserId) {
       this.actorByConversation.set(conversationId, archonUserId);
     }
+  }
 
-    // 5. Check if new conversation
-    const existingConv = await db.getOrCreateConversation('github', conversationId);
-    const isNewConversation = !existingConv.codebase_id;
-
-    // 6. Get/create codebase (checks for existing first!)
-    const {
-      codebase,
-      repoPath,
-      isNew: isNewCodebase,
-    } = await this.getOrCreateCodebaseForRepo(owner, repo);
-
-    // 6b. Link conversation to codebase (fixes #97)
-    if (isNewConversation) {
-      try {
-        await db.updateConversation(existingConv.id, {
-          codebase_id: codebase.id,
-          cwd: repoPath,
-        });
-      } catch (updateError) {
-        if (updateError instanceof ConversationNotFoundError) {
-          getLog().error(
-            { conversationId: existingConv.id, codebaseId: codebase.id },
-            'github.conversation_codebase_link_failed'
-          );
-          // Re-throw as this is a critical setup step
-          throw new Error('Failed to set up GitHub conversation - please try again');
-        }
-        throw updateError;
+  private async linkGitHubConversation(
+    conversationId: string,
+    codebaseId: string,
+    repoPath: string,
+    isNewConversation: boolean
+  ): Promise<void> {
+    if (!isNewConversation) return;
+    try {
+      await db.updateConversation(conversationId, { codebase_id: codebaseId, cwd: repoPath });
+    } catch (updateError) {
+      if (updateError instanceof ConversationNotFoundError) {
+        getLog().error({ conversationId, codebaseId }, 'github.conversation_codebase_link_failed');
+        throw new Error('Failed to set up GitHub conversation - please try again');
       }
+      throw updateError;
     }
+  }
 
-    // 7. Get default branch
-    let defaultBranch: string;
+  private async fetchDefaultBranchOrReport(
+    owner: string,
+    repo: string,
+    conversationId: string
+  ): Promise<string | undefined> {
     try {
       const { data: repoData } = await this.withTokenRefresh(owner, repo, octokit =>
         octokit.rest.repos.get({ owner, repo })
       );
-      defaultBranch = repoData.default_branch;
+      return repoData.default_branch;
     } catch (error) {
       const err = toError(error);
       getLog().error({ err, owner, repo, conversationId }, 'github.repo_metadata_fetch_failed');
       try {
-        const userMessage = classifyAndFormatError(err);
-        await this.sendMessage(conversationId, userMessage);
+        await this.sendMessage(conversationId, classifyAndFormatError(err));
       } catch (sendError) {
         getLog().error(
           { err: toError(sendError), conversationId },
           'github.error_message_send_failed'
         );
       }
-      return;
+      return undefined;
     }
+  }
 
-    // 8. Ensure repo ready (clone if needed, sync if new conversation)
-    await this.ensureRepoReady(owner, repo, defaultBranch, repoPath, isNewCodebase);
-
-    // 9. Auto-load commands if new codebase (defaults loaded at runtime, not copied)
-    if (isNewCodebase) {
-      await this.autoDetectAndLoadCommands(repoPath, codebase.id);
-    }
-
-    // 10. Gather isolation hints for orchestrator
-    // The orchestrator now handles all isolation decisions
-    const isPR = eventType === 'pull_request' || !!pullRequest || !!issue?.pull_request;
-
-    // Build isolation hints for orchestrator
+  private async buildGitHubIsolationHints(parsed: GitHubParsedEvent): Promise<IsolationHints> {
+    const isPR =
+      parsed.eventType === 'pull_request' || !!parsed.pullRequest || !!parsed.issue?.pull_request;
     const isolationHints: IsolationHints = {
       workflowType: isPR ? 'pr' : 'issue',
-      workflowId: String(number),
+      workflowId: String(parsed.number),
     };
+    if (!isPR) return isolationHints;
 
-    // For PRs: get linked issues and branch info
-    if (isPR) {
-      // Get linked issues for worktree sharing
-      const linkedIssues = await getLinkedIssueNumbers(owner, repo, number);
-      if (linkedIssues.length > 0) {
-        isolationHints.linkedIssues = linkedIssues;
-        getLog().info({ prNumber: number, linkedIssues }, 'github.pr_linked_issues');
-      }
-
-      // Fetch PR head branch, SHA, and fork status for isolation
-      try {
-        const { data: prData } = await this.withTokenRefresh(owner, repo, octokit =>
-          octokit.rest.pulls.get({
-            owner,
-            repo,
-            pull_number: number,
-          })
-        );
-        isolationHints.prBranch = toBranchName(prData.head.ref);
-        isolationHints.prSha = prData.head.sha;
-
-        // Detect if PR is from a fork (different repo than base)
-        // For fork PRs: head.repo is different from base.repo
-        // For same-repo PRs: head.repo.full_name === base.repo.full_name
-        // Note: head.repo can be null if the fork was deleted after PR creation
-        // In that case, we treat it as a fork (can't push to deleted repo anyway)
-        const headRepoFullName = prData.head.repo?.full_name;
-        const baseRepoFullName = prData.base.repo.full_name;
-        isolationHints.isForkPR = headRepoFullName !== baseRepoFullName;
-
-        getLog().info(
-          {
-            prNumber: number,
-            headRef: prData.head.ref,
-            headSha: prData.head.sha.substring(0, 7),
-            isFork: isolationHints.isForkPR,
-          },
-          'github.pr_head_info'
-        );
-      } catch (error) {
-        const err = error as Error;
-        // Log at appropriate level based on error type
-        const isNonTransient =
-          err.message.includes('rate limit') ||
-          err.message.includes('403') ||
-          err.message.includes('401') ||
-          err.message.includes('Bad credentials');
-
-        const logData = { err, owner, repo, prNumber: number };
-        if (isNonTransient) {
-          getLog().error(logData, 'github.pr_head_fetch_failed');
-        } else {
-          getLog().warn(logData, 'github.pr_head_fetch_failed');
-        }
-
-        // Mark degraded mode - worktree isolation will use fallback naming
-        isolationHints.prFetchFailed = true;
-      }
+    const linkedIssues = await getLinkedIssueNumbers(parsed.owner, parsed.repo, parsed.number);
+    if (linkedIssues.length > 0) {
+      isolationHints.linkedIssues = linkedIssues;
+      getLog().info({ prNumber: parsed.number, linkedIssues }, 'github.pr_linked_issues');
     }
+    await this.addGitHubPrHeadHints(parsed, isolationHints);
+    return isolationHints;
+  }
 
-    // 11. Build message with context
-    const strippedComment = this.stripMention(comment);
-    let finalMessage = strippedComment;
-    let contextToAppend: string | undefined;
+  private async addGitHubPrHeadHints(
+    parsed: GitHubParsedEvent,
+    isolationHints: IsolationHints
+  ): Promise<void> {
+    try {
+      const { data: prData } = await this.withTokenRefresh(parsed.owner, parsed.repo, octokit =>
+        octokit.rest.pulls.get({
+          owner: parsed.owner,
+          repo: parsed.repo,
+          pull_number: parsed.number,
+        })
+      );
+      isolationHints.prBranch = toBranchName(prData.head.ref);
+      isolationHints.prSha = prData.head.sha;
+      isolationHints.isForkPR = prData.head.repo?.full_name !== prData.base.repo.full_name;
+      getLog().info(
+        {
+          prNumber: parsed.number,
+          headRef: prData.head.ref,
+          headSha: prData.head.sha.substring(0, 7),
+          isFork: isolationHints.isForkPR,
+        },
+        'github.pr_head_info'
+      );
+    } catch (error) {
+      const err = error as Error;
+      const logData = { err, owner: parsed.owner, repo: parsed.repo, prNumber: parsed.number };
+      if (this.isNonTransientPrFetchError(err))
+        getLog().error(logData, 'github.pr_head_fetch_failed');
+      else getLog().warn(logData, 'github.pr_head_fetch_failed');
+      isolationHints.prFetchFailed = true;
+    }
+  }
 
-    // IMPORTANT: Slash commands must be processed deterministically (not by AI)
-    const isSlashCommand = strippedComment.trim().startsWith('/');
+  private isNonTransientPrFetchError(err: Error): boolean {
+    return (
+      err.message.includes('rate limit') ||
+      err.message.includes('403') ||
+      err.message.includes('401') ||
+      err.message.includes('Bad credentials')
+    );
+  }
 
-    if (isSlashCommand) {
-      // For slash commands, use only the first line
-      finalMessage = strippedComment.split('\n')[0].trim();
+  private buildGitHubMessage(parsed: GitHubParsedEvent): {
+    finalMessage: string;
+    contextToAppend?: string;
+  } {
+    const strippedComment = this.stripMention(parsed.comment);
+    if (strippedComment.trim().startsWith('/')) {
+      const finalMessage = strippedComment.split('\n')[0].trim();
       getLog().debug({ command: finalMessage }, 'github.slash_command_processing');
-
-      // Add issue/PR reference context
-      if (eventType === 'issue' && issue) {
-        contextToAppend = `GitHub Issue #${String(issue.number)}: "${issue.title}"\nUse 'gh issue view ${String(issue.number)}' for full details if needed.`;
-      } else if (eventType === 'pull_request' && pullRequest) {
-        contextToAppend = `GitHub Pull Request #${String(pullRequest.number)}: "${pullRequest.title}"\nUse 'gh pr view ${String(pullRequest.number)}' for full details if needed.`;
-      } else if (eventType === 'issue_comment') {
-        if (pullRequest) {
-          contextToAppend = `GitHub Pull Request #${String(pullRequest.number)}: "${pullRequest.title}"\nUse 'gh pr view ${String(pullRequest.number)}' for full details if needed.`;
-        } else if (issue) {
-          contextToAppend = `GitHub Issue #${String(issue.number)}: "${issue.title}"\nUse 'gh issue view ${String(issue.number)}' for full details if needed.`;
-        }
-      }
-    } else {
-      // For non-command messages, add rich context and issue/PR reference for workflows
-      if (eventType === 'issue' && issue) {
-        finalMessage = this.buildIssueContext(issue, strippedComment);
-        contextToAppend = `GitHub Issue #${String(issue.number)}: "${issue.title}"\nUse 'gh issue view ${String(issue.number)}' for full details if needed.`;
-      } else if (eventType === 'issue_comment' && issue) {
-        finalMessage = this.buildIssueContext(issue, strippedComment);
-        contextToAppend = `GitHub Issue #${String(issue.number)}: "${issue.title}"\nUse 'gh issue view ${String(issue.number)}' for full details if needed.`;
-      } else if (eventType === 'pull_request' && pullRequest) {
-        finalMessage = this.buildPRContext(pullRequest, strippedComment);
-        contextToAppend = `GitHub Pull Request #${String(pullRequest.number)}: "${pullRequest.title}"\nUse 'gh pr view ${String(pullRequest.number)}' for full details if needed.`;
-      } else if (eventType === 'issue_comment' && pullRequest) {
-        finalMessage = this.buildPRContext(pullRequest, strippedComment);
-        contextToAppend = `GitHub Pull Request #${String(pullRequest.number)}: "${pullRequest.title}"\nUse 'gh pr view ${String(pullRequest.number)}' for full details if needed.`;
-      }
+      return { finalMessage, contextToAppend: this.githubReferenceContext(parsed) };
     }
+    if (parsed.pullRequest) {
+      return {
+        finalMessage: this.buildPRContext(parsed.pullRequest, strippedComment),
+        contextToAppend: this.githubReferenceContext(parsed),
+      };
+    }
+    if (parsed.issue) {
+      return {
+        finalMessage: this.buildIssueContext(parsed.issue, strippedComment),
+        contextToAppend: this.githubReferenceContext(parsed),
+      };
+    }
+    return { finalMessage: strippedComment };
+  }
 
-    // 12. Fetch comment history for thread context
-    const commentHistory = await this.fetchCommentHistory(owner, repo, number);
+  private githubReferenceContext(parsed: GitHubParsedEvent): string | undefined {
+    if (parsed.pullRequest) {
+      return `GitHub Pull Request #${String(parsed.pullRequest.number)}: "${parsed.pullRequest.title}"
+Use 'gh pr view ${String(parsed.pullRequest.number)}' for full details if needed.`;
+    }
+    if (parsed.issue) {
+      return `GitHub Issue #${String(parsed.issue.number)}: "${parsed.issue.title}"
+Use 'gh issue view ${String(parsed.issue.number)}' for full details if needed.`;
+    }
+    return undefined;
+  }
+
+  private async prepareGitHubMessage(
+    parsed: GitHubParsedEvent,
+    archonUserId: string | undefined
+  ): Promise<GitHubWebhookMessage | undefined> {
+    const conversationId = this.buildConversationId(parsed.owner, parsed.repo, parsed.number);
+    this.rememberGitHubActor(conversationId, archonUserId);
+    const existingConv = await db.getOrCreateConversation('github', conversationId);
+    const {
+      codebase,
+      repoPath,
+      isNew: isNewCodebase,
+    } = await this.getOrCreateCodebaseForRepo(parsed.owner, parsed.repo);
+    await this.linkGitHubConversation(
+      existingConv.id,
+      codebase.id,
+      repoPath,
+      !existingConv.codebase_id
+    );
+    const defaultBranch = await this.fetchDefaultBranchOrReport(
+      parsed.owner,
+      parsed.repo,
+      conversationId
+    );
+    if (!defaultBranch) return undefined;
+    await this.ensureRepoReady(parsed.owner, parsed.repo, defaultBranch, repoPath, isNewCodebase);
+    if (isNewCodebase) await this.autoDetectAndLoadCommands(repoPath, codebase.id);
+
+    const isolationHints = await this.buildGitHubIsolationHints(parsed);
+    const { finalMessage, contextToAppend } = this.buildGitHubMessage(parsed);
+    return {
+      conversationId,
+      owner: parsed.owner,
+      repo: parsed.repo,
+      number: parsed.number,
+      finalMessage,
+      contextToAppend,
+      isolationHints,
+      archonUserId,
+    };
+  }
+
+  private async dispatchGitHubMessage(message: GitHubWebhookMessage): Promise<void> {
+    const commentHistory = await this.fetchCommentHistory(
+      message.owner,
+      message.repo,
+      message.number
+    );
     const threadContext = commentHistory.length > 0 ? commentHistory.join('\n') : undefined;
     getLog().debug(
-      { commentCount: threadContext ? commentHistory.length : 0, conversationId },
+      {
+        commentCount: threadContext ? commentHistory.length : 0,
+        conversationId: message.conversationId,
+      },
       'github.thread_context_loaded'
     );
-
-    // 13. Route to orchestrator with isolation hints (with lock for concurrency control)
-    await this.lockManager.acquireLock(conversationId, async () => {
+    await this.lockManager.acquireLock(message.conversationId, async () => {
       try {
-        await handleMessage(this, conversationId, finalMessage, {
-          issueContext: contextToAppend,
+        await handleMessage(this, message.conversationId, message.finalMessage, {
+          issueContext: message.contextToAppend,
           threadContext,
-          isolationHints,
-          userId: archonUserId,
+          isolationHints: message.isolationHints,
+          userId: message.archonUserId,
         });
       } catch (error) {
         const err = toError(error);
-        getLog().error({ err, conversationId }, 'github.message_handling_error');
+        getLog().error(
+          { err, conversationId: message.conversationId },
+          'github.message_handling_error'
+        );
         try {
-          const userMessage = classifyAndFormatError(err);
-          await this.sendMessage(conversationId, userMessage);
+          await this.sendMessage(message.conversationId, classifyAndFormatError(err));
         } catch (sendError) {
           getLog().error(
-            { err: toError(sendError), conversationId },
+            { err: toError(sendError), conversationId: message.conversationId },
             'github.error_message_send_failed'
           );
         }
       }
     });
+  }
+
+  async handleWebhook(payload: string, signature: string, deliveryId?: string): Promise<void> {
+    const event = this.parseAuthorizedWebhook(payload, signature);
+    if (!event) return;
+
+    const parsed = this.parseEvent(event);
+    if (!parsed) return;
+    this.primeGitHubInstallation(event, parsed);
+
+    if (parsed.isCloseEvent) {
+      const mergeLabel = parsed.isMerged ? 'merge' : 'close';
+      getLog().info(
+        { event: mergeLabel, owner: parsed.owner, repo: parsed.repo, number: parsed.number },
+        'github.close_event_received'
+      );
+      await this.cleanupWorktree(
+        parsed.owner,
+        parsed.repo,
+        parsed.number,
+        parsed.isMerged ?? false
+      );
+      return;
+    }
+
+    if (this.shouldIgnoreGitHubComment(event, parsed.comment)) return;
+    if (this.seenGitHubDelivery(event, parsed, deliveryId)) return;
+    getLog().info(
+      {
+        eventType: parsed.eventType,
+        owner: parsed.owner,
+        repo: parsed.repo,
+        number: parsed.number,
+      },
+      'github.webhook_processing'
+    );
+
+    const attributedLogin = event.comment?.user?.login ?? event.sender?.login;
+    const archonUserId = await this.resolveGitHubUserId(attributedLogin);
+    const message = await this.prepareGitHubMessage(parsed, archonUserId);
+    if (message) await this.dispatchGitHubMessage(message);
   }
 }

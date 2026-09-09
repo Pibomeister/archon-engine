@@ -50,6 +50,26 @@ const MAX_LENGTH = 65000; // Practical limit for GitLab notes
 /** Hidden marker added to bot comments to prevent self-triggering loops */
 const BOT_RESPONSE_MARKER = '<!-- archon-bot-response -->';
 
+interface GitLabParsedEvent {
+  projectPath: string;
+  iid: number;
+  comment: string;
+  eventType: 'note' | 'issue' | 'merge_request';
+  isMR: boolean;
+  issue?: GitLabIssue;
+  mergeRequest?: GitLabMergeRequest;
+  isCloseEvent?: boolean;
+  isMerged?: boolean;
+}
+
+interface GitLabWebhookMessage {
+  conversationId: string;
+  finalMessage: string;
+  contextToAppend?: string;
+  isolationHints: IsolationHints;
+  archonUserId?: string;
+}
+
 export class GitLabAdapter implements IPlatformAdapter {
   private readonly gitlabUrl: string;
   private readonly token: string;
@@ -286,17 +306,7 @@ export class GitLabAdapter implements IPlatformAdapter {
   // Event parsing
   // ---------------------------------------------------------------------------
 
-  private parseEvent(event: GitLabWebhookEvent): {
-    projectPath: string;
-    iid: number;
-    comment: string;
-    eventType: 'note' | 'issue' | 'merge_request';
-    isMR: boolean;
-    issue?: GitLabIssue;
-    mergeRequest?: GitLabMergeRequest;
-    isCloseEvent?: boolean;
-    isMerged?: boolean;
-  } | null {
+  private parseEvent(event: GitLabWebhookEvent): GitLabParsedEvent | null {
     const projectPath = event.project.path_with_namespace;
 
     // Issue closed
@@ -623,221 +633,264 @@ Use 'glab mr view ${String(mr.iid)}' for full details and 'glab mr diff ${String
   // Webhook handler
   // ---------------------------------------------------------------------------
 
-  async handleWebhook(payload: string, token: string): Promise<void> {
-    // 1. Verify token
+  private parseAuthorizedWebhook(payload: string, token: string): GitLabWebhookEvent | undefined {
     if (!verifyWebhookToken(token, this.webhookSecret)) {
       getLog().error(
         { tokenPrefix: token?.substring(0, 8) + '...', payloadSize: payload.length },
         'gitlab.invalid_webhook_token'
       );
-      return;
+      return undefined;
     }
 
-    // 2. Parse event
     let event: GitLabWebhookEvent;
     try {
       event = JSON.parse(payload) as GitLabWebhookEvent;
     } catch (error) {
       getLog().error({ err: error, payloadSize: payload.length }, 'gitlab.webhook_parse_failed');
-      return;
+      return undefined;
     }
 
-    // 3. Authorization check
     const senderUsername = event.user?.username;
     if (!isGitLabUserAuthorized(senderUsername, this.allowedUsers)) {
       const maskedUser = senderUsername ? `${senderUsername.slice(0, 3)}***` : 'unknown';
       getLog().info({ maskedUser }, 'gitlab.unauthorized_webhook');
-      return;
+      return undefined;
     }
+    return event;
+  }
+
+  private shouldIgnoreGitLabComment(event: GitLabWebhookEvent, comment: string): boolean {
+    if (comment.includes(BOT_RESPONSE_MARKER)) {
+      getLog().debug({ commentAuthor: event.user?.username }, 'gitlab.ignoring_marked_comment');
+      return true;
+    }
+    if (event.user?.username?.toLowerCase() === this.botMention.toLowerCase()) {
+      getLog().debug({ commentAuthor: event.user.username }, 'gitlab.ignoring_own_comment');
+      return true;
+    }
+    return !this.hasMention(comment);
+  }
+
+  private async resolveGitLabUserId(
+    senderUsername: string | undefined
+  ): Promise<string | undefined> {
+    if (!senderUsername) return undefined;
+    try {
+      const user = await userDb.findOrCreateUserByPlatformIdentity(
+        'gitlab',
+        senderUsername,
+        senderUsername
+      );
+      return user.id;
+    } catch (err) {
+      getLog().warn(
+        { err: toError(err), gitlabUsername: senderUsername },
+        'gitlab.user_resolve_failed'
+      );
+      return undefined;
+    }
+  }
+
+  private async linkGitLabConversation(
+    conversationId: string,
+    codebaseId: string,
+    repoPath: string,
+    isNewConversation: boolean
+  ): Promise<void> {
+    if (!isNewConversation) return;
+    try {
+      await db.updateConversation(conversationId, { codebase_id: codebaseId, cwd: repoPath });
+    } catch (updateError) {
+      if (updateError instanceof ConversationNotFoundError) {
+        getLog().error({ conversationId, codebaseId }, 'gitlab.conversation_codebase_link_failed');
+        throw new Error('Failed to set up GitLab conversation - please try again');
+      }
+      throw updateError;
+    }
+  }
+
+  private async buildGitLabIsolationHints(parsed: GitLabParsedEvent): Promise<IsolationHints> {
+    const isolationHints: IsolationHints = {
+      workflowType: parsed.isMR ? 'pr' : 'issue',
+      workflowId: String(parsed.iid),
+    };
+    if (parsed.isMR && parsed.mergeRequest) {
+      isolationHints.prBranch = toBranchName(parsed.mergeRequest.source_branch);
+      isolationHints.isForkPR =
+        parsed.mergeRequest.source_project_id !== parsed.mergeRequest.target_project_id;
+      getLog().info(
+        {
+          mrIid: parsed.iid,
+          sourceBranch: parsed.mergeRequest.source_branch,
+          isFork: isolationHints.isForkPR,
+        },
+        'gitlab.mr_head_info'
+      );
+    }
+    return isolationHints;
+  }
+
+  private buildGitLabMessage(parsed: GitLabParsedEvent): {
+    finalMessage: string;
+    contextToAppend?: string;
+  } {
+    const strippedComment = this.stripMention(parsed.comment);
+    if (strippedComment.trim().startsWith('/')) {
+      const finalMessage = strippedComment.split('\n')[0].trim();
+      getLog().debug({ command: finalMessage }, 'gitlab.slash_command_processing');
+      return { finalMessage, contextToAppend: this.gitLabReferenceContext(parsed) };
+    }
+    if (parsed.isMR && parsed.mergeRequest) {
+      return {
+        finalMessage: this.buildMRContext(parsed.mergeRequest, strippedComment),
+        contextToAppend: this.gitLabReferenceContext(parsed),
+      };
+    }
+    if (parsed.issue) {
+      return {
+        finalMessage: this.buildIssueContext(parsed.issue, strippedComment),
+        contextToAppend: this.gitLabReferenceContext(parsed),
+      };
+    }
+    return { finalMessage: strippedComment };
+  }
+
+  private gitLabReferenceContext(parsed: GitLabParsedEvent): string | undefined {
+    if (parsed.isMR && parsed.mergeRequest) {
+      return `GitLab Merge Request !${String(parsed.mergeRequest.iid)}: "${parsed.mergeRequest.title}"
+Use 'glab mr view ${String(parsed.mergeRequest.iid)}' for full details if needed.`;
+    }
+    if (parsed.issue) {
+      return `GitLab Issue #${String(parsed.issue.iid)}: "${parsed.issue.title}"
+Use 'glab issue view ${String(parsed.issue.iid)}' for full details if needed.`;
+    }
+    return undefined;
+  }
+
+  private async prepareGitLabMessage(
+    event: GitLabWebhookEvent,
+    parsed: GitLabParsedEvent,
+    archonUserId: string | undefined
+  ): Promise<GitLabWebhookMessage> {
+    const conversationId = this.buildConversationId(parsed.projectPath, parsed.iid, parsed.isMR);
+    const existingConv = await db.getOrCreateConversation('gitlab', conversationId);
+    const {
+      codebase,
+      repoPath,
+      isNew: isNewCodebase,
+    } = await this.getOrCreateCodebaseForRepo(parsed.projectPath);
+    await this.linkGitLabConversation(
+      existingConv.id,
+      codebase.id,
+      repoPath,
+      !existingConv.codebase_id
+    );
+    await this.ensureRepoReady(
+      parsed.projectPath,
+      event.project.default_branch,
+      repoPath,
+      isNewCodebase
+    );
+    if (isNewCodebase) await this.autoDetectAndLoadCommands(repoPath, codebase.id);
+
+    const isolationHints = await this.buildGitLabIsolationHints(parsed);
+    const { finalMessage, contextToAppend } = this.buildGitLabMessage(parsed);
+    return { conversationId, finalMessage, contextToAppend, isolationHints, archonUserId };
+  }
+
+  private async dispatchGitLabMessage(message: GitLabWebhookMessage): Promise<void> {
+    const commentHistory = await this.fetchCommentHistory(
+      message.conversationId.replace(/[#!]\d+$/, ''),
+      Number(/[#!](\d+)$/.exec(message.conversationId)?.[1] ?? 0),
+      message.isolationHints.workflowType === 'pr'
+    );
+    const threadContext = commentHistory.length > 0 ? commentHistory.join('\n') : undefined;
+    getLog().debug(
+      {
+        commentCount: threadContext ? commentHistory.length : 0,
+        conversationId: message.conversationId,
+      },
+      'gitlab.thread_context_loaded'
+    );
+    await this.lockManager.acquireLock(message.conversationId, async () => {
+      try {
+        await handleMessage(this, message.conversationId, message.finalMessage, {
+          issueContext: message.contextToAppend,
+          threadContext,
+          isolationHints: message.isolationHints,
+          userId: message.archonUserId,
+        });
+      } catch (error) {
+        await this.reportGitLabMessageError(message.conversationId, toError(error));
+      }
+    });
+  }
+
+  private async reportGitLabMessageError(conversationId: string, err: Error): Promise<void> {
+    getLog().error({ err, conversationId }, 'gitlab.message_handling_error');
+    try {
+      await this.sendMessage(conversationId, classifyAndFormatError(err));
+    } catch (sendError) {
+      getLog().error(
+        { err: toError(sendError), conversationId },
+        'gitlab.error_message_send_failed'
+      );
+    }
+  }
+
+  private async reportGitLabSetupError(parsed: GitLabParsedEvent, error: unknown): Promise<void> {
+    const err = toError(error);
+    const conversationId = this.buildConversationId(parsed.projectPath, parsed.iid, parsed.isMR);
+    getLog().error({ err, conversationId }, 'gitlab.webhook_setup_failed');
+    try {
+      await this.sendMessage(conversationId, classifyAndFormatError(err));
+    } catch (sendError) {
+      getLog().error(
+        { err: toError(sendError), conversationId },
+        'gitlab.webhook_setup_error_send_failed'
+      );
+    }
+  }
+
+  async handleWebhook(payload: string, token: string): Promise<void> {
+    const event = this.parseAuthorizedWebhook(payload, token);
+    if (!event) return;
 
     const parsed = this.parseEvent(event);
     if (!parsed) return;
 
-    const {
-      projectPath,
-      iid,
-      comment,
-      eventType,
-      isMR,
-      issue,
-      mergeRequest,
-      isCloseEvent,
-      isMerged,
-    } = parsed;
-
-    // 4. Handle close/merge events
-    if (isCloseEvent) {
-      const mergeLabel = isMerged ? 'merge' : 'close';
-      getLog().info({ event: mergeLabel, projectPath, iid }, 'gitlab.close_event_received');
-      await this.cleanupWorktree(projectPath, iid, isMR, isMerged ?? false);
-      return;
-    }
-
-    // 5. Self-trigger prevention
-    if (comment.includes(BOT_RESPONSE_MARKER)) {
-      getLog().debug({ commentAuthor: event.user?.username }, 'gitlab.ignoring_marked_comment');
-      return;
-    }
-    if (event.user?.username?.toLowerCase() === this.botMention.toLowerCase()) {
-      getLog().debug({ commentAuthor: event.user.username }, 'gitlab.ignoring_own_comment');
-      return;
-    }
-
-    // 6. Check @mention
-    if (!this.hasMention(comment)) return;
-
-    getLog().info({ eventType, projectPath, iid, isMR }, 'gitlab.webhook_processing');
-
-    // Resolution failure must not drop the webhook — warn-log and continue with
-    // archonUserId undefined so the conversation/run rows fall back to NULL.
-    let archonUserId: string | undefined;
-    if (senderUsername) {
-      try {
-        const user = await userDb.findOrCreateUserByPlatformIdentity(
-          'gitlab',
-          senderUsername,
-          senderUsername
-        );
-        archonUserId = user.id;
-      } catch (err) {
-        getLog().warn(
-          { err: toError(err), gitlabUsername: senderUsername },
-          'gitlab.user_resolve_failed'
-        );
-      }
-    }
-
-    // Steps 8-14 wrapped in try-catch so user gets error feedback on setup failures
-    try {
-      // 8. Conversation + codebase setup
-      const conversationId = this.buildConversationId(projectPath, iid, isMR);
-      const existingConv = await db.getOrCreateConversation('gitlab', conversationId);
-      const isNewConversation = !existingConv.codebase_id;
-
-      const {
-        codebase,
-        repoPath,
-        isNew: isNewCodebase,
-      } = await this.getOrCreateCodebaseForRepo(projectPath);
-
-      if (isNewConversation) {
-        try {
-          await db.updateConversation(existingConv.id, {
-            codebase_id: codebase.id,
-            cwd: repoPath,
-          });
-        } catch (updateError) {
-          if (updateError instanceof ConversationNotFoundError) {
-            getLog().error(
-              { conversationId: existingConv.id, codebaseId: codebase.id },
-              'gitlab.conversation_codebase_link_failed'
-            );
-            throw new Error('Failed to set up GitLab conversation - please try again');
-          }
-          throw updateError;
-        }
-      }
-
-      // 9. Get default branch
-      const defaultBranch = event.project.default_branch;
-
-      // 10. Ensure repo ready
-      await this.ensureRepoReady(projectPath, defaultBranch, repoPath, isNewCodebase);
-
-      // 11. Auto-load commands
-      if (isNewCodebase) {
-        await this.autoDetectAndLoadCommands(repoPath, codebase.id);
-      }
-
-      // 12. Isolation hints
-      const isolationHints: IsolationHints = {
-        workflowType: isMR ? 'pr' : 'issue',
-        workflowId: String(iid),
-      };
-
-      if (isMR && mergeRequest) {
-        isolationHints.prBranch = toBranchName(mergeRequest.source_branch);
-        isolationHints.isForkPR = mergeRequest.source_project_id !== mergeRequest.target_project_id;
-
-        getLog().info(
-          {
-            mrIid: iid,
-            sourceBranch: mergeRequest.source_branch,
-            isFork: isolationHints.isForkPR,
-          },
-          'gitlab.mr_head_info'
-        );
-      }
-
-      // 13. Build message with context
-      const strippedComment = this.stripMention(comment);
-      let finalMessage = strippedComment;
-      let contextToAppend: string | undefined;
-
-      const isSlashCommand = strippedComment.trim().startsWith('/');
-
-      if (isSlashCommand) {
-        finalMessage = strippedComment.split('\n')[0].trim();
-        getLog().debug({ command: finalMessage }, 'gitlab.slash_command_processing');
-
-        if (isMR && mergeRequest) {
-          contextToAppend = `GitLab Merge Request !${String(mergeRequest.iid)}: "${mergeRequest.title}"\nUse 'glab mr view ${String(mergeRequest.iid)}' for full details if needed.`;
-        } else if (issue) {
-          contextToAppend = `GitLab Issue #${String(issue.iid)}: "${issue.title}"\nUse 'glab issue view ${String(issue.iid)}' for full details if needed.`;
-        }
-      } else {
-        if (isMR && mergeRequest) {
-          finalMessage = this.buildMRContext(mergeRequest, strippedComment);
-          contextToAppend = `GitLab Merge Request !${String(mergeRequest.iid)}: "${mergeRequest.title}"\nUse 'glab mr view ${String(mergeRequest.iid)}' for full details if needed.`;
-        } else if (issue) {
-          finalMessage = this.buildIssueContext(issue, strippedComment);
-          contextToAppend = `GitLab Issue #${String(issue.iid)}: "${issue.title}"\nUse 'glab issue view ${String(issue.iid)}' for full details if needed.`;
-        }
-      }
-
-      // 14. Thread context + dispatch
-      const commentHistory = await this.fetchCommentHistory(projectPath, iid, isMR);
-      const threadContext = commentHistory.length > 0 ? commentHistory.join('\n') : undefined;
-      getLog().debug(
-        { commentCount: threadContext ? commentHistory.length : 0, conversationId },
-        'gitlab.thread_context_loaded'
+    if (parsed.isCloseEvent) {
+      const mergeLabel = parsed.isMerged ? 'merge' : 'close';
+      getLog().info(
+        { event: mergeLabel, projectPath: parsed.projectPath, iid: parsed.iid },
+        'gitlab.close_event_received'
       );
+      await this.cleanupWorktree(
+        parsed.projectPath,
+        parsed.iid,
+        parsed.isMR,
+        parsed.isMerged ?? false
+      );
+      return;
+    }
 
-      await this.lockManager.acquireLock(conversationId, async () => {
-        try {
-          await handleMessage(this, conversationId, finalMessage, {
-            issueContext: contextToAppend,
-            threadContext,
-            isolationHints,
-            userId: archonUserId,
-          });
-        } catch (error) {
-          const err = toError(error);
-          getLog().error({ err, conversationId }, 'gitlab.message_handling_error');
-          try {
-            const userMessage = classifyAndFormatError(err);
-            await this.sendMessage(conversationId, userMessage);
-          } catch (sendError) {
-            getLog().error(
-              { err: toError(sendError), conversationId },
-              'gitlab.error_message_send_failed'
-            );
-          }
-        }
-      });
+    if (this.shouldIgnoreGitLabComment(event, parsed.comment)) return;
+    getLog().info(
+      {
+        eventType: parsed.eventType,
+        projectPath: parsed.projectPath,
+        iid: parsed.iid,
+        isMR: parsed.isMR,
+      },
+      'gitlab.webhook_processing'
+    );
+
+    const archonUserId = await this.resolveGitLabUserId(event.user?.username);
+    try {
+      const message = await this.prepareGitLabMessage(event, parsed, archonUserId);
+      await this.dispatchGitLabMessage(message);
     } catch (error) {
-      const err = toError(error);
-      const conversationId = this.buildConversationId(projectPath, iid, isMR);
-      getLog().error({ err, conversationId }, 'gitlab.webhook_setup_failed');
-      try {
-        const userMessage = classifyAndFormatError(err);
-        await this.sendMessage(conversationId, userMessage);
-      } catch (sendError) {
-        getLog().error(
-          { err: toError(sendError), conversationId },
-          'gitlab.webhook_setup_error_send_failed'
-        );
-      }
+      await this.reportGitLabSetupError(parsed, error);
     }
   }
 }

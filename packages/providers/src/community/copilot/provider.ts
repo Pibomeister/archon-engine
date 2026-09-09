@@ -415,6 +415,188 @@ function buildFriendlyCopilotError(error: unknown, lastSessionError?: string): E
   return error instanceof Error ? error : new Error(combined);
 }
 
+interface CopilotAuthClientOptionsInput {
+  cwd: string;
+  mergedEnv: Record<string, string>;
+  cliPath?: string;
+  copilotConfig: CopilotProviderDefaults;
+  copilotToken?: string;
+  genericGithubToken?: string;
+}
+
+interface CopilotSessionResolution {
+  session: CopilotSession;
+  resumeFailed: boolean;
+  forkedToFresh: boolean;
+}
+
+interface CopilotClientLike {
+  createSession(config: SessionConfig): Promise<CopilotSession>;
+  resumeSession(sessionId: string, config: SessionConfig): Promise<CopilotSession>;
+  stop(): Promise<Error[]>;
+}
+
+function logUnsupportedCopilotOptions(
+  log: ReturnType<typeof getLog>,
+  requestOptions: SendQueryOptions | undefined
+): void {
+  if (requestOptions?.forkSession !== undefined) {
+    log.debug(
+      { option: 'forkSession', value: requestOptions.forkSession },
+      'copilot.option_not_supported'
+    );
+  }
+  if (requestOptions?.persistSession !== undefined) {
+    log.debug(
+      { option: 'persistSession', value: requestOptions.persistSession },
+      'copilot.option_not_supported'
+    );
+  }
+}
+
+function buildCopilotClientOptions(input: CopilotAuthClientOptionsInput): {
+  clientOpts: CopilotClientOptions;
+  tokenSource: 'copilot-token' | 'generic-token' | 'logged-in-user';
+} {
+  const clientOpts: CopilotClientOptions = {
+    workingDirectory: input.cwd,
+    env: input.mergedEnv,
+  };
+  if (input.cliPath) clientOpts.connection = { kind: 'stdio', path: input.cliPath };
+  if (input.copilotConfig.configDir) clientOpts.baseDirectory = input.copilotConfig.configDir;
+
+  if (input.copilotToken) {
+    clientOpts.gitHubToken = input.copilotToken;
+    clientOpts.useLoggedInUser = false;
+    return { clientOpts, tokenSource: 'copilot-token' };
+  }
+
+  if (input.copilotConfig.useLoggedInUser === false) {
+    if (input.genericGithubToken) {
+      clientOpts.gitHubToken = input.genericGithubToken;
+    }
+    clientOpts.useLoggedInUser = false;
+    return {
+      clientOpts,
+      tokenSource: input.genericGithubToken ? 'generic-token' : 'logged-in-user',
+    };
+  }
+
+  clientOpts.useLoggedInUser = true;
+  return { clientOpts, tokenSource: 'logged-in-user' };
+}
+
+async function stopCopilotClientAfterSessionError(
+  client: CopilotClientLike,
+  log: ReturnType<typeof getLog>
+): Promise<void> {
+  try {
+    await client.stop();
+  } catch (stopErr) {
+    log.debug({ err: stopErr }, 'copilot.client_stop_failed_after_session_error');
+  }
+}
+
+async function resolveCopilotSession(input: {
+  client: CopilotClientLike;
+  sessionConfig: SessionConfig;
+  resumeSessionId: string | undefined;
+  wantsFork: boolean;
+  cwd: string;
+  log: ReturnType<typeof getLog>;
+}): Promise<CopilotSessionResolution> {
+  const { client, sessionConfig, resumeSessionId, wantsFork, cwd, log } = input;
+  if (resumeSessionId && !wantsFork) {
+    log.debug({ sessionId: resumeSessionId, cwd }, 'copilot.resume_attempt');
+    try {
+      return {
+        session: await client.resumeSession(resumeSessionId, sessionConfig),
+        resumeFailed: false,
+        forkedToFresh: false,
+      };
+    } catch (err) {
+      log.debug(
+        { err, sessionId: resumeSessionId },
+        'copilot.resume_failed_falling_back_to_create'
+      );
+      return {
+        session: await client.createSession(sessionConfig),
+        resumeFailed: true,
+        forkedToFresh: false,
+      };
+    }
+  }
+
+  if (resumeSessionId && wantsFork) {
+    log.warn(
+      { requestedResumeSessionId: resumeSessionId },
+      'copilot.fork_unsupported_creating_fresh_session'
+    );
+    return {
+      session: await client.createSession(sessionConfig),
+      resumeFailed: false,
+      forkedToFresh: true,
+    };
+  }
+
+  log.debug({ cwd }, 'copilot.create_session');
+  return {
+    session: await client.createSession(sessionConfig),
+    resumeFailed: false,
+    forkedToFresh: false,
+  };
+}
+
+function copilotResumeWarning(resolution: CopilotSessionResolution): string | undefined {
+  if (resolution.resumeFailed) {
+    return 'Could not resume Copilot session — starting a fresh conversation.';
+  }
+  if (resolution.forkedToFresh) {
+    return 'Copilot SDK does not support session forking; starting a fresh conversation to keep retries safe.';
+  }
+  return undefined;
+}
+
+async function stopCopilotClient(
+  client: CopilotClientLike,
+  log: ReturnType<typeof getLog>
+): Promise<void> {
+  try {
+    const stopErrors = await client.stop();
+    if (stopErrors.length > 0) {
+      log.warn({ errors: stopErrors.map(e => e.message) }, 'copilot.client_stop_errors');
+    }
+  } catch (stopErr) {
+    log.debug({ err: stopErr }, 'copilot.client_stop_threw');
+  }
+}
+
+function logCopilotSessionStarted(input: {
+  log: ReturnType<typeof getLog>;
+  session: CopilotSession;
+  sessionConfig: SessionConfig;
+  cwd: string;
+  tokenSource: 'copilot-token' | 'generic-token' | 'logged-in-user';
+  resumed: boolean;
+}): void {
+  const { log, session, sessionConfig, cwd, tokenSource, resumed } = input;
+  log.info(
+    {
+      sessionId: session.sessionId,
+      model: sessionConfig.model,
+      cwd,
+      reasoningEffort: sessionConfig.reasoningEffort,
+      hasSystemMessage: sessionConfig.systemMessage !== undefined,
+      mcpServers: sessionConfig.mcpServers ? Object.keys(sessionConfig.mcpServers).length : 0,
+      skills: sessionConfig.skillDirectories?.length ?? 0,
+      agents: sessionConfig.customAgents?.length ?? 0,
+      tokenSource,
+      resumed,
+    },
+    'copilot.session_started'
+  );
+}
+
 // ─── Provider class ─────────────────────────────────────────────────────────
 
 /**
@@ -442,29 +624,11 @@ export class CopilotProvider implements IAgentProvider {
     requestOptions?: SendQueryOptions
   ): AsyncGenerator<MessageChunk> {
     const log = getLog();
-
-    // forkSession / persistSession are boolean flags the executor may set in
-    // normal operation; log-warn rather than throw — throwing would block
-    // ordinary session reuse.
-    if (requestOptions?.forkSession !== undefined) {
-      log.debug(
-        { option: 'forkSession', value: requestOptions.forkSession },
-        'copilot.option_not_supported'
-      );
-    }
-    if (requestOptions?.persistSession !== undefined) {
-      log.debug(
-        { option: 'persistSession', value: requestOptions.persistSession },
-        'copilot.option_not_supported'
-      );
-    }
+    logUnsupportedCopilotOptions(log, requestOptions);
 
     const assistantConfig = requestOptions?.assistantConfig ?? {};
     const copilotConfig = parseCopilotConfig(assistantConfig);
-
     const mergedEnv = buildCopilotEnv(requestOptions?.env);
-    const copilotToken = resolveCopilotToken(mergedEnv);
-    const genericGithubToken = resolveGenericGitHubToken(mergedEnv);
     const cliPath = await resolveCopilotBinaryPath(copilotConfig.copilotCliPath);
 
     const sdk = await import('@github/copilot-sdk');
@@ -479,125 +643,54 @@ export class CopilotProvider implements IAgentProvider {
       warnings
     );
 
-    // Flush translation warnings before session creation so the user sees
-    // them even if session construction fails.
     for (const w of warnings) {
       yield { type: 'system', content: `⚠️ ${w.message}` };
     }
 
-    // Best-effort structured output: Copilot has no native JSON-mode, so we
-    // augment the prompt with the schema. bridgeSession parses the
-    // accumulated assistant transcript and attaches `structuredOutput` to
-    // the terminal result chunk.
     const outputFormat = requestOptions?.outputFormat;
     const wantsStructured = outputFormat?.type === 'json_schema';
     const effectivePrompt = wantsStructured
       ? augmentPromptForJsonSchema(prompt, outputFormat.schema)
       : prompt;
 
-    const clientOpts: CopilotClientOptions = {
-      workingDirectory: cwd,
-      env: mergedEnv,
-    };
-    // copilot-sdk 1.0: a custom CLI binary rides a stdio runtime connection
-    // (replaces the removed `cliPath` option).
-    if (cliPath) clientOpts.connection = { kind: 'stdio', path: cliPath };
-    // configDir override → baseDirectory (sets COPILOT_HOME on the runtime).
-    if (copilotConfig.configDir) clientOpts.baseDirectory = copilotConfig.configDir;
-    // Auth precedence: see COPILOT_TOKEN_ENV_KEY / GENERIC_GITHUB_TOKEN_ENV_KEYS docs.
-    let tokenSource: 'copilot-token' | 'generic-token' | 'logged-in-user';
-    if (copilotToken) {
-      clientOpts.gitHubToken = copilotToken;
-      clientOpts.useLoggedInUser = false;
-      tokenSource = 'copilot-token';
-    } else if (copilotConfig.useLoggedInUser === false) {
-      if (genericGithubToken) {
-        clientOpts.gitHubToken = genericGithubToken;
-        tokenSource = 'generic-token';
-      } else {
-        tokenSource = 'logged-in-user';
-      }
-      clientOpts.useLoggedInUser = false;
-    } else {
-      clientOpts.useLoggedInUser = true;
-      tokenSource = 'logged-in-user';
-    }
+    const { clientOpts, tokenSource } = buildCopilotClientOptions({
+      cwd,
+      mergedEnv,
+      cliPath,
+      copilotConfig,
+      copilotToken: resolveCopilotToken(mergedEnv),
+      genericGithubToken: resolveGenericGitHubToken(mergedEnv),
+    });
     if (copilotConfig.logLevel) clientOpts.logLevel = copilotConfig.logLevel;
     const client = new copilotClientCtor(clientOpts);
 
-    let session: CopilotSession;
-    let resumeFailed = false;
-    let forkedToFresh = false;
-    // Archon's dag-executor sets `forkSession: true` on every reuse so retries
-    // start from the pre-node conversation state. The Copilot SDK has no fork
-    // API — resumeSession mutates the source session in place. When fork is
-    // requested we therefore create a fresh session rather than pollute the
-    // source with retry attempts. That loses the prior conversation context,
-    // but preserves retry correctness (which is what the executor cares about).
-    const wantsFork = requestOptions?.forkSession === true;
+    let resolution: CopilotSessionResolution;
     try {
-      if (resumeSessionId && !wantsFork) {
-        log.debug({ sessionId: resumeSessionId, cwd }, 'copilot.resume_attempt');
-        try {
-          session = await client.resumeSession(resumeSessionId, sessionConfig);
-        } catch (err) {
-          log.debug(
-            { err, sessionId: resumeSessionId },
-            'copilot.resume_failed_falling_back_to_create'
-          );
-          resumeFailed = true;
-          session = await client.createSession(sessionConfig);
-        }
-      } else {
-        if (resumeSessionId && wantsFork) {
-          log.warn(
-            { requestedResumeSessionId: resumeSessionId },
-            'copilot.fork_unsupported_creating_fresh_session'
-          );
-          forkedToFresh = true;
-        } else {
-          log.debug({ cwd }, 'copilot.create_session');
-        }
-        session = await client.createSession(sessionConfig);
-      }
+      resolution = await resolveCopilotSession({
+        client,
+        sessionConfig,
+        resumeSessionId,
+        wantsFork: requestOptions?.forkSession === true,
+        cwd,
+        log,
+      });
     } catch (err) {
-      // Can't connect / create — surface a friendly error and stop the client.
-      try {
-        await client.stop();
-      } catch (stopErr) {
-        log.debug({ err: stopErr }, 'copilot.client_stop_failed_after_session_error');
-      }
+      await stopCopilotClientAfterSessionError(client, log);
       throw buildFriendlyCopilotError(err);
     }
 
-    if (resumeFailed) {
-      yield {
-        type: 'system',
-        content: '⚠️ Could not resume Copilot session — starting a fresh conversation.',
-      };
-    } else if (forkedToFresh) {
-      yield {
-        type: 'system',
-        content:
-          '⚠️ Copilot SDK does not support session forking; starting a fresh conversation to keep retries safe.',
-      };
-    }
+    const warning = copilotResumeWarning(resolution);
+    if (warning) yield { type: 'system', content: `⚠️ ${warning}` };
 
-    log.info(
-      {
-        sessionId: session.sessionId,
-        model: sessionConfig.model,
-        cwd,
-        reasoningEffort: sessionConfig.reasoningEffort,
-        hasSystemMessage: sessionConfig.systemMessage !== undefined,
-        mcpServers: sessionConfig.mcpServers ? Object.keys(sessionConfig.mcpServers).length : 0,
-        skills: sessionConfig.skillDirectories?.length ?? 0,
-        agents: sessionConfig.customAgents?.length ?? 0,
-        tokenSource,
-        resumed: resumeSessionId !== undefined && !resumeFailed,
-      },
-      'copilot.session_started'
-    );
+    const { session } = resolution;
+    logCopilotSessionStarted({
+      log,
+      session,
+      sessionConfig,
+      cwd,
+      tokenSource,
+      resumed: resumeSessionId !== undefined && !resolution.resumeFailed,
+    });
 
     try {
       yield* bridgeSession(
@@ -611,16 +704,7 @@ export class CopilotProvider implements IAgentProvider {
       log.error({ err, sessionId: session.sessionId }, 'copilot.prompt_failed');
       throw buildFriendlyCopilotError(err);
     } finally {
-      // Stop the client so its CLI subprocess shuts down; bridgeSession already
-      // handled session.abort() + session.disconnect() in its own finally.
-      try {
-        const stopErrors = await client.stop();
-        if (stopErrors.length > 0) {
-          log.warn({ errors: stopErrors.map(e => e.message) }, 'copilot.client_stop_errors');
-        }
-      } catch (stopErr) {
-        log.debug({ err: stopErr }, 'copilot.client_stop_threw');
-      }
+      await stopCopilotClient(client, log);
     }
   }
 }

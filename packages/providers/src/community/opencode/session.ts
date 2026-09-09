@@ -116,6 +116,156 @@ async function readStructuredOutput(
   return undefined;
 }
 
+interface OpencodeRawEvent {
+  type?: string;
+  properties?: Record<string, unknown>;
+}
+
+interface OpencodeSessionStreamState {
+  latestAssistantInfo: Record<string, unknown> | undefined;
+  lastAssistantMessageId: string | undefined;
+  aborted: boolean;
+  resultYielded: boolean;
+}
+
+function handleOpencodeMessageUpdated(
+  sessionId: string,
+  properties: Record<string, unknown>,
+  state: OpencodeSessionStreamState
+): void {
+  const info = isRecord(properties.info) ? properties.info : undefined;
+  if (info?.role !== 'assistant' || info.sessionID !== sessionId) return;
+  state.latestAssistantInfo = info;
+  if (typeof info.id === 'string') state.lastAssistantMessageId = info.id;
+}
+
+function textFromPart(properties: Record<string, unknown>, part: Record<string, unknown>): string {
+  const delta = typeof properties.delta === 'string' ? properties.delta : undefined;
+  return delta ?? (typeof part.text === 'string' ? part.text : '');
+}
+
+function opencodeToolResultChunk(
+  callId: string,
+  toolName: string,
+  state: Record<string, unknown> | undefined,
+  status: 'completed' | 'error'
+): MessageChunk {
+  return {
+    type: 'tool_result',
+    toolName,
+    toolOutput:
+      status === 'completed'
+        ? typeof state?.output === 'string'
+          ? state.output
+          : ''
+        : typeof state?.error === 'string'
+          ? state.error
+          : 'Tool failed',
+    toolCallId: callId,
+    toolOutcome: status === 'completed' ? 'success' : 'error',
+  };
+}
+
+function opencodeToolChunks(
+  part: Record<string, unknown>,
+  seenToolCalls: Set<string>,
+  completedToolCalls: Set<string>
+): MessageChunk[] {
+  const callId = typeof part.callID === 'string' ? part.callID : undefined;
+  const toolName = typeof part.tool === 'string' ? part.tool : 'unknown';
+  const state = isRecord(part.state) ? part.state : undefined;
+  const status = typeof state?.status === 'string' ? state.status : undefined;
+  const chunks: MessageChunk[] = [];
+  if (callId && !seenToolCalls.has(callId)) {
+    seenToolCalls.add(callId);
+    const toolInput = isRecord(state?.input) ? state.input : undefined;
+    chunks.push({
+      type: 'tool',
+      toolName,
+      ...(toolInput ? { toolInput } : {}),
+      toolCallId: callId,
+    });
+  }
+  if (callId && !completedToolCalls.has(callId) && (status === 'completed' || status === 'error')) {
+    completedToolCalls.add(callId);
+    chunks.push(opencodeToolResultChunk(callId, toolName, state, status));
+  }
+  return chunks;
+}
+
+function opencodePartChunks(
+  sessionId: string,
+  properties: Record<string, unknown>,
+  seenToolCalls: Set<string>,
+  completedToolCalls: Set<string>
+): MessageChunk[] {
+  const part = isRecord(properties.part) ? properties.part : undefined;
+  if (part?.sessionID !== sessionId || typeof part.type !== 'string') return [];
+  if (part.type === 'text') {
+    const text = textFromPart(properties, part);
+    return text ? [{ type: 'assistant', content: text }] : [];
+  }
+  if (part.type === 'reasoning') {
+    const text = textFromPart(properties, part);
+    return text ? [{ type: 'thinking', content: text }] : [];
+  }
+  if (part.type === 'tool') return opencodeToolChunks(part, seenToolCalls, completedToolCalls);
+  return [];
+}
+
+function throwIfOpencodeSessionError(sessionId: string, properties: Record<string, unknown>): void {
+  const eventSessionId =
+    typeof properties.sessionID === 'string' ? properties.sessionID : undefined;
+  if (eventSessionId && eventSessionId !== sessionId) return;
+  const rawError = isRecord(properties.error) ? properties.error : properties;
+  const err = new Error(errorMessage(rawError));
+  err.cause = rawError;
+  throw err;
+}
+
+async function buildOpencodeIdleResult(
+  client: OpencodeClientLike,
+  cwd: string,
+  sessionId: string,
+  state: OpencodeSessionStreamState
+): Promise<MessageChunk> {
+  const structuredOutput = await readStructuredOutput(
+    client,
+    cwd,
+    sessionId,
+    state.lastAssistantMessageId
+  );
+  const tokens = normalizeTokens(state.latestAssistantInfo);
+  return {
+    type: 'result',
+    sessionId,
+    ...(tokens ? { tokens } : {}),
+    ...(structuredOutput !== undefined ? { structuredOutput } : {}),
+    ...(typeof state.latestAssistantInfo?.cost === 'number'
+      ? { cost: state.latestAssistantInfo.cost }
+      : {}),
+    ...(typeof state.latestAssistantInfo?.finish === 'string'
+      ? { stopReason: state.latestAssistantInfo.finish }
+      : {}),
+    ...(typeof state.latestAssistantInfo?.modelID === 'string' &&
+    state.latestAssistantInfo.modelID.length > 0
+      ? { resolvedModel: { id: state.latestAssistantInfo.modelID } }
+      : {}),
+  };
+}
+
+function throwOpencodeAborted(
+  sessionId: string,
+  cwd: string,
+  requestOptions: SendQueryOptions | undefined
+): never {
+  const abortReason = requestOptions?.abortSignal?.reason;
+  throw new Error(
+    `OpenCode query aborted (session: ${sessionId}, cwd: ${cwd})` +
+      (abortReason ? `: ${String(abortReason)}` : '')
+  );
+}
+
 export async function* streamOpencodeSession(
   client: OpencodeClientLike,
   cwd: string,
@@ -128,13 +278,15 @@ export async function* streamOpencodeSession(
   const streamController = new AbortController();
   const seenToolCalls = new Set<string>();
   const completedToolCalls = new Set<string>();
-  let latestAssistantInfo: Record<string, unknown> | undefined;
-  let lastAssistantMessageId: string | undefined;
-  let aborted = requestOptions?.abortSignal?.aborted === true;
-  let resultYielded = false;
+  const state: OpencodeSessionStreamState = {
+    latestAssistantInfo: undefined,
+    lastAssistantMessageId: undefined,
+    aborted: requestOptions?.abortSignal?.aborted === true,
+    resultYielded: false,
+  };
 
   const abortHandler = (): void => {
-    aborted = true;
+    state.aborted = true;
     void client.session
       .abort({ path: { id: sessionId }, query: { directory: cwd } })
       .catch((error): void => {
@@ -143,158 +295,40 @@ export async function* streamOpencodeSession(
     streamController.abort();
   };
 
-  requestOptions?.abortSignal?.addEventListener('abort', abortHandler, {
-    once: true,
-  });
+  requestOptions?.abortSignal?.addEventListener('abort', abortHandler, { once: true });
 
   try {
     const promptBody = createSessionPromptBody(prompt, model, requestOptions);
     await promptSession(client, cwd, sessionId, promptBody);
 
     for await (const rawEvent of abortableStream(events.stream, streamController.signal)) {
-      const event = rawEvent as {
-        type?: string;
-        properties?: Record<string, unknown>;
-      };
+      const event = rawEvent as OpencodeRawEvent;
       const properties = isRecord(event.properties) ? event.properties : {};
-
-      if (event.type === 'message.updated') {
-        const info = isRecord(properties.info) ? properties.info : undefined;
-        if (info?.role === 'assistant' && info.sessionID === sessionId) {
-          latestAssistantInfo = info;
-          if (typeof info.id === 'string') {
-            lastAssistantMessageId = info.id;
-          }
-        }
-        continue;
-      }
-
-      if (event.type === 'message.part.updated') {
-        const part = isRecord(properties.part) ? properties.part : undefined;
-        if (!part || part?.sessionID !== sessionId || typeof part.type !== 'string') {
-          continue;
-        }
-
-        if (part.type === 'text') {
-          const delta = typeof properties.delta === 'string' ? properties.delta : undefined;
-          const text = delta ?? (typeof part.text === 'string' ? part.text : '');
-          if (text) {
-            yield { type: 'assistant', content: text };
-          }
-          continue;
-        }
-
-        if (part.type === 'reasoning') {
-          const delta = typeof properties.delta === 'string' ? properties.delta : undefined;
-          const text = delta ?? (typeof part.text === 'string' ? part.text : '');
-          if (text) {
-            yield { type: 'thinking', content: text };
-          }
-          continue;
-        }
-
-        if (part.type === 'tool') {
-          const callId = typeof part.callID === 'string' ? part.callID : undefined;
-          const toolName = typeof part.tool === 'string' ? part.tool : 'unknown';
-          const state = isRecord(part.state) ? part.state : undefined;
-          const toolInput = isRecord(state?.input) ? state.input : undefined;
-          const status = typeof state?.status === 'string' ? state.status : undefined;
-
-          if (callId && !seenToolCalls.has(callId)) {
-            seenToolCalls.add(callId);
-            yield {
-              type: 'tool',
-              toolName,
-              ...(toolInput ? { toolInput } : {}),
-              ...(callId ? { toolCallId: callId } : {}),
-            };
-          }
-
-          if (callId && !completedToolCalls.has(callId)) {
-            if (status === 'completed') {
-              completedToolCalls.add(callId);
-              yield {
-                type: 'tool_result',
-                toolName,
-                toolOutput: typeof state?.output === 'string' ? state.output : '',
-                ...(callId ? { toolCallId: callId } : {}),
-                toolOutcome: 'success',
-              };
-            } else if (status === 'error') {
-              completedToolCalls.add(callId);
-              yield {
-                type: 'tool_result',
-                toolName,
-                toolOutput: typeof state?.error === 'string' ? state.error : 'Tool failed',
-                ...(callId ? { toolCallId: callId } : {}),
-                toolOutcome: 'error',
-              };
-            }
-          }
-        }
-        continue;
-      }
-
-      if (event.type === 'session.error') {
-        const eventSessionId =
-          typeof properties.sessionID === 'string' ? properties.sessionID : undefined;
-        if (eventSessionId && eventSessionId !== sessionId) continue;
-
-        const rawError = isRecord(properties.error) ? properties.error : properties;
-        const err = new Error(errorMessage(rawError));
-        err.cause = rawError;
-        throw err;
-      }
-
-      if (event.type === 'session.idle') {
-        if (properties.sessionID !== sessionId) continue;
-
-        const structuredOutput = await readStructuredOutput(
-          client,
-          cwd,
+      if (event.type === 'message.updated')
+        handleOpencodeMessageUpdated(sessionId, properties, state);
+      else if (event.type === 'message.part.updated') {
+        for (const chunk of opencodePartChunks(
           sessionId,
-          lastAssistantMessageId
-        );
-        const tokens = normalizeTokens(latestAssistantInfo);
-
-        yield {
-          type: 'result',
-          sessionId,
-          ...(tokens ? { tokens } : {}),
-          ...(structuredOutput !== undefined ? { structuredOutput } : {}),
-          ...(typeof latestAssistantInfo?.cost === 'number'
-            ? { cost: latestAssistantInfo.cost }
-            : {}),
-          ...(typeof latestAssistantInfo?.finish === 'string'
-            ? { stopReason: latestAssistantInfo.finish }
-            : {}),
-          ...(typeof latestAssistantInfo?.modelID === 'string' &&
-          latestAssistantInfo.modelID.length > 0
-            ? { resolvedModel: { id: latestAssistantInfo.modelID } }
-            : {}),
-        };
-        resultYielded = true;
+          properties,
+          seenToolCalls,
+          completedToolCalls
+        ))
+          yield chunk;
+      } else if (event.type === 'session.error') throwIfOpencodeSessionError(sessionId, properties);
+      else if (event.type === 'session.idle' && properties.sessionID === sessionId) {
+        yield await buildOpencodeIdleResult(client, cwd, sessionId, state);
+        state.resultYielded = true;
         return;
       }
     }
 
-    if (!resultYielded && !aborted) {
-      yield { type: 'result', sessionId };
-    }
-
-    if (aborted) {
-      const abortReason = requestOptions?.abortSignal?.reason;
-      throw new Error(
-        `OpenCode query aborted (session: ${sessionId}, cwd: ${cwd})` +
-          (abortReason ? `: ${String(abortReason)}` : '')
-      );
-    }
+    if (!state.resultYielded && !state.aborted) yield { type: 'result', sessionId };
+    if (state.aborted) throwOpencodeAborted(sessionId, cwd, requestOptions);
   } finally {
     requestOptions?.abortSignal?.removeEventListener('abort', abortHandler);
     streamController.abort();
   }
 }
-
 export async function* abortableStream(
   stream: AsyncIterable<unknown>,
   signal: AbortSignal

@@ -131,6 +131,7 @@ mock.module('@opencode-ai/sdk', () => ({
   createOpencodeClient: mockCreateOpencodeClient,
 }));
 
+import { streamMultiAgentOpencodeSession } from './multi-agent';
 import { OpencodeProvider, resetEmbeddedRuntime } from './provider';
 
 /** Default model for tests — satisfies the model-or-agent validation */
@@ -375,6 +376,61 @@ describe('OpencodeProvider', () => {
         }),
       ])
     );
+  });
+
+  test('multi-agent abort cancels sessions created before all session creates resolve', async () => {
+    let resolveSecond!: (value: { data: { id: string } }) => void;
+    const secondSession = new Promise<{ data: { id: string } }>(resolve => {
+      resolveSecond = resolve;
+    });
+    let createCount = 0;
+    const abortController = new AbortController();
+    const sessionAbort = mock(async () => undefined);
+    const client = {
+      session: {
+        create: mock(() => {
+          createCount++;
+          if (createCount === 1) return Promise.resolve({ data: { id: 'scout-session' } });
+          return secondSession;
+        }),
+        promptAsync: mock(async () => undefined),
+        abort: sessionAbort,
+        message: mock(async () => ({ data: { info: {} } })),
+      },
+      event: {
+        subscribe: mock(async () => ({ stream: createPendingStream() })),
+      },
+    };
+
+    const consumed = consume(
+      streamMultiAgentOpencodeSession(client, '/tmp/project', 'review', 'hi', TEST_MODEL, {
+        abortSignal: abortController.signal,
+        nodeConfig: {
+          nodeId: 'review',
+          agents: {
+            scout: { description: 'Scout', prompt: 'Explore' },
+            reviewer: { description: 'Reviewer', prompt: 'Review' },
+          },
+        },
+      })
+    );
+
+    while (
+      !mockLogger.info.mock.calls.some(call => call[1] === 'opencode.multi_agent_session_created')
+    ) {
+      await Promise.resolve();
+    }
+    abortController.abort('stop-now');
+    await Promise.resolve();
+
+    expect(sessionAbort).toHaveBeenCalledWith({
+      path: { id: 'scout-session' },
+      query: { directory: '/tmp/project' },
+    });
+
+    resolveSecond({ data: { id: 'reviewer-session' } });
+    const { error } = await consumed;
+    expect(error?.message).toContain('OpenCode query aborted');
   });
 
   test('terminal result chunk includes sessionId and normalized tokens', async () => {

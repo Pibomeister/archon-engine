@@ -126,68 +126,86 @@ export class SlackWorkflowBridge {
     if (!trigger) return;
 
     try {
-      switch (event.type) {
-        case 'workflow_started':
-          await this.onWorkflowStarted(event, conversationId, trigger);
-          break;
-        case 'node_started':
-          this.upsertNode(event.runId, event.nodeId, event.nodeName, 'running');
-          this.scheduleStatusUpdate(event.runId);
-          break;
-        case 'node_completed':
-          this.upsertNode(event.runId, event.nodeId, event.nodeName, 'completed', {
-            durationMs: event.duration,
-          });
-          this.scheduleStatusUpdate(event.runId);
-          break;
-        case 'node_failed':
-          this.upsertNode(event.runId, event.nodeId, event.nodeName, 'failed', {
-            error: event.error,
-          });
-          this.scheduleStatusUpdate(event.runId);
-          break;
-        case 'node_skipped':
-          this.upsertNode(event.runId, event.nodeId, event.nodeName, 'skipped');
-          this.scheduleStatusUpdate(event.runId);
-          break;
-        case 'approval_pending':
-          await this.onApprovalPending(event);
-          break;
-        case 'workflow_completed':
-          await this.onTerminal(event.runId, 'completed', conversationId);
-          break;
-        case 'workflow_failed':
-          await this.onTerminal(event.runId, 'failed', conversationId, event.error);
-          break;
-        case 'workflow_cancelled':
-          await this.onTerminal(event.runId, 'cancelled', conversationId, event.reason);
-          break;
-        // Loop / tool / artifact / container-lifecycle events would surface as
-        // noise in-thread and aren't tied to a button or actionable state; the
-        // status message already conveys run health via the DAG node states.
-        case 'loop_iteration_started':
-        case 'loop_iteration_completed':
-        case 'loop_iteration_failed':
-        case 'tool_started':
-        case 'tool_completed':
-        case 'workflow_artifact':
-        case 'task_activity':
-        case 'hook_activity':
-        case 'container_lifecycle':
-          break;
-        default: {
-          const exhaustive: never = event;
-          getLog().warn(
-            { type: (exhaustive as { type: string }).type },
-            'slack.bridge_unhandled_event'
-          );
-        }
-      }
+      await this.dispatchEvent(event, conversationId, trigger);
     } catch (error) {
       getLog().error(
         { err: error as Error, eventType: event.type, runId: event.runId },
         'slack.bridge_event_handler_failed'
       );
+    }
+  }
+
+  private async dispatchEvent(
+    event: WorkflowEmitterEvent,
+    conversationId: string,
+    trigger: SlackMessageRef
+  ): Promise<void> {
+    switch (event.type) {
+      case 'workflow_started':
+        await this.onWorkflowStarted(event, conversationId, trigger);
+        break;
+      case 'node_started':
+      case 'node_completed':
+      case 'node_failed':
+      case 'node_skipped':
+        this.onNodeLifecycle(event);
+        break;
+      case 'approval_pending':
+        await this.onApprovalPending(event);
+        break;
+      case 'workflow_completed':
+        await this.onTerminal(event.runId, 'completed', conversationId);
+        break;
+      case 'workflow_failed':
+        await this.onTerminal(event.runId, 'failed', conversationId, event.error);
+        break;
+      case 'workflow_cancelled':
+        await this.onTerminal(event.runId, 'cancelled', conversationId, event.reason);
+        break;
+      default:
+        this.ignoreNonSlackEvent(event);
+    }
+  }
+
+  private onNodeLifecycle(
+    event: Extract<
+      WorkflowEmitterEvent,
+      { type: 'node_started' | 'node_completed' | 'node_failed' | 'node_skipped' }
+    >
+  ): void {
+    if (event.type === 'node_started') {
+      this.upsertNode(event.runId, event.nodeId, event.nodeName, 'running');
+    } else if (event.type === 'node_completed') {
+      this.upsertNode(event.runId, event.nodeId, event.nodeName, 'completed', {
+        durationMs: event.duration,
+      });
+    } else if (event.type === 'node_failed') {
+      this.upsertNode(event.runId, event.nodeId, event.nodeName, 'failed', {
+        error: event.error,
+      });
+    } else {
+      this.upsertNode(event.runId, event.nodeId, event.nodeName, 'skipped');
+    }
+    this.scheduleStatusUpdate(event.runId);
+  }
+
+  private ignoreNonSlackEvent(event: WorkflowEmitterEvent): void {
+    // Loop / tool / artifact / container-lifecycle events would surface as
+    // noise in-thread and aren't tied to a button or actionable state; the
+    // status message already conveys run health via the DAG node states.
+    switch (event.type) {
+      case 'loop_iteration_started':
+      case 'loop_iteration_completed':
+      case 'loop_iteration_failed':
+      case 'tool_started':
+      case 'tool_completed':
+      case 'workflow_artifact':
+      case 'task_activity':
+      case 'hook_activity':
+      case 'container_lifecycle':
+        return;
+      default:
+        getLog().warn({ eventType: event.type }, 'slack.bridge_unhandled_event');
     }
   }
 
