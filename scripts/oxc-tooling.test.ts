@@ -29,6 +29,40 @@ describe('Oxc tooling configuration', () => {
     ]);
   });
 
+  test('Git checkout preserves formatter LF endings with autocrlf enabled', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'archon-checkout-eol-'));
+    try {
+      writeFileSync(join(dir, '.gitattributes'), readFileSync(join(repoRoot, '.gitattributes')));
+      const names = ['fixture.ts', 'fixture.tsx', 'fixture.mjs', 'fixture.json'];
+      for (const name of names) {
+        writeFileSync(
+          join(dir, name),
+          name.endsWith('.json') ? '{}\n' : 'export const value = 1;\n'
+        );
+      }
+      writeFileSync(join(dir, 'fixture.bin'), Buffer.from([0, 13, 10, 255, 0]));
+      runOk('git', ['init', '--quiet'], dir);
+      const config = [
+        '-c',
+        'core.autocrlf=true',
+        '-c',
+        `core.attributesFile=${join(dir, 'no-global-attributes')}`,
+      ];
+      runOk('git', [...config, 'add', '.'], dir);
+      for (const name of [...names, 'fixture.bin']) rmSync(join(dir, name));
+      runOk('git', [...config, 'checkout-index', '--all', '--force'], dir);
+      for (const name of names) {
+        const content = readFileSync(join(dir, name), 'utf8');
+        expect(content.includes('\r')).toBe(false);
+        expect(content.endsWith('\n')).toBe(true);
+      }
+      expect(readFileSync(join(dir, 'fixture.ts'), 'utf8')).toBe('export const value = 1;\n');
+      expect(readFileSync(join(dir, 'fixture.bin'))).toEqual(Buffer.from([0, 13, 10, 255, 0]));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test('oxfmt check-write-check preserves protected evidence and seccomp files', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'archon-oxfmt-'));
     try {
