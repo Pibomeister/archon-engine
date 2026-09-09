@@ -80,8 +80,8 @@ mock.module('../db/isolation-environments', () => ({
 }));
 
 // Mock workflows DB (getRunByIsolationEnvId — reaper run-status lookup)
-const mockGetRunByIsolationEnvId = mock(
-  (): Promise<{ id: string; status: string } | null> => Promise.resolve(null)
+const mockGetRunByIsolationEnvId = mock((): Promise<{ id: string; status: string } | null> =>
+  Promise.resolve(null)
 );
 mock.module('../db/workflows', () => ({
   getRunByIsolationEnvId: mockGetRunByIsolationEnvId,

@@ -134,13 +134,23 @@ interface AccountedReservation {
   reservationId: string;
   body: Buffer;
   maxResponseBytes: number;
+  releaseLifecycle: () => void;
+}
+
+interface AccountingLifecycleGate {
+  active: boolean;
+  waiter?: {
+    connection: StrictConnection;
+    resolve: (release: (() => void) | null) => void;
+    onClose: () => void;
+  };
 }
 
 interface ResponseEvidence {
   chunks: Buffer[];
   bytes: number;
   overLimit: boolean;
-  settled: boolean;
+  settlementStarted: boolean;
 }
 
 interface TerminalSseHold {
@@ -151,6 +161,11 @@ interface TerminalSseHold {
   overLimit: boolean;
   maxBytes: number;
 }
+
+const accountingLifecycleGates = new WeakMap<
+  StrictProviderAccountingOptions,
+  AccountingLifecycleGate
+>();
 
 export async function startStrictHttpsConnectProxy(
   options: StrictHttpsConnectProxyOptions
@@ -597,16 +612,30 @@ async function forwardRequest(
     sendDownstreamError(connection, body.status, body.message);
     return;
   }
-  const accounting = await reserveAccountedRequest(options, target, request, body.body, grant);
+  const accounting = await reserveAccountedRequest(
+    connection,
+    options,
+    target,
+    request,
+    body.body,
+    grant
+  );
+  if (accounting === null) return;
   if (connection.released || connection.clientClosed) {
-    await markAccountingUnknown(options, accounting, 'downstream closed before upstream request');
+    await finishAccountingUnknown(options, accounting, 'downstream closed before upstream request');
     return;
   }
   const upstreamBody = accounting?.body ?? body.body;
-  const upstream = await createUpstreamRequest(connection, target, request, upstreamBody, options);
+  let upstream;
+  try {
+    upstream = await createUpstreamRequest(connection, target, request, upstreamBody, options);
+  } catch (error) {
+    await finishAccountingUnknown(options, accounting, errorMessage(error));
+    throw error;
+  }
   if (connection.released) {
     upstream.response.destroy();
-    await markAccountingUnknown(options, accounting, 'downstream closed after upstream request');
+    await finishAccountingUnknown(options, accounting, 'downstream closed after upstream request');
     return;
   }
   connection.upstreamResponse = upstream.response;
@@ -688,22 +717,42 @@ function readFixedBody(
 }
 
 async function reserveAccountedRequest(
+  connection: StrictConnection,
   options: StrictHttpsConnectProxyOptions,
   target: NonNullable<StrictConnection['target']>,
   request: ParsedHttpRequest,
   body: Buffer,
   grant: NormalizedStrictGrant
-): Promise<AccountedReservation | undefined> {
+): Promise<AccountedReservation | null | undefined> {
   if (!options.accounting) return undefined;
-  const maxResponseBytes = normalizeAccountingResponseBytes(options.accounting.maxResponseBytes);
+  const releaseLifecycle = await acquireAccountingLifecycle(options.accounting, connection);
+  if (!releaseLifecycle) {
+    if (!connection.released && !connection.clientClosed)
+      sendDownstreamError(connection, 503, 'accounting capacity');
+    return null;
+  }
+  try {
+    return await reserveWithLifecycle(options, target, request, body, grant, releaseLifecycle);
+  } catch (error) {
+    releaseLifecycle();
+    throw error;
+  }
+}
+
+async function reserveWithLifecycle(
+  options: StrictHttpsConnectProxyOptions,
+  target: NonNullable<StrictConnection['target']>,
+  request: ParsedHttpRequest,
+  body: Buffer,
+  grant: NormalizedStrictGrant,
+  releaseLifecycle: () => void
+): Promise<AccountedReservation> {
+  const accounting = options.accounting;
+  if (!accounting) throw new Error('Strict proxy accounting configuration disappeared.');
+  const maxResponseBytes = normalizeAccountingResponseBytes(accounting.maxResponseBytes);
   const path = originPathname(request.path);
   const requestBody = parseJsonBody(body);
-  const policy = matchingAccountingPolicy(
-    options.accounting.policies,
-    target.host,
-    path,
-    requestBody
-  );
+  const policy = matchingAccountingPolicy(accounting.policies, target.host, path, requestBody);
   const prepared = prepareTrustedProviderRequest(policy, {
     method: request.method,
     host: target.host,
@@ -713,7 +762,7 @@ async function reserveAccountedRequest(
     headers: requestFeatureHeaders(request.headers),
   });
   assertPreparedBodyWithinGrant(prepared.body, grant.maxBodyBytes);
-  const reserved = await options.accounting.client.reserve({
+  const reserved = await accounting.client.reserve({
     provider: policy.provider,
     host: target.host,
     method: request.method,
@@ -729,6 +778,7 @@ async function reserveAccountedRequest(
     reservationId: reserved.reservationId,
     body: prepared.body,
     maxResponseBytes,
+    releaseLifecycle,
   };
 }
 
@@ -747,6 +797,67 @@ function matchingAccountingPolicy(
   );
   if (!policy) throw new Error('No trusted provider budget policy matched upstream request.');
   return policy;
+}
+
+function acquireAccountingLifecycle(
+  accounting: StrictProviderAccountingOptions,
+  connection: StrictConnection
+): Promise<(() => void) | null> {
+  const gate = accountingLifecycleGate(accounting);
+  if (!gate.active) {
+    gate.active = true;
+    return Promise.resolve(createLifecycleRelease(gate));
+  }
+  if (gate.waiter) return Promise.resolve(null);
+  return new Promise(resolve => {
+    const onClose = (): void => {
+      removeLifecycleWaiter(gate, connection);
+    };
+    gate.waiter = { connection, resolve, onClose };
+    connection.raw.once('close', onClose);
+  });
+}
+
+function accountingLifecycleGate(
+  accounting: StrictProviderAccountingOptions
+): AccountingLifecycleGate {
+  const existing = accountingLifecycleGates.get(accounting);
+  if (existing) return existing;
+  const created = { active: false };
+  accountingLifecycleGates.set(accounting, created);
+  return created;
+}
+
+function createLifecycleRelease(gate: AccountingLifecycleGate): () => void {
+  let released = false;
+  return (): void => {
+    if (released) return;
+    released = true;
+    activateLifecycleWaiter(gate);
+  };
+}
+
+function activateLifecycleWaiter(gate: AccountingLifecycleGate): void {
+  const waiter = gate.waiter;
+  if (!waiter) {
+    gate.active = false;
+    return;
+  }
+  gate.waiter = undefined;
+  waiter.connection.raw.off('close', waiter.onClose);
+  if (waiter.connection.released || waiter.connection.clientClosed) {
+    waiter.resolve(null);
+    activateLifecycleWaiter(gate);
+    return;
+  }
+  waiter.resolve(createLifecycleRelease(gate));
+}
+
+function removeLifecycleWaiter(gate: AccountingLifecycleGate, connection: StrictConnection): void {
+  const waiter = gate.waiter;
+  if (waiter?.connection !== connection) return;
+  gate.waiter = undefined;
+  waiter.resolve(null);
 }
 
 function requestModel(body: unknown): string {
@@ -982,7 +1093,7 @@ function streamUpstreamResponse(
 }
 
 function createResponseEvidence(): ResponseEvidence {
-  return { chunks: [], bytes: 0, overLimit: false, settled: false };
+  return { chunks: [], bytes: 0, overLimit: false, settlementStarted: false };
 }
 
 function createTerminalSseHold(
@@ -1136,12 +1247,17 @@ async function settleCompletedAccounting(
   downstream: TLSSocket,
   evidence: ResponseEvidence
 ): Promise<boolean> {
-  if (evidence.settled) return true;
+  if (evidence.settlementStarted) return false;
   if (evidence.overLimit) {
-    evidence.settled = true;
-    await markAccountingUnknown(options, accounting, 'upstream response too large');
-    return false;
+    evidence.settlementStarted = true;
+    try {
+      await markAccountingUnknown(options, accounting, 'upstream response too large');
+      return false;
+    } finally {
+      accounting.releaseLifecycle();
+    }
   }
+  evidence.settlementStarted = true;
   try {
     const settled = await settleAccountedResponse(
       options,
@@ -1150,14 +1266,12 @@ async function settleCompletedAccounting(
       downstream,
       Buffer.concat(evidence.chunks)
     );
-    evidence.settled = true;
     return settled;
   } catch (error) {
-    if (!evidence.settled) {
-      evidence.settled = true;
-      await tryMarkAccountingUnknown(options, accounting, errorMessage(error));
-    }
+    await tryMarkAccountingUnknown(options, accounting, errorMessage(error));
     return false;
+  } finally {
+    accounting.releaseLifecycle();
   }
 }
 
@@ -1167,9 +1281,26 @@ async function settleInterruptedAccounting(
   evidence: ResponseEvidence | undefined,
   reason: string
 ): Promise<void> {
-  if (!accounting || !evidence || evidence.settled) return;
-  evidence.settled = true;
-  await tryMarkAccountingUnknown(options, accounting, reason);
+  if (!accounting || !evidence || evidence.settlementStarted) return;
+  evidence.settlementStarted = true;
+  try {
+    await tryMarkAccountingUnknown(options, accounting, reason);
+  } finally {
+    accounting.releaseLifecycle();
+  }
+}
+
+async function finishAccountingUnknown(
+  options: StrictHttpsConnectProxyOptions,
+  accounting: AccountedReservation | undefined,
+  reason: string
+): Promise<void> {
+  if (!accounting) return;
+  try {
+    await tryMarkAccountingUnknown(options, accounting, reason);
+  } finally {
+    accounting.releaseLifecycle();
+  }
 }
 
 async function settleAccountedResponse(

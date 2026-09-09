@@ -587,3 +587,319 @@ function freshDbPath(): string {
   tempRoots.push(root);
   return join(root, 'ledger.sqlite');
 }
+
+const rootBinding = Object.freeze({
+  runId: 'root-run',
+  workflowDigest: 'sha256:workflow-root',
+  policyDigest: 'sha256:policy-chain',
+});
+const childBinding = Object.freeze({
+  runId: 'run-child',
+  workflowDigest: 'sha256:workflow-child',
+  policyDigest: 'sha256:policy-chain',
+});
+const chainGrant = Object.freeze({
+  schema: 'archon.proxy-budget-grant.v2',
+  rootChainId: 'root-run',
+  deadlineEpochMs: 2_000_000,
+  inputTokenLimit: 100,
+  outputTokenLimit: 80,
+  totalTokenLimit: 150,
+  workflowBindings: Object.freeze([rootBinding, childBinding]),
+} satisfies ProxyBudgetGrant);
+
+describe('proxy budget ledger v2 shared-chain authority', () => {
+  test('aggregates settled usage across two fixed member bindings', () => {
+    const ledger = createV2Ledger('create');
+    const root = ledger.reserveBudget({
+      workflowBinding: rootBinding,
+      requestHash: 'sha256:root-request',
+      inputCeiling: 30,
+      outputCeiling: 20,
+      nowMs: 1_000,
+    });
+    ledger.settleBudget({
+      workflowBinding: rootBinding,
+      reservationId: root.reservationId,
+      inputTokens: 12,
+      outputTokens: 5,
+    });
+    const child = ledger.reserveBudget({
+      workflowBinding: childBinding,
+      requestHash: 'sha256:child-request',
+      inputCeiling: 40,
+      outputCeiling: 30,
+      nowMs: 1_001,
+    });
+    ledger.settleBudget({
+      workflowBinding: childBinding,
+      reservationId: child.reservationId,
+      inputTokens: 20,
+      outputTokens: 10,
+    });
+
+    expect(ledger.getBudgetStatus()).toMatchObject({
+      consumedInputTokens: 32,
+      consumedOutputTokens: 15,
+      consumedTotalTokens: 47,
+      remainingTotalTokens: 103,
+    });
+    expect(ledger.getReservation(child.reservationId, childBinding).workflowBinding).toEqual(
+      childBinding
+    );
+    ledger.close();
+  });
+
+  test('cross-member reservations exhaust one shared total budget', () => {
+    const ledger = createV2Ledger('create', { totalTokenLimit: 55 });
+    const root = ledger.reserveBudget({
+      workflowBinding: rootBinding,
+      requestHash: 'sha256:root-most',
+      inputCeiling: 25,
+      outputCeiling: 20,
+      nowMs: 1_000,
+    });
+    ledger.settleBudget({
+      workflowBinding: rootBinding,
+      reservationId: root.reservationId,
+      inputTokens: 25,
+      outputTokens: 20,
+    });
+
+    expect(() =>
+      ledger.reserveBudget({
+        workflowBinding: childBinding,
+        requestHash: 'sha256:child-too-much',
+        inputCeiling: 6,
+        outputCeiling: 5,
+        nowMs: 1_001,
+      })
+    ).toThrow('Total token budget exhausted.');
+    ledger.close();
+  });
+
+  test('rejects unauthorized or altered workflow identity before insertion', () => {
+    const ledger = createV2Ledger('create');
+    for (const workflowBinding of [
+      { ...rootBinding, runId: 'unknown-run' },
+      { ...rootBinding, workflowDigest: 'sha256:workflow-tampered' },
+      { ...rootBinding, policyDigest: 'sha256:policy-tampered' },
+    ]) {
+      expect(() =>
+        ledger.reserveBudget({
+          workflowBinding,
+          requestHash: `sha256:${workflowBinding.runId}`,
+          inputCeiling: 1,
+          outputCeiling: 1,
+          nowMs: 1_000,
+        })
+      ).toThrow('Workflow binding is not authorized by the budget grant.');
+    }
+    expect(ledger.getBudgetStatus()).toMatchObject({ consumedTotalTokens: 0 });
+    ledger.close();
+  });
+
+  test('member-scoped mutations refuse cross-settlement and cross-read by UUID', () => {
+    const ledger = createV2Ledger('create');
+    const child = ledger.reserveBudget({
+      workflowBinding: childBinding,
+      requestHash: 'sha256:child-owned',
+      inputCeiling: 10,
+      outputCeiling: 5,
+      nowMs: 1_000,
+    });
+
+    expect(() => ledger.getReservation(child.reservationId, rootBinding)).toThrow(
+      'Budget reservation is not scoped to this workflow binding.'
+    );
+    expect(() =>
+      ledger.settleBudget({
+        workflowBinding: rootBinding,
+        reservationId: child.reservationId,
+        inputTokens: 3,
+        outputTokens: 2,
+      })
+    ).toThrow('Budget reservation is not scoped to this workflow binding.');
+    expect(() =>
+      ledger.markReservationUnknown({
+        workflowBinding: rootBinding,
+        reservationId: child.reservationId,
+        reason: 'cross-member poison',
+      })
+    ).toThrow('Budget reservation is not scoped to this workflow binding.');
+    expect(
+      ledger.settleBudget({
+        workflowBinding: childBinding,
+        reservationId: child.reservationId,
+        inputTokens: 3,
+        outputTokens: 2,
+      })
+    ).toMatchObject({ status: 'settled' });
+    ledger.close();
+  });
+
+  test('resume rejects grant mutation, reordered bindings, and extended deadline', () => {
+    const { ledger, dbPath } = createV2LedgerWithPath('create');
+    ledger.close();
+    expect(() =>
+      createProxyBudgetLedger({
+        mode: 'resume',
+        dbPath,
+        grant: { ...chainGrant, deadlineEpochMs: 3_000_000 },
+      })
+    ).toThrow('Budget grant binding drift detected.');
+    expect(() =>
+      createProxyBudgetLedger({
+        mode: 'resume',
+        dbPath,
+        grant: { ...chainGrant, workflowBindings: [childBinding, rootBinding] },
+      })
+    ).toThrow('Workflow bindings must be sorted and unique.');
+    expect(() =>
+      createProxyBudgetLedger({
+        mode: 'resume',
+        dbPath,
+        grant: {
+          ...chainGrant,
+          workflowBindings: [
+            rootBinding,
+            childBinding,
+            { runId: 'z-run', workflowDigest: 'sha256:z', policyDigest: 'sha256:policy-chain' },
+          ],
+        },
+      })
+    ).toThrow('Budget grant binding drift detected.');
+  });
+
+  test('ambiguous manifests fail closed at create', () => {
+    expect(() => createV2Ledger('create', { workflowBindings: [] })).toThrow(
+      'Workflow bindings must be a non-empty array.'
+    );
+    expect(() => createV2Ledger('create', { rootChainId: 'missing-root' })).toThrow(
+      'Workflow bindings must contain the root chain ID.'
+    );
+    expect(() =>
+      createV2Ledger('create', { workflowBindings: [childBinding, rootBinding] })
+    ).toThrow('Workflow bindings must be sorted and unique.');
+    expect(() =>
+      createV2Ledger('create', {
+        workflowBindings: [rootBinding, { ...rootBinding, workflowDigest: 'sha256:other' }],
+      })
+    ).toThrow('Workflow bindings must be unique by run ID.');
+  });
+
+  test('global scans reject corruption of every persisted workflow identity field', () => {
+    for (const [column, replacement] of [
+      ['run_id', childBinding.runId],
+      ['workflow_digest', childBinding.workflowDigest],
+      ['policy_digest', 'sha256:other-policy'],
+    ] as const) {
+      const { ledger, dbPath } = createV2LedgerWithPath('create');
+      const reservation = ledger.reserveBudget({
+        workflowBinding: rootBinding,
+        requestHash: `sha256:tamper-${column}`,
+        inputCeiling: 10,
+        outputCeiling: 5,
+        nowMs: 1_000,
+      });
+      const db = new Database(dbPath);
+      db.query(`UPDATE proxy_budget_reservations SET ${column} = ? WHERE id = ?`).run(
+        replacement,
+        reservation.reservationId
+      );
+      db.close();
+
+      expect(() => ledger.getBudgetStatus()).toThrow('Budget ledger private state is malformed.');
+      expect(() =>
+        ledger.reserveBudget({
+          workflowBinding: childBinding,
+          requestHash: `sha256:after-${column}`,
+          inputCeiling: 1,
+          outputCeiling: 1,
+          nowMs: 1_001,
+        })
+      ).toThrow('Budget ledger private state is malformed.');
+      ledger.close();
+    }
+  });
+
+  test('complete reassignment to another valid member cannot authorize read or mutation', () => {
+    for (const operation of ['get', 'settle', 'unknown'] as const) {
+      const { ledger, dbPath } = createV2LedgerWithPath('create');
+      const reservation = ledger.reserveBudget({
+        workflowBinding: rootBinding,
+        requestHash: `sha256:reassign-${operation}`,
+        inputCeiling: 10,
+        outputCeiling: 5,
+        nowMs: 1_000,
+      });
+      const db = new Database(dbPath);
+      db.query(
+        'UPDATE proxy_budget_reservations SET run_id = ?, workflow_digest = ?, policy_digest = ? WHERE id = ?'
+      ).run(
+        childBinding.runId,
+        childBinding.workflowDigest,
+        childBinding.policyDigest,
+        reservation.reservationId
+      );
+      db.close();
+
+      const invoke = (): unknown => {
+        if (operation === 'get')
+          return ledger.getReservation(reservation.reservationId, childBinding);
+        if (operation === 'settle') {
+          return ledger.settleBudget({
+            workflowBinding: childBinding,
+            reservationId: reservation.reservationId,
+            inputTokens: 1,
+            outputTokens: 1,
+          });
+        }
+        return ledger.markReservationUnknown({
+          workflowBinding: childBinding,
+          reservationId: reservation.reservationId,
+          reason: 'reassigned',
+        });
+      };
+      expect(invoke).toThrow('Budget ledger private state is malformed.');
+      ledger.close();
+    }
+  });
+
+  test('same request hash from different members is charged independently', () => {
+    const ledger = createV2Ledger('create');
+    for (const workflowBinding of [rootBinding, childBinding]) {
+      const reservation = ledger.reserveBudget({
+        workflowBinding,
+        requestHash: 'sha256:same-across-members',
+        inputCeiling: 10,
+        outputCeiling: 5,
+        nowMs: 1_000,
+      });
+      ledger.settleBudget({
+        workflowBinding,
+        reservationId: reservation.reservationId,
+        inputTokens: 10,
+        outputTokens: 5,
+      });
+    }
+    expect(ledger.getBudgetStatus()).toMatchObject({ consumedTotalTokens: 30 });
+    ledger.close();
+  });
+});
+
+function createV2Ledger(
+  mode: 'create' | 'resume' | 'status',
+  override: Partial<ProxyBudgetGrant> = {}
+): ProxyBudgetLedger {
+  return createV2LedgerWithPath(mode, override).ledger;
+}
+
+function createV2LedgerWithPath(
+  mode: 'create' | 'resume' | 'status',
+  override: Partial<ProxyBudgetGrant> = {}
+): { ledger: ProxyBudgetLedger; dbPath: string } {
+  const dbPath = freshDbPath();
+  const ledger = createProxyBudgetLedger({ mode, dbPath, grant: { ...chainGrant, ...override } });
+  return { ledger, dbPath };
+}

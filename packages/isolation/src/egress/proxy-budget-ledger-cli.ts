@@ -2,7 +2,11 @@ import { lstatSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { stdin as input, stdout as output } from 'node:process';
 import { createProxyBudgetLedger } from './proxy-budget-ledger';
-import type { ProxyBudgetGrant, ProxyBudgetLedger } from './proxy-budget-ledger';
+import type {
+  ProxyBudgetGrant,
+  ProxyBudgetLedger,
+  ProxyBudgetWorkflowBinding,
+} from './proxy-budget-ledger';
 
 const GRANT_PATH = '/archon-proxy-private/budget.json';
 const LEDGER_PATH = '/archon-budget/ledger.sqlite';
@@ -20,17 +24,20 @@ interface ReservePayload {
   requestHash: string;
   inputCeiling: number;
   outputCeiling: number;
+  workflowBinding: ProxyBudgetWorkflowBinding;
 }
 
 interface SettlePayload {
   reservationId: string;
   inputTokens: number;
   outputTokens: number;
+  workflowBinding: ProxyBudgetWorkflowBinding;
 }
 
 interface UnknownPayload {
   reservationId: string;
   reason: string;
+  workflowBinding: ProxyBudgetWorkflowBinding;
 }
 
 function readMode(args: string[]): 'create' | 'resume' | 'status' {
@@ -146,41 +153,71 @@ function dispatchCommand(command: string, payload: unknown, ledger: ProxyBudgetL
   if (command === 'reserve') return ledger.reserveBudget(readReservePayload(payload));
   if (command === 'settle') return ledger.settleBudget(readSettlePayload(payload));
   if (command === 'markUnknown') return ledger.markReservationUnknown(readUnknownPayload(payload));
-  if (command === 'getReservation')
-    return ledger.getReservation(readReservationIdPayload(payload).reservationId);
+  if (command === 'getReservation') {
+    const input = readReservationIdPayload(payload);
+    return ledger.getReservation(input.reservationId, input.workflowBinding);
+  }
   if (command === 'status') return ledger.getBudgetStatus();
   throw new Error('Unsupported proxy budget command.');
 }
 
 function readReservePayload(payload: unknown): ReservePayload {
-  const record = readPayload(payload, ['requestHash', 'inputCeiling', 'outputCeiling']);
+  const record = readPayload(payload, [
+    'requestHash',
+    'inputCeiling',
+    'outputCeiling',
+    'workflowBinding',
+  ]);
   return {
     requestHash: readString(record.requestHash, 'requestHash'),
     inputCeiling: readNumber(record.inputCeiling, 'inputCeiling'),
     outputCeiling: readNumber(record.outputCeiling, 'outputCeiling'),
+    workflowBinding: readWorkflowBinding(record.workflowBinding),
   };
 }
 
 function readSettlePayload(payload: unknown): SettlePayload {
-  const record = readPayload(payload, ['reservationId', 'inputTokens', 'outputTokens']);
+  const record = readPayload(payload, [
+    'reservationId',
+    'inputTokens',
+    'outputTokens',
+    'workflowBinding',
+  ]);
   return {
     reservationId: readString(record.reservationId, 'reservationId'),
     inputTokens: readNumber(record.inputTokens, 'inputTokens'),
     outputTokens: readNumber(record.outputTokens, 'outputTokens'),
+    workflowBinding: readWorkflowBinding(record.workflowBinding),
   };
 }
 
 function readUnknownPayload(payload: unknown): UnknownPayload {
-  const record = readPayload(payload, ['reservationId', 'reason']);
+  const record = readPayload(payload, ['reservationId', 'reason', 'workflowBinding']);
   return {
     reservationId: readString(record.reservationId, 'reservationId'),
     reason: readString(record.reason, 'reason'),
+    workflowBinding: readWorkflowBinding(record.workflowBinding),
   };
 }
 
-function readReservationIdPayload(payload: unknown): { reservationId: string } {
-  const record = readPayload(payload, ['reservationId']);
-  return { reservationId: readString(record.reservationId, 'reservationId') };
+function readReservationIdPayload(payload: unknown): {
+  reservationId: string;
+  workflowBinding: ProxyBudgetWorkflowBinding;
+} {
+  const record = readPayload(payload, ['reservationId', 'workflowBinding']);
+  return {
+    reservationId: readString(record.reservationId, 'reservationId'),
+    workflowBinding: readWorkflowBinding(record.workflowBinding),
+  };
+}
+
+function readWorkflowBinding(value: unknown): ProxyBudgetWorkflowBinding {
+  const record = readPayload(value, ['runId', 'workflowDigest', 'policyDigest']);
+  return {
+    runId: readString(record.runId, 'workflowBinding.runId'),
+    workflowDigest: readString(record.workflowDigest, 'workflowBinding.workflowDigest'),
+    policyDigest: readString(record.policyDigest, 'workflowBinding.policyDigest'),
+  };
 }
 
 function readPayload(payload: unknown, allowedKeys: string[]): Record<string, unknown> {

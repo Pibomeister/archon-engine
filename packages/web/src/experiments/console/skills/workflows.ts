@@ -73,13 +73,11 @@ export async function getWorkflowGraph(name: string, cwd?: string): Promise<Work
     throw new Error(`Workflow not found: ${name}`);
   }
   const nodes = match.workflow.nodes ?? [];
-  return nodes.map(
-    (n): WorkflowGraphNode => ({
-      id: n.id,
-      dependsOn: n.depends_on ?? [],
-      kind: nodeKind(n),
-    })
-  );
+  return nodes.map((n): WorkflowGraphNode => ({
+    id: n.id,
+    dependsOn: n.depends_on ?? [],
+    kind: nodeKind(n),
+  }));
 }
 
 // ---------------------------------------------------------------------------

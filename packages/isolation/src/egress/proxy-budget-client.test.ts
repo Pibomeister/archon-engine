@@ -28,6 +28,7 @@ test('performs valid ready, reserve, settle, status, and getReservation exchange
             outputCeiling: request.payload.outputCeiling,
             status: 'pending',
             createdAtMs: 111,
+            workflowBinding: { runId: 'run', workflowDigest: 'sha256:workflow', policyDigest: 'sha256:policy' },
           };
           reservations.set(result.reservationId, result);
           process.stdout.write(JSON.stringify({ id: request.id, ok: true, result }) + '\\n');
@@ -57,6 +58,11 @@ test('performs valid ready, reserve, settle, status, and getReservation exchange
     outputCeiling: 5,
     status: 'pending',
     createdAtMs: 111,
+    workflowBinding: {
+      runId: 'run',
+      workflowDigest: 'sha256:workflow',
+      policyDigest: 'sha256:policy',
+    },
   });
   await expect(
     client.settleBudget({ reservationId: 'reservation-1', inputTokens: 8, outputTokens: 3 })
@@ -70,6 +76,94 @@ test('performs valid ready, reserve, settle, status, and getReservation exchange
     acceptingReservations: true,
     pendingReservations: 0,
   });
+});
+
+test('emits and validates the constructor-fixed workflow binding on reservation commands', async () => {
+  const workflowBinding = {
+    runId: 'fixed-run',
+    workflowDigest: 'sha256:fixed-workflow',
+    policyDigest: 'sha256:fixed-policy',
+  };
+  const client = spawnFixture(
+    `
+    process.stdout.write(JSON.stringify({ ok: true, event: 'ready', mode: 'resume' }) + '\\n');
+    process.stdin.on('data', data => {
+      for (const line of data.toString('utf8').trim().split('\\n').filter(Boolean)) {
+        const request = JSON.parse(line);
+        const result = {
+          reservationId: request.payload.reservationId || 'reservation-fixed',
+          requestHash: request.payload.requestHash || 'sha256:fixed',
+          inputCeiling: request.payload.inputCeiling || 10,
+          outputCeiling: request.payload.outputCeiling || 5,
+          status: request.command === 'markUnknown' ? 'unknown' : request.command === 'reserve' ? 'pending' : 'settled',
+          createdAtMs: 111,
+          workflowBinding: request.payload.workflowBinding,
+        };
+        process.stdout.write(JSON.stringify({ id: request.id, ok: true, result }) + '\\n');
+      }
+    });
+  `,
+    { workflowBinding }
+  );
+
+  await client.ready();
+  const reserved = await client.reserveBudget({
+    requestHash: 'sha256:fixed',
+    inputCeiling: 10,
+    outputCeiling: 5,
+  });
+  expect(reserved.workflowBinding).toEqual(workflowBinding);
+  await expect(
+    client.settleBudget({ reservationId: 'reservation-fixed', inputTokens: 3, outputTokens: 2 })
+  ).resolves.toMatchObject({ workflowBinding, status: 'settled' });
+  await expect(
+    client.markReservationUnknown({ reservationId: 'reservation-fixed', reason: 'test' })
+  ).resolves.toMatchObject({ workflowBinding, status: 'unknown' });
+  await expect(client.getReservation('reservation-fixed')).resolves.toMatchObject({
+    workflowBinding,
+  });
+});
+
+test('fixed workflow binding clients fail closed on missing or wrong reservation binding', async () => {
+  const workflowBinding = {
+    runId: 'fixed-run',
+    workflowDigest: 'sha256:fixed-workflow',
+    policyDigest: 'sha256:fixed-policy',
+  };
+  const missing = spawnFixture(
+    `
+    process.stdout.write(JSON.stringify({ ok: true, event: 'ready', mode: 'resume' }) + '\\n');
+    process.stdin.on('data', data => {
+      const request = JSON.parse(data.toString('utf8'));
+      process.stdout.write(JSON.stringify({ id: request.id, ok: true, result: { reservationId: 'r', requestHash: request.payload.requestHash, inputCeiling: 1, outputCeiling: 1, status: 'pending', createdAtMs: 1 } }) + '\\n');
+    });
+  `,
+    { workflowBinding }
+  );
+  await missing.ready();
+  await expect(
+    missing.reserveBudget({
+      requestHash: 'sha256:missing-binding',
+      inputCeiling: 1,
+      outputCeiling: 1,
+    })
+  ).rejects.toThrow('workflowBinding must be an object.');
+
+  const wrong = spawnFixture(
+    `
+    process.stdout.write(JSON.stringify({ ok: true, event: 'ready', mode: 'resume' }) + '\\n');
+    process.stdin.on('data', data => {
+      const request = JSON.parse(data.toString('utf8'));
+      const workflowBinding = { runId: 'other-run', workflowDigest: 'sha256:fixed-workflow', policyDigest: 'sha256:fixed-policy' };
+      process.stdout.write(JSON.stringify({ id: request.id, ok: true, result: { reservationId: 'r', requestHash: request.payload.requestHash, inputCeiling: 1, outputCeiling: 1, status: 'pending', createdAtMs: 1, workflowBinding } }) + '\\n');
+    });
+  `,
+    { workflowBinding }
+  );
+  await wrong.ready();
+  await expect(
+    wrong.reserveBudget({ requestHash: 'sha256:wrong-binding', inputCeiling: 1, outputCeiling: 1 })
+  ).rejects.toThrow('Budget reservation result does not match the fixed workflow binding.');
 });
 
 test('rejects malformed readiness and child exit before readiness', async () => {
@@ -174,7 +268,7 @@ test('rejects ok reserve responses with invalid or mismatched result shapes', as
     process.stdout.write(JSON.stringify({ ok: true, event: 'ready', mode: 'resume' }) + '\\n');
     process.stdin.on('data', data => {
       const request = JSON.parse(data.toString('utf8'));
-      process.stdout.write(JSON.stringify({ id: request.id, ok: true, result: { reservationId: 'reservation-mismatch', requestHash: 'sha256:other', inputCeiling: request.payload.inputCeiling, outputCeiling: request.payload.outputCeiling, status: 'pending', createdAtMs: 1 } }) + '\\n');
+      process.stdout.write(JSON.stringify({ id: request.id, ok: true, result: { reservationId: 'reservation-mismatch', requestHash: 'sha256:other', inputCeiling: request.payload.inputCeiling, outputCeiling: request.payload.outputCeiling, status: 'pending', createdAtMs: 1, workflowBinding: { runId: 'run', workflowDigest: 'sha256:workflow', policyDigest: 'sha256:policy' } } }) + '\\n');
     });
   `);
   await mismatched.ready();

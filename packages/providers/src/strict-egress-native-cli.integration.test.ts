@@ -2439,11 +2439,19 @@ const policy = normalizeEgressPolicy({
   maxConcurrentConnections: 16,
 });
 const grant = JSON.parse(readFileSync('/archon-proxy-private/budget.json', 'utf8'));
+if (grant.schema !== 'archon.proxy-budget-grant.v1') {
+  throw new Error('strict native fixture requires a v1 private budget grant');
+}
 const budgetClient = createProxyBudgetClientForTest({
   executable: '/usr/local/bin/bun',
   args: ['${BUDGET_LEDGER_CLI}'],
   env: { PATH: '/usr/local/bin:/usr/bin:/bin' },
   wallDeadlineEpochMs: grant.deadlineEpochMs,
+  workflowBinding: {
+    runId: grant.runId,
+    workflowDigest: grant.workflowDigest,
+    policyDigest: grant.policyDigest,
+  },
 });
 await budgetClient.ready();
 const accountingClient = {

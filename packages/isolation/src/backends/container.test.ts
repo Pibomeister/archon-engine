@@ -1237,6 +1237,58 @@ describe('ContainerBackend egress lifecycle', () => {
     expect(docker.calls.some(call => call[0] === 'exec' && call.includes('--status'))).toBe(true);
   });
 
+  test('refuses shared-chain proxy budget status before v2 projection is wired', async () => {
+    const store = fakeStore();
+    const metadata = egressMetadata('status-v2-refusal');
+    const row = await createContainerRow(store, 'status-v2-refusal', {
+      ...metadata,
+      ownerRunId: 'run-owner',
+    });
+    const v2Grant = {
+      schema: 'archon.proxy-budget-grant.v2',
+      rootChainId: 'root-run',
+      deadlineEpochMs: Date.now() + 3_600_000,
+      inputTokenLimit: 1_000,
+      outputTokenLimit: 500,
+      totalTokenLimit: 1_200,
+      workflowBindings: [
+        {
+          runId: 'root-run',
+          workflowDigest: 'sha256:workflow-root',
+          policyDigest: METADATA_PROXY_BUDGET_GRANT.policyDigest,
+        },
+      ],
+    } as ProxyBudgetGrant;
+    const docker = fakeDocker(args => {
+      if (args[0] === 'volume' && args[1] === 'inspect' && args.includes('--format')) {
+        return { stdout: 'run-owner\n', stderr: '' };
+      }
+      if (args[0] === 'volume' && args[1] === 'inspect') return { stdout: '[]', stderr: '' };
+      if (args[0] === 'inspect' && args.includes('{{.State.Running}}')) {
+        return { stdout: 'true\n', stderr: '' };
+      }
+      if (args[0] === 'inspect' && args.some(part => part.includes('{{json .Config.Env}}'))) {
+        return { stdout: proxyContainerInspectOutput(metadata), stderr: '' };
+      }
+      if (args[0] === 'inspect' && args.includes('--format')) {
+        return { stdout: `run-owner\n${METADATA_IMAGE}\n`, stderr: '' };
+      }
+      if (args[0] === 'exec' && args.includes('--status')) {
+        return { stdout: budgetStatusJson({ grant: v2Grant }), stderr: '' };
+      }
+      return { stdout: '', stderr: '' };
+    });
+    const backend = new ContainerBackend({
+      store,
+      config: strictBudgetConfig({ image: METADATA_IMAGE }, v2Grant),
+      dockerRunner: docker,
+    });
+
+    await expect(
+      backend.readProxyBudgetStatus(row.id, egressBinding('status-v2-refusal'))
+    ).rejects.toThrow('Proxy budget shared-chain status is not wired.');
+  });
+
   test('rejects a running proxy whose container env or mounts drifted before status exec', async () => {
     const store = fakeStore();
     const metadata = egressMetadata('status-running-drift');
@@ -1262,9 +1314,7 @@ describe('ContainerBackend egress lifecycle', () => {
       }
       if (args[0] === 'inspect' && args.includes('--format')) {
         return {
-          stdout: `run-owner
-${METADATA_IMAGE}
-`,
+          stdout: `run-owner\n${METADATA_IMAGE}\n`,
           stderr: '',
         };
       }

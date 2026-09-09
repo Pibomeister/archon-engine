@@ -104,6 +104,7 @@ test('loads complete budget material without consuming a readiness reservation',
     totalTokenLimit: 1_200,
   };
   const observedDeadlines: number[] = [];
+  const observedBindings: unknown[] = [];
   const fakeClient: ProxyBudgetClient = {
     async ready() {},
     async reserveBudget() {
@@ -141,10 +142,18 @@ test('loads complete budget material without consuming a readiness reservation',
 
   const loaded = await loadStrictProxyMaterial(directory, encoded, image, options => {
     observedDeadlines.push(options.deadlineEpochMs ?? 0);
+    observedBindings.push(options.workflowBinding);
     return fakeClient;
   });
 
   expect(observedDeadlines).toEqual([grant.deadlineEpochMs]);
+  expect(observedBindings).toEqual([
+    {
+      runId: grant.runId,
+      workflowDigest: grant.workflowDigest,
+      policyDigest: grant.policyDigest,
+    },
+  ]);
   expect(loaded.budgetGrant).toEqual(grant);
   expect(await loaded.accounting?.client.getStatus()).toMatchObject({
     consumedInputTokens: 0,

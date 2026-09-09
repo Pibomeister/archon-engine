@@ -310,14 +310,13 @@ function makeDeps(store: IWorkflowStore): WorkflowDeps {
   return {
     store,
     getAgentProvider: mock(() => makeProvider()) as unknown as WorkflowDeps['getAgentProvider'],
-    loadConfig: mock(
-      (): Promise<WorkflowConfig> =>
-        Promise.resolve({
-          assistant: 'claude',
-          assistants: { claude: {}, codex: {} },
-          commands: {},
-          defaults: { loadDefaultCommands: false, loadDefaultWorkflows: false },
-        })
+    loadConfig: mock((): Promise<WorkflowConfig> =>
+      Promise.resolve({
+        assistant: 'claude',
+        assistants: { claude: {}, codex: {} },
+        commands: {},
+        defaults: { loadDefaultCommands: false, loadDefaultWorkflows: false },
+      })
     ),
   };
 }

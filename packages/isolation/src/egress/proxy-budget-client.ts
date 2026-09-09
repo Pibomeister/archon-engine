@@ -7,6 +7,7 @@ import type {
   BudgetStatus,
   MarkReservationUnknownInput,
   ProxyBudgetGrant,
+  ProxyBudgetWorkflowBinding,
   ReserveBudgetInput,
   SettleBudgetInput,
 } from './proxy-budget-ledger';
@@ -14,15 +15,15 @@ import type {
 export interface ProxyBudgetClient {
   ready(): Promise<void>;
   reserveBudget(
-    input: Omit<ReserveBudgetInput, 'nowMs'>,
+    input: Omit<ReserveBudgetInput, 'nowMs' | 'workflowBinding'>,
     options?: ProxyBudgetClientCallOptions
   ): Promise<BudgetReservation>;
   settleBudget(
-    input: SettleBudgetInput,
+    input: Omit<SettleBudgetInput, 'workflowBinding'>,
     options?: ProxyBudgetClientCallOptions
   ): Promise<BudgetReservation>;
   markReservationUnknown(
-    input: MarkReservationUnknownInput,
+    input: Omit<MarkReservationUnknownInput, 'workflowBinding'>,
     options?: ProxyBudgetClientCallOptions
   ): Promise<BudgetReservation>;
   getReservation(
@@ -50,7 +51,9 @@ export interface ProxyBudgetClientTestOptions {
   maxOutputBacklogBytes?: number;
 }
 
-type PrivateClientOptions = ProxyBudgetClientTestOptions;
+type PrivateClientOptions = ProxyBudgetClientTestOptions & {
+  workflowBinding?: ProxyBudgetWorkflowBinding;
+};
 
 interface PendingRequest {
   id: string;
@@ -82,6 +85,7 @@ const MINIMAL_ENV = Object.freeze({ PATH: '/usr/local/bin:/usr/bin:/bin' });
 
 export interface ProxyBudgetClientOptions {
   deadlineEpochMs?: number;
+  workflowBinding?: ProxyBudgetWorkflowBinding;
 }
 
 export function createProxyBudgetClient(options: ProxyBudgetClientOptions = {}): ProxyBudgetClient {
@@ -92,6 +96,7 @@ export function createProxyBudgetClient(options: ProxyBudgetClientOptions = {}):
     readyTimeoutMs: timeoutFromDeadline(options.deadlineEpochMs, READY_TIMEOUT_MS),
     operationTimeoutMs: timeoutFromDeadline(options.deadlineEpochMs, OPERATION_TIMEOUT_MS),
     wallDeadlineEpochMs: options.deadlineEpochMs,
+    workflowBinding: options.workflowBinding,
     maxLineBytes: MAX_LINE_BYTES,
     maxOutputBacklogBytes: MAX_OUTPUT_BACKLOG_BYTES,
   });
@@ -110,6 +115,7 @@ class StdioProxyBudgetClient implements ProxyBudgetClient {
   private readonly maxLineBytes: number;
   private readonly maxOutputBacklogBytes: number;
   private readonly pending = new Map<string, PendingRequest>();
+  private readonly workflowBinding?: ProxyBudgetWorkflowBinding;
   private buffer = Buffer.alloc(0);
   private closed = false;
   private childExited = false;
@@ -120,6 +126,9 @@ class StdioProxyBudgetClient implements ProxyBudgetClient {
 
   constructor(options: PrivateClientOptions) {
     this.operationTimeoutMs = options.operationTimeoutMs ?? OPERATION_TIMEOUT_MS;
+    this.workflowBinding = options.workflowBinding
+      ? Object.freeze({ ...options.workflowBinding })
+      : undefined;
     this.maxLineBytes = options.maxLineBytes ?? MAX_LINE_BYTES;
     this.maxOutputBacklogBytes = options.maxOutputBacklogBytes ?? MAX_OUTPUT_BACKLOG_BYTES;
     this.readyPromise = new Promise<void>((resolve, reject) => {
@@ -150,10 +159,10 @@ class StdioProxyBudgetClient implements ProxyBudgetClient {
   }
 
   async reserveBudget(
-    input: Omit<ReserveBudgetInput, 'nowMs'>,
+    input: Omit<ReserveBudgetInput, 'nowMs' | 'workflowBinding'>,
     options: ProxyBudgetClientCallOptions = {}
   ): Promise<BudgetReservation> {
-    const result = await this.call('reserve', input, options);
+    const result = await this.call('reserve', this.withBinding(input), options);
     return this.readReservationResult(result, {
       requestHash: input.requestHash,
       inputCeiling: input.inputCeiling,
@@ -163,10 +172,10 @@ class StdioProxyBudgetClient implements ProxyBudgetClient {
   }
 
   async settleBudget(
-    input: SettleBudgetInput,
+    input: Omit<SettleBudgetInput, 'workflowBinding'>,
     options: ProxyBudgetClientCallOptions = {}
   ): Promise<BudgetReservation> {
-    const result = await this.call('settle', input, options);
+    const result = await this.call('settle', this.withBinding(input), options);
     return this.readReservationResult(result, {
       reservationId: input.reservationId,
       status: 'settled',
@@ -174,10 +183,10 @@ class StdioProxyBudgetClient implements ProxyBudgetClient {
   }
 
   async markReservationUnknown(
-    input: MarkReservationUnknownInput,
+    input: Omit<MarkReservationUnknownInput, 'workflowBinding'>,
     options: ProxyBudgetClientCallOptions = {}
   ): Promise<BudgetReservation> {
-    const result = await this.call('markUnknown', input, options);
+    const result = await this.call('markUnknown', this.withBinding(input), options);
     return this.readReservationResult(result, {
       reservationId: input.reservationId,
       status: 'unknown',
@@ -188,7 +197,7 @@ class StdioProxyBudgetClient implements ProxyBudgetClient {
     reservationId: string,
     options: ProxyBudgetClientCallOptions = {}
   ): Promise<BudgetReservation> {
-    const result = await this.call('getReservation', { reservationId }, options);
+    const result = await this.call('getReservation', this.withBinding({ reservationId }), options);
     return this.readReservationResult(result, { reservationId });
   }
 
@@ -220,6 +229,7 @@ class StdioProxyBudgetClient implements ProxyBudgetClient {
         outputCeiling: readPositiveInteger(record.outputCeiling, 'outputCeiling'),
         status: readReservationStatus(record.status),
         createdAtMs: readNonNegativeInteger(record.createdAtMs, 'createdAtMs'),
+        workflowBinding: this.readReservationBinding(record.workflowBinding),
       };
       assertExpectedReservation(reservation, expected);
       return reservation;
@@ -228,6 +238,19 @@ class StdioProxyBudgetClient implements ProxyBudgetClient {
       this.failClosed(normalized);
       throw normalized;
     }
+  }
+
+  private readReservationBinding(value: unknown): ProxyBudgetWorkflowBinding {
+    const binding = readWorkflowBinding(value);
+    if (!this.workflowBinding) return binding;
+    if (
+      binding.runId !== this.workflowBinding.runId ||
+      binding.workflowDigest !== this.workflowBinding.workflowDigest ||
+      binding.policyDigest !== this.workflowBinding.policyDigest
+    ) {
+      throw new Error('Budget reservation result does not match the fixed workflow binding.');
+    }
+    return binding;
   }
 
   private readStatusResult(result: unknown): BudgetStatus {
@@ -275,6 +298,13 @@ class StdioProxyBudgetClient implements ProxyBudgetClient {
       this.failClosed(normalized);
       throw normalized;
     }
+  }
+
+  private withBinding<T extends object>(
+    input: T
+  ): T | (T & { workflowBinding: ProxyBudgetWorkflowBinding }) {
+    if (!this.workflowBinding) return input;
+    return { ...input, workflowBinding: { ...this.workflowBinding } };
   }
 
   private async call(
@@ -515,22 +545,30 @@ function deadlineRemaining(deadlineEpochMs: number): number {
 
 function readGrantResult(value: unknown): ProxyBudgetGrant {
   const record = readObject(value, 'Budget status grant');
-  return {
-    schema: readGrantSchema(record.schema),
+  const common = {
     rootChainId: readString(record.rootChainId, 'rootChainId'),
-    runId: readString(record.runId, 'runId'),
-    workflowDigest: readString(record.workflowDigest, 'workflowDigest'),
-    policyDigest: readString(record.policyDigest, 'policyDigest'),
     deadlineEpochMs: readPositiveInteger(record.deadlineEpochMs, 'deadlineEpochMs'),
     inputTokenLimit: readNonNegativeInteger(record.inputTokenLimit, 'inputTokenLimit'),
     outputTokenLimit: readNonNegativeInteger(record.outputTokenLimit, 'outputTokenLimit'),
     totalTokenLimit: readNonNegativeInteger(record.totalTokenLimit, 'totalTokenLimit'),
   };
-}
-
-function readGrantSchema(value: unknown): ProxyBudgetGrant['schema'] {
-  if (value !== 'archon.proxy-budget-grant.v1') throw new Error('Budget status grant is invalid.');
-  return value;
+  if (record.schema === 'archon.proxy-budget-grant.v1') {
+    return {
+      schema: record.schema,
+      ...common,
+      runId: readString(record.runId, 'runId'),
+      workflowDigest: readString(record.workflowDigest, 'workflowDigest'),
+      policyDigest: readString(record.policyDigest, 'policyDigest'),
+    };
+  }
+  if (record.schema === 'archon.proxy-budget-grant.v2') {
+    return {
+      schema: record.schema,
+      ...common,
+      workflowBindings: readWorkflowBindings(record.workflowBindings),
+    };
+  }
+  throw new Error('Budget status grant is invalid.');
 }
 
 function readObject(value: unknown, label: string): Record<string, unknown> {
@@ -589,4 +627,20 @@ function normalizeProtocolError(error: unknown): Error {
 
 function fixedLedgerCliPath(): string {
   return join(dirname(fileURLToPath(import.meta.url)), 'proxy-budget-ledger-cli.ts');
+}
+
+function readWorkflowBindings(value: unknown): ProxyBudgetWorkflowBinding[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new Error('workflowBindings must be a non-empty array.');
+  }
+  return value.map(readWorkflowBinding);
+}
+
+function readWorkflowBinding(value: unknown): ProxyBudgetWorkflowBinding {
+  const record = readObject(value, 'workflowBinding');
+  return {
+    runId: readString(record.runId, 'workflowBinding.runId'),
+    workflowDigest: readString(record.workflowDigest, 'workflowBinding.workflowDigest'),
+    policyDigest: readString(record.policyDigest, 'workflowBinding.policyDigest'),
+  };
 }

@@ -317,6 +317,105 @@ async function main(): Promise<void> {
       await closeAll();
     });
 
+    await run('serializes two accounting lifecycles and rejects a third waiter', async () => {
+      const fixture = await startSlowOpenAiSseFixture(certs.upstreamKey, certs.upstreamCert);
+      const client = new RecordingBudgetClient();
+      const proxy = await startAccountingProxy(temp, certs, fixture.port, client);
+      const requestCount = requests.length;
+      const body = JSON.stringify({
+        model: 'gpt-5.1-pinned',
+        input: 'hello',
+        max_output_tokens: 10,
+        store: false,
+        stream: true,
+        truncation: 'disabled',
+      });
+
+      const first = strictRequest(
+        proxy.socketPath,
+        certs.caCert,
+        'allowed.example',
+        'POST',
+        '/v1/responses',
+        body
+      );
+      await waitForRequestCount(requestCount + 1);
+      const second = strictRequest(
+        proxy.socketPath,
+        certs.caCert,
+        'allowed.example',
+        'POST',
+        '/v1/responses',
+        body
+      );
+      await sleep(25);
+      assertEqual(
+        requests.length,
+        requestCount + 1,
+        'queued request did not reserve or reach upstream'
+      );
+      const third = await strictRequest(
+        proxy.socketPath,
+        certs.caCert,
+        'allowed.example',
+        'POST',
+        '/v1/responses',
+        body
+      );
+      assertIncludes(third, 'HTTP/1.1 503 accounting capacity');
+      assertEqual(client.reservations.length, 1, 'third request rejected before reserve');
+
+      fixture.releaseTerminal();
+      assertIncludes(await first, 'HTTP/1.1 200 OK');
+      assertIncludes(await second, 'HTTP/1.1 200 OK');
+      assertEqual(client.reservations.length, 2, 'two serialized reservations');
+      assertEqual(client.settled.length, 2, 'two durable settlements');
+      assertEqual(client.settled[0]?.usage.total, 10, 'first literal settled total');
+      assertEqual(client.settled[1]?.usage.total, 10, 'second literal settled total');
+      await closeAll();
+    });
+
+    await run('removes an aborted accounting waiter without reserving tokens', async () => {
+      const fixture = await startSlowOpenAiSseFixture(certs.upstreamKey, certs.upstreamCert);
+      const client = new RecordingBudgetClient();
+      const proxy = await startAccountingProxy(temp, certs, fixture.port, client);
+      const requestCount = requests.length;
+      const body = JSON.stringify({
+        model: 'gpt-5.1-pinned',
+        input: 'hello',
+        max_output_tokens: 10,
+        store: false,
+        stream: true,
+        truncation: 'disabled',
+      });
+      const first = strictRequest(
+        proxy.socketPath,
+        certs.caCert,
+        'allowed.example',
+        'POST',
+        '/v1/responses',
+        body
+      );
+      await waitForRequestCount(requestCount + 1);
+      await strictRequest(
+        proxy.socketPath,
+        certs.caCert,
+        'allowed.example',
+        'POST',
+        '/v1/responses',
+        body,
+        {},
+        'allowed.example:443',
+        { disconnectAfterMs: 20 }
+      );
+      fixture.releaseTerminal();
+      await first;
+      await sleep(25);
+      assertEqual(client.reservations.length, 1, 'aborted waiter consumed no reservation');
+      assertEqual(client.settled.length, 1, 'active request still settled');
+      await closeAll();
+    });
+
     await run(
       'preserves fragmented UTF-8 SSE bytes and supports CRLF terminal boundaries',
       async () => {
@@ -365,7 +464,7 @@ async function main(): Promise<void> {
       });
       const tailClient = new RecordingBudgetClient();
       const tailProxy = await startAccountingProxy(temp, certs, tailFixture.port, tailClient, 192);
-      const tailResponse = await strictRequest(
+      const tailResponsePromise = strictRequest(
         tailProxy.socketPath,
         certs.caCert,
         'allowed.example',
@@ -373,10 +472,23 @@ async function main(): Promise<void> {
         '/v1/responses',
         body
       );
+      await waitForReserveAttempts(tailClient, 1);
+      const blockedAfterUnknown = strictRequest(
+        tailProxy.socketPath,
+        certs.caCert,
+        'allowed.example',
+        'POST',
+        '/v1/responses',
+        body
+      );
+      const tailResponse = await tailResponsePromise;
       assertIncludes(tailResponse, 'HTTP/1.1 200 OK');
       assertNotIncludes(tailResponse, 'event: response.completed');
       assertEqual(tailClient.settled.length, 0, 'large tail not settled known');
       assertEqual(tailClient.unknown.length, 1, 'large tail marked unknown');
+      await blockedAfterUnknown;
+      assertEqual(tailClient.reserveAttempts, 2, 'unknown release woke next reserve attempt');
+      assertEqual(tailClient.reservations.length, 1, 'unknown state remained globally fail closed');
       await closeAll();
 
       const incompleteFixture = await startAdversarialSseFixture(
@@ -464,6 +576,48 @@ async function main(): Promise<void> {
       assertIncludes(cancelled, 'HTTP/1.1 200 OK');
       assertEqual(client.settled.length, 0, 'pending settlement was not committed');
       assertEqual(client.unknown.length, 1, 'pending settlement became unknown');
+      await closeAll();
+    });
+
+    await run('terminal settlement owns the lifecycle while downstream closes', async () => {
+      const fixture = await startProviderFixture(certs.upstreamKey, certs.upstreamCert);
+      const client = new RecordingBudgetClient({ settleDelayMs: 100, ignoreSettleAbort: true });
+      const proxy = await startAccountingProxy(temp, certs, fixture.port, client);
+      const requestCount = requests.length;
+      const body = JSON.stringify({
+        model: 'gpt-5.1-pinned',
+        input: 'hello',
+        max_output_tokens: 10,
+        store: false,
+        stream: true,
+        truncation: 'disabled',
+      });
+      const first = strictRequest(
+        proxy.socketPath,
+        certs.caCert,
+        'allowed.example',
+        'POST',
+        '/v1/responses',
+        body,
+        {},
+        'allowed.example:443',
+        { disconnectAfterMs: 20 }
+      );
+      await waitForRequestCount(requestCount + 1);
+      const second = strictRequest(
+        proxy.socketPath,
+        certs.caCert,
+        'allowed.example',
+        'POST',
+        '/v1/responses',
+        body
+      );
+      await sleep(40);
+      assertEqual(client.reservations.length, 1, 'lease held during terminal settlement RPC');
+      await first;
+      assertIncludes(await second, 'HTTP/1.1 200 OK');
+      assertEqual(client.settled.length, 2, 'known terminal settlement committed once per request');
+      assertEqual(client.unknown.length, 0, 'downstream close did not race terminal ownership');
       await closeAll();
     });
 
@@ -1447,6 +1601,7 @@ function providerResponse(mode: ProviderFixtureMode): unknown {
 }
 
 class RecordingBudgetClient implements StrictProviderBudgetClient {
+  reserveAttempts = 0;
   readonly reservations: StrictProviderBudgetReservationInput[] = [];
   readonly settled: {
     reservationId: string;
@@ -1459,6 +1614,7 @@ class RecordingBudgetClient implements StrictProviderBudgetClient {
       failReserve?: boolean;
       reserveDelayMs?: number;
       settleDelayMs?: number;
+      ignoreSettleAbort?: boolean;
     } = {}
   ) {}
 
@@ -1488,6 +1644,7 @@ class RecordingBudgetClient implements StrictProviderBudgetClient {
   }
 
   async reserve(input: StrictProviderBudgetReservationInput): Promise<{ reservationId: string }> {
+    this.reserveAttempts += 1;
     if (this.options.reserveDelayMs !== undefined) await sleep(this.options.reserveDelayMs);
     if (this.options.failReserve) throw new Error('reserve failed');
     if (this.unknown.length > 0) throw new Error('unknown reservation blocks additional requests');
@@ -1502,9 +1659,11 @@ class RecordingBudgetClient implements StrictProviderBudgetClient {
     signal?: AbortSignal;
   }): Promise<void> {
     if (this.options.settleDelayMs !== undefined) {
-      await sleepUntilSettledOrAborted(this.options.settleDelayMs, input.signal);
+      if (this.options.ignoreSettleAbort) await sleep(this.options.settleDelayMs);
+      else await sleepUntilSettledOrAborted(this.options.settleDelayMs, input.signal);
     }
-    if (input.signal?.aborted) throw new Error('settlement aborted');
+    if (input.signal?.aborted && !this.options.ignoreSettleAbort)
+      throw new Error('settlement aborted');
     this.settled.push(input);
   }
 
@@ -1913,6 +2072,25 @@ function onceConnected(socket: ReturnType<typeof createConnection>): Promise<voi
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function waitForRequestCount(expected: number): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (requests.length >= expected) return;
+    await sleep(5);
+  }
+  throw new Error(`Timed out waiting for ${expected} upstream requests.`);
+}
+
+async function waitForReserveAttempts(
+  client: RecordingBudgetClient,
+  expected: number
+): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (client.reserveAttempts >= expected) return;
+    await sleep(5);
+  }
+  throw new Error(`Timed out waiting for ${expected} reservation attempts.`);
 }
 
 function assertIncludes(value: string, expected: string): void {

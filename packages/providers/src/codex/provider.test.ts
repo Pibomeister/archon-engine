@@ -1233,6 +1233,26 @@ describe('CodexProvider', () => {
       expect(call.env.DATABASE_URL).toBeUndefined();
     });
 
+    test('host execution still forwards explicit CODEX_HOME request config', async () => {
+      mockRunStreamed.mockResolvedValue({
+        events: (async function* () {
+          yield { type: 'turn.completed', usage: defaultUsage };
+        })(),
+      });
+
+      for await (const _ of client.sendQuery('test prompt', '/workspace', undefined, {
+        env: { CODEX_HOME: '/host/subscription-home' },
+        execContext: { kind: 'host' },
+      })) {
+        void _;
+      }
+
+      const call = MockCodex.mock.calls[0][0] as { env: Record<string, string> };
+      expect(call.env.CODEX_HOME).toBe('/host/subscription-home');
+      expect(mockStartThread).toHaveBeenCalledTimes(1);
+      expect(mockRunStreamed).toHaveBeenCalledTimes(1);
+    });
+
     test('container execution pins the sealed OpenAI origin when request env omits base URL', async () => {
       mockRunStreamed.mockResolvedValue({
         events: (async function* () {
@@ -1315,6 +1335,35 @@ describe('CodexProvider', () => {
       expect(call.env.OPENAI_BASE_URL).toBe('https://api.openai.com/v1');
     });
 
+    test('hardened container ignores ambient CODEX_HOME for explicit API-key auth', async () => {
+      const originalCodexHome = process.env.CODEX_HOME;
+      process.env.CODEX_HOME = '/host/ambient-codex-home';
+      mockRunStreamed.mockResolvedValue({
+        events: (async function* () {
+          yield { type: 'turn.completed', usage: defaultUsage };
+        })(),
+      });
+
+      try {
+        for await (const _ of client.sendQuery('test prompt', '/workspace', undefined, {
+          env: { OPENAI_API_KEY: 'explicit-openai' },
+          execContext: SEALED_OPENAI_EXEC_CONTEXT,
+        })) {
+          void _;
+        }
+
+        const call = MockCodex.mock.calls[0][0] as { env: Record<string, string> };
+        expect(call.env.OPENAI_API_KEY).toBe('explicit-openai');
+        expect(call.env.CODEX_HOME).toBeUndefined();
+        expect(Object.values(call.env)).not.toContain('/host/ambient-codex-home');
+        expect(mockStartThread).toHaveBeenCalledTimes(1);
+        expect(mockRunStreamed).toHaveBeenCalledTimes(1);
+      } finally {
+        if (originalCodexHome === undefined) delete process.env.CODEX_HOME;
+        else process.env.CODEX_HOME = originalCodexHome;
+      }
+    });
+
     test('container execution rejects hostile OpenAI base URL overrides before SDK setup', async () => {
       const hostileUrls = [
         'http://127.0.0.1:3141/v1',
@@ -1335,6 +1384,36 @@ describe('CodexProvider', () => {
 
         await expect(consumeGenerator()).rejects.toThrow(/exact HTTPS|controller-sealed/);
       }
+      expect(MockCodex).not.toHaveBeenCalled();
+      expect(mockStartThread).not.toHaveBeenCalled();
+      expect(mockRunStreamed).not.toHaveBeenCalled();
+    });
+
+    test.each([
+      ['non-empty CODEX_HOME', { CODEX_HOME: '/host/subscription-home' }],
+      ['empty CODEX_HOME', { CODEX_HOME: '' }],
+      [
+        'mixed CODEX_HOME and OPENAI_API_KEY',
+        { CODEX_HOME: '/host/subscription-home', OPENAI_API_KEY: 'explicit-openai-key' },
+      ],
+    ])('hardened container rejects explicit %s before SDK setup', async (_, env) => {
+      const consumeGenerator = async (): Promise<void> => {
+        for await (const _ of client.sendQuery('test prompt', '/workspace', undefined, {
+          env,
+          nodeConfig: { mcp: 'missing-mcp.json' },
+          execContext: SEALED_OPENAI_EXEC_CONTEXT,
+        })) {
+          void _;
+        }
+      };
+
+      const error = await consumeGenerator().catch((err: unknown) => err as Error);
+      expect(error.message).toBe(
+        'Codex subscription configuration is not admitted for hardened container execution: an enforceable subscription output cap has not been verified.'
+      );
+      expect(error.message).not.toContain('/host/subscription-home');
+      expect(error.message).not.toContain('explicit-openai-key');
+      expect(error.message).not.toMatch(/paid|billing|upgrade|switch/i);
       expect(MockCodex).not.toHaveBeenCalled();
       expect(mockStartThread).not.toHaveBeenCalled();
       expect(mockRunStreamed).not.toHaveBeenCalled();

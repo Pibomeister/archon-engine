@@ -3,17 +3,32 @@ import { existsSync, mkdirSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { dirname } from 'node:path';
 
-export interface ProxyBudgetGrant {
-  schema: 'archon.proxy-budget-grant.v1';
-  rootChainId: string;
+export interface ProxyBudgetWorkflowBinding {
   runId: string;
   workflowDigest: string;
   policyDigest: string;
+}
+
+export interface ProxyBudgetGrantV1 extends ProxyBudgetWorkflowBinding {
+  schema: 'archon.proxy-budget-grant.v1';
+  rootChainId: string;
   deadlineEpochMs: number;
   inputTokenLimit: number;
   outputTokenLimit: number;
   totalTokenLimit: number;
 }
+
+export interface ProxyBudgetGrantV2 {
+  schema: 'archon.proxy-budget-grant.v2';
+  rootChainId: string;
+  deadlineEpochMs: number;
+  inputTokenLimit: number;
+  outputTokenLimit: number;
+  totalTokenLimit: number;
+  workflowBindings: readonly ProxyBudgetWorkflowBinding[];
+}
+
+export type ProxyBudgetGrant = ProxyBudgetGrantV1 | ProxyBudgetGrantV2;
 
 export interface ProxyBudgetLedgerOptions {
   mode: 'create' | 'resume' | 'status';
@@ -26,6 +41,7 @@ export interface ReserveBudgetInput {
   inputCeiling: number;
   outputCeiling: number;
   nowMs?: number;
+  workflowBinding?: ProxyBudgetWorkflowBinding;
 }
 
 export interface BudgetReservation {
@@ -35,17 +51,20 @@ export interface BudgetReservation {
   outputCeiling: number;
   status: 'pending' | 'settled' | 'unknown';
   createdAtMs: number;
+  workflowBinding: ProxyBudgetWorkflowBinding;
 }
 
 export interface SettleBudgetInput {
   reservationId: string;
   inputTokens: number;
   outputTokens: number;
+  workflowBinding?: ProxyBudgetWorkflowBinding;
 }
 
 export interface MarkReservationUnknownInput {
   reservationId: string;
   reason: string;
+  workflowBinding?: ProxyBudgetWorkflowBinding;
 }
 
 export interface BudgetStatus {
@@ -73,6 +92,10 @@ interface ReservationRow {
   status: 'pending' | 'settled' | 'unknown';
   created_at_ms: number;
   unknown_reason: string | null;
+  run_id?: string;
+  workflow_digest?: string;
+  policy_digest?: string;
+  binding_digest?: string;
 }
 
 interface SettlementRow {
@@ -87,8 +110,10 @@ interface UsageTotals {
   total: number;
 }
 
-const SCHEMA_VERSION = '1';
+const SCHEMA_VERSION_V1 = '1';
+const SCHEMA_VERSION_V2 = '2';
 const MAX_REASON_BYTES = 512;
+const BINDING_KEYS = ['runId', 'workflowDigest', 'policyDigest'] as const;
 
 export class ProxyBudgetLedger {
   private readonly db: Database;
@@ -98,7 +123,7 @@ export class ProxyBudgetLedger {
 
   private constructor(db: Database, grant: ProxyBudgetGrant) {
     this.db = db;
-    this.grant = Object.freeze({ ...grant });
+    this.grant = freezeGrant(grant);
     this.grantDigest = digestJson(this.grant);
   }
 
@@ -122,6 +147,7 @@ export class ProxyBudgetLedger {
 
   reserveBudget(input: ReserveBudgetInput): BudgetReservation {
     this.assertOpen();
+    const binding = this.authorizeBinding(input.workflowBinding);
     const requestHash = normalizeBoundedString(input.requestHash, 'Request hash', 256);
     const inputCeiling = assertPositiveSafeInteger(input.inputCeiling, 'Input reservation ceiling');
     const outputCeiling = assertPositiveSafeInteger(
@@ -130,13 +156,12 @@ export class ProxyBudgetLedger {
     );
     const nowMs = assertNow(input.nowMs ?? Date.now());
     return this.writeTransaction(() => {
-      this.assertMetadataBinding();
       this.assertDeadline(nowMs);
       this.assertNoUnsafeOpenReservations();
       const totals = this.calculateUsageTotals();
+      const reserveTotal = safeAdd(inputCeiling, outputCeiling, 'Reservation total');
       assertCanAdd(totals.input, inputCeiling, 'Input reservation total');
       assertCanAdd(totals.output, outputCeiling, 'Output reservation total');
-      const reserveTotal = safeAdd(inputCeiling, outputCeiling, 'Reservation total');
       assertCanAdd(totals.total, reserveTotal, 'Overall reservation total');
       if (totals.input + inputCeiling > this.grant.inputTokenLimit) {
         throw new Error('Input token budget exhausted.');
@@ -148,39 +173,64 @@ export class ProxyBudgetLedger {
         throw new Error('Total token budget exhausted.');
       }
       const reservationId = randomUUID();
-      this.db
-        .query(
-          `INSERT INTO proxy_budget_reservations
-           (id, request_hash, input_ceiling, output_ceiling, status, created_at_ms)
-           VALUES (?, ?, ?, ?, 'pending', ?)`
-        )
-        .run(reservationId, requestHash, inputCeiling, outputCeiling, nowMs);
-      return {
-        reservationId,
-        requestHash,
-        inputCeiling,
-        outputCeiling,
-        status: 'pending',
-        createdAtMs: nowMs,
-      };
+      if (isV2Grant(this.grant)) {
+        const bindingDigest = this.bindingDigest(reservationId, binding);
+        this.db
+          .query(
+            `INSERT INTO proxy_budget_reservations
+             (id, request_hash, input_ceiling, output_ceiling, status, created_at_ms, run_id, workflow_digest, policy_digest, binding_digest)
+             VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)`
+          )
+          .run(
+            reservationId,
+            requestHash,
+            inputCeiling,
+            outputCeiling,
+            nowMs,
+            binding.runId,
+            binding.workflowDigest,
+            binding.policyDigest,
+            bindingDigest
+          );
+      } else {
+        this.db
+          .query(
+            `INSERT INTO proxy_budget_reservations
+             (id, request_hash, input_ceiling, output_ceiling, status, created_at_ms)
+             VALUES (?, ?, ?, ?, 'pending', ?)`
+          )
+          .run(reservationId, requestHash, inputCeiling, outputCeiling, nowMs);
+      }
+      return rowToReservation(
+        {
+          id: reservationId,
+          request_hash: requestHash,
+          input_ceiling: inputCeiling,
+          output_ceiling: outputCeiling,
+          status: 'pending',
+          created_at_ms: nowMs,
+          unknown_reason: null,
+        },
+        binding
+      );
     });
   }
 
   settleBudget(input: SettleBudgetInput): BudgetReservation {
     this.assertOpen();
+    const binding = this.authorizeBinding(input.workflowBinding);
     const reservationId = normalizeBoundedString(input.reservationId, 'Reservation ID', 128);
     const inputTokens = assertNonNegativeSafeInteger(input.inputTokens, 'Settled input tokens');
     const outputTokens = assertNonNegativeSafeInteger(input.outputTokens, 'Settled output tokens');
     return this.writeTransaction(() => {
-      this.assertMetadataBinding();
-      const reservation = this.requireReservation(reservationId);
+      const reservation = this.requireReservation(reservationId, binding);
       if (reservation.status === 'unknown')
         throw new Error('Unknown reservation cannot be settled.');
       assertWithinReservation(inputTokens, outputTokens, reservation);
       const existing = this.findSettlement(reservationId);
       if (existing) {
         assertSameSettlement(existing, inputTokens, outputTokens);
-        return rowToReservation({ ...reservation, status: 'settled' });
+        return rowToReservation({ ...reservation, status: 'settled' }, binding);
       }
       if (reservation.status !== 'pending')
         throw new Error('Reservation has invalid settlement state.');
@@ -192,17 +242,17 @@ export class ProxyBudgetLedger {
       this.db
         .query("UPDATE proxy_budget_reservations SET status = 'settled' WHERE id = ?")
         .run(reservationId);
-      return rowToReservation({ ...reservation, status: 'settled' });
+      return rowToReservation({ ...reservation, status: 'settled' }, binding);
     });
   }
 
   markReservationUnknown(input: MarkReservationUnknownInput): BudgetReservation {
     this.assertOpen();
+    const binding = this.authorizeBinding(input.workflowBinding);
     const reservationId = normalizeBoundedString(input.reservationId, 'Reservation ID', 128);
     const reason = normalizeBoundedString(input.reason, 'Unknown reason', MAX_REASON_BYTES);
     return this.writeTransaction(() => {
-      this.assertMetadataBinding();
-      const reservation = this.requireReservation(reservationId);
+      const reservation = this.requireReservation(reservationId, binding);
       if (reservation.status === 'settled')
         throw new Error('Settled reservation cannot be marked unknown.');
       this.db
@@ -210,18 +260,26 @@ export class ProxyBudgetLedger {
           "UPDATE proxy_budget_reservations SET status = 'unknown', unknown_reason = ? WHERE id = ?"
         )
         .run(reason, reservationId);
-      return rowToReservation({ ...reservation, status: 'unknown', unknown_reason: reason });
+      return rowToReservation(
+        { ...reservation, status: 'unknown', unknown_reason: reason },
+        binding
+      );
     });
   }
 
-  getReservation(reservationId: string): BudgetReservation {
+  getReservation(
+    reservationId: string,
+    workflowBinding?: ProxyBudgetWorkflowBinding
+  ): BudgetReservation {
     this.assertOpen();
+    const binding = this.authorizeBinding(workflowBinding);
     this.assertMetadataBinding();
     const reservation = this.requireReservation(
-      normalizeBoundedString(reservationId, 'Reservation ID', 128)
+      normalizeBoundedString(reservationId, 'Reservation ID', 128),
+      binding
     );
     this.assertCompleteReservationIntegrity(reservation);
-    return rowToReservation(reservation);
+    return rowToReservation(reservation, binding);
   }
 
   getBudgetStatus(): BudgetStatus {
@@ -232,7 +290,7 @@ export class ProxyBudgetLedger {
       const pendingReservations = this.countReservations('pending');
       const unknownReservations = this.countReservations('unknown');
       return {
-        grant: { ...this.grant },
+        grant: cloneGrant(this.grant),
         pendingReservations,
         unknownReservations,
         consumedInputTokens: totals.input,
@@ -269,7 +327,7 @@ export class ProxyBudgetLedger {
         if (exists) throw new Error('Budget ledger already initialized.');
         if (this.userTableCount() > 0) throw new Error('Budget ledger create target is not empty.');
         this.createSchema();
-        this.writeMetadata('schema_version', SCHEMA_VERSION);
+        this.writeMetadata('schema_version', schemaVersionForGrant(this.grant));
         this.writeMetadata('grant_digest', this.grantDigest);
         this.writeMetadata('grant_json', JSON.stringify(this.grant));
       } else {
@@ -284,6 +342,13 @@ export class ProxyBudgetLedger {
   }
 
   private createSchema(): void {
+    const bindingColumns = isV2Grant(this.grant)
+      ? `,
+        run_id TEXT NOT NULL,
+        workflow_digest TEXT NOT NULL,
+        policy_digest TEXT NOT NULL,
+        binding_digest TEXT NOT NULL`
+      : '';
     this.db.exec(`
       CREATE TABLE proxy_budget_metadata (
         key TEXT PRIMARY KEY,
@@ -296,7 +361,7 @@ export class ProxyBudgetLedger {
         output_ceiling INTEGER NOT NULL CHECK (output_ceiling > 0),
         status TEXT NOT NULL CHECK (status IN ('pending', 'settled', 'unknown')),
         created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
-        unknown_reason TEXT
+        unknown_reason TEXT${bindingColumns}
       );
       CREATE TABLE proxy_budget_settlements (
         reservation_id TEXT PRIMARY KEY REFERENCES proxy_budget_reservations(id),
@@ -310,39 +375,55 @@ export class ProxyBudgetLedger {
     const version = this.readMetadata('schema_version');
     const digest = this.readMetadata('grant_digest');
     const grantJson = this.readMetadata('grant_json');
-    if (version !== SCHEMA_VERSION) throw new Error('Unsupported budget ledger schema version.');
+    if (version !== schemaVersionForGrant(this.grant))
+      throw new Error('Unsupported budget ledger schema version.');
     if (digest !== this.grantDigest) throw new Error('Budget grant binding drift detected.');
     try {
-      if (digestJson(JSON.parse(grantJson)) !== this.grantDigest) {
+      const storedGrant = normalizeGrant(JSON.parse(grantJson) as ProxyBudgetGrant);
+      if (digestJson(storedGrant) !== this.grantDigest)
         throw new Error('Budget grant private state is malformed.');
-      }
     } catch (error) {
       if (error instanceof SyntaxError) throw new Error('Budget grant private state is malformed.');
       throw error;
     }
   }
 
+  private authorizeBinding(
+    input: ProxyBudgetWorkflowBinding | undefined
+  ): ProxyBudgetWorkflowBinding {
+    if (!isV2Grant(this.grant) && input === undefined) return rootBinding(this.grant);
+    const binding = normalizeWorkflowBinding(input, 'Workflow binding');
+    if (!grantContainsBinding(this.grant, binding))
+      throw new Error('Workflow binding is not authorized by the budget grant.');
+    return binding;
+  }
+
   private calculateUsageTotals(): UsageTotals {
+    const bindingFields = isV2Grant(this.grant)
+      ? 'r.run_id, r.workflow_digest, r.policy_digest, r.binding_digest'
+      : 'NULL AS run_id, NULL AS workflow_digest, NULL AS policy_digest, NULL AS binding_digest';
     const rows = this.db
       .query(
-        `SELECT r.input_ceiling, r.output_ceiling, r.status, s.input_tokens, s.output_tokens
+        `SELECT r.id, r.request_hash, r.input_ceiling, r.output_ceiling, r.status,
+                r.created_at_ms, r.unknown_reason, ${bindingFields},
+                s.input_tokens, s.output_tokens
          FROM proxy_budget_reservations r
          LEFT JOIN proxy_budget_settlements s ON s.reservation_id = r.id`
       )
-      .all() as {
+      .all() as (ReservationRow & {
       input_ceiling: number;
       output_ceiling: number;
       status: string;
       input_tokens: number | null;
       output_tokens: number | null;
-    }[];
+    })[];
     let input = 0;
     let output = 0;
     for (const row of rows) {
-      const rowInput = usageInput(row);
-      const rowOutput = usageOutput(row);
-      input = safeAdd(input, rowInput, 'Ledger input usage');
-      output = safeAdd(output, rowOutput, 'Ledger output usage');
+      assertReservationRow(row);
+      this.assertV2BindingIntegrity(row);
+      input = safeAdd(input, usageInput(row), 'Ledger input usage');
+      output = safeAdd(output, usageOutput(row), 'Ledger output usage');
     }
     const total = safeAdd(input, output, 'Ledger total usage');
     this.assertTotalsWithinGrant({ input, output, total });
@@ -366,12 +447,10 @@ export class ProxyBudgetLedger {
   }
 
   private assertNoUnsafeOpenReservations(): void {
-    if (this.countReservations('pending') > 0) {
+    if (this.countReservations('pending') > 0)
       throw new Error('Pending budget reservation blocks additional requests.');
-    }
-    if (this.countReservations('unknown') > 0) {
+    if (this.countReservations('unknown') > 0)
       throw new Error('Unknown budget reservation blocks additional requests.');
-    }
   }
 
   private countReservations(status: 'pending' | 'unknown'): number {
@@ -381,16 +460,22 @@ export class ProxyBudgetLedger {
     return assertNonNegativeSafeInteger(row.count, 'Reservation count');
   }
 
-  private requireReservation(id: string): ReservationRow {
-    const row = this.db
-      .query(
-        `SELECT id, request_hash, input_ceiling, output_ceiling, status, created_at_ms, unknown_reason
-         FROM proxy_budget_reservations WHERE id = ?`
-      )
-      .get(id) as ReservationRow | null;
+  private requireReservation(id: string, binding: ProxyBudgetWorkflowBinding): ReservationRow {
+    const row = this.readReservationRow(id);
     if (!row) throw new Error('Budget reservation not found.');
     assertReservationRow(row);
+    this.assertV2BindingIntegrity(row);
+    if (isV2Grant(this.grant)) assertReservationBinding(row, binding);
     return row;
+  }
+
+  private readReservationRow(id: string): ReservationRow | null {
+    const fields = isV2Grant(this.grant)
+      ? 'id, request_hash, input_ceiling, output_ceiling, status, created_at_ms, unknown_reason, run_id, workflow_digest, policy_digest, binding_digest'
+      : 'id, request_hash, input_ceiling, output_ceiling, status, created_at_ms, unknown_reason';
+    return this.db
+      .query(`SELECT ${fields} FROM proxy_budget_reservations WHERE id = ?`)
+      .get(id) as ReservationRow | null;
   }
 
   private findSettlement(reservationId: string): SettlementRow | null {
@@ -399,6 +484,18 @@ export class ProxyBudgetLedger {
         'SELECT reservation_id, input_tokens, output_tokens FROM proxy_budget_settlements WHERE reservation_id = ?'
       )
       .get(reservationId) as SettlementRow | null;
+  }
+
+  private bindingDigest(id: string, binding: ProxyBudgetWorkflowBinding): string {
+    return digestJson({ grantDigest: this.grantDigest, reservationId: id, binding });
+  }
+
+  private assertV2BindingIntegrity(row: ReservationRow): void {
+    if (!isV2Grant(this.grant)) return;
+    const binding = normalizeRowBinding(row);
+    if (row.binding_digest !== this.bindingDigest(row.id, binding)) {
+      throw new Error('Budget ledger private state is malformed.');
+    }
   }
 
   private userTableCount(): number {
@@ -468,6 +565,14 @@ export function createProxyBudgetLedger(options: ProxyBudgetLedgerOptions): Prox
   return ProxyBudgetLedger.open(options);
 }
 
+export function proxyBudgetRootBinding(grant: ProxyBudgetGrant): ProxyBudgetWorkflowBinding {
+  return rootBinding(normalizeGrant(grant));
+}
+
+export function isProxyBudgetGrantV2(grant: ProxyBudgetGrant): grant is ProxyBudgetGrantV2 {
+  return grant.schema === 'archon.proxy-budget-grant.v2';
+}
+
 function configureDatabase(db: Database, mode: 'create' | 'resume' | 'status'): void {
   if (mode !== 'status') db.exec('PRAGMA journal_mode = WAL');
   db.exec('PRAGMA synchronous = FULL');
@@ -476,23 +581,29 @@ function configureDatabase(db: Database, mode: 'create' | 'resume' | 'status'): 
 }
 
 function normalizeGrant(input: ProxyBudgetGrant): ProxyBudgetGrant {
-  if (!input || typeof input !== 'object') throw new Error('Budget grant must be an object.');
-  const allowedKeys = [
-    'schema',
-    'rootChainId',
-    'runId',
-    'workflowDigest',
-    'policyDigest',
-    'deadlineEpochMs',
-    'inputTokenLimit',
-    'outputTokenLimit',
-    'totalTokenLimit',
-  ];
-  if (Object.keys(input).some(key => !allowedKeys.includes(key))) {
-    throw new Error('Budget grant contains unsupported settings.');
-  }
-  if (input.schema !== 'archon.proxy-budget-grant.v1')
-    throw new Error('Unsupported budget grant schema.');
+  if (!input || typeof input !== 'object' || Array.isArray(input))
+    throw new Error('Budget grant must be an object.');
+  if (input.schema === 'archon.proxy-budget-grant.v1') return normalizeV1Grant(input);
+  if (input.schema === 'archon.proxy-budget-grant.v2') return normalizeV2Grant(input);
+  throw new Error('Unsupported budget grant schema.');
+}
+
+function normalizeV1Grant(input: ProxyBudgetGrantV1): ProxyBudgetGrantV1 {
+  assertExactKeys(
+    input as unknown as Record<string, unknown>,
+    [
+      'schema',
+      'rootChainId',
+      'runId',
+      'workflowDigest',
+      'policyDigest',
+      'deadlineEpochMs',
+      'inputTokenLimit',
+      'outputTokenLimit',
+      'totalTokenLimit',
+    ],
+    'Budget grant'
+  );
   return {
     schema: input.schema,
     rootChainId: normalizeBoundedString(input.rootChainId, 'Root chain ID', 256),
@@ -504,6 +615,156 @@ function normalizeGrant(input: ProxyBudgetGrant): ProxyBudgetGrant {
     outputTokenLimit: assertNonNegativeSafeInteger(input.outputTokenLimit, 'Output token limit'),
     totalTokenLimit: assertNonNegativeSafeInteger(input.totalTokenLimit, 'Total token limit'),
   };
+}
+
+function normalizeV2Grant(input: ProxyBudgetGrantV2): ProxyBudgetGrantV2 {
+  assertExactKeys(
+    input as unknown as Record<string, unknown>,
+    [
+      'schema',
+      'rootChainId',
+      'deadlineEpochMs',
+      'inputTokenLimit',
+      'outputTokenLimit',
+      'totalTokenLimit',
+      'workflowBindings',
+    ],
+    'Budget grant'
+  );
+  const bindings = normalizeWorkflowBindings(input.workflowBindings);
+  const grant = {
+    schema: input.schema,
+    rootChainId: normalizeBoundedString(input.rootChainId, 'Root chain ID', 256),
+    deadlineEpochMs: assertPositiveSafeInteger(input.deadlineEpochMs, 'Grant deadline'),
+    inputTokenLimit: assertNonNegativeSafeInteger(input.inputTokenLimit, 'Input token limit'),
+    outputTokenLimit: assertNonNegativeSafeInteger(input.outputTokenLimit, 'Output token limit'),
+    totalTokenLimit: assertNonNegativeSafeInteger(input.totalTokenLimit, 'Total token limit'),
+    workflowBindings: bindings,
+  };
+  assertWorkflowBindingsContainRoot(grant);
+  return grant;
+}
+
+function normalizeWorkflowBindings(
+  input: readonly ProxyBudgetWorkflowBinding[]
+): ProxyBudgetWorkflowBinding[] {
+  if (!Array.isArray(input) || input.length === 0)
+    throw new Error('Workflow bindings must be a non-empty array.');
+  const seen = new Set<string>();
+  let previous = '';
+  return input.map((member, index) => {
+    const binding = normalizeWorkflowBinding(member, 'Workflow binding');
+    const orderKey = bindingOrderKey(binding);
+    if (seen.has(binding.runId)) throw new Error('Workflow bindings must be unique by run ID.');
+    if (index > 0 && previous >= orderKey)
+      throw new Error('Workflow bindings must be sorted and unique.');
+    previous = orderKey;
+    seen.add(binding.runId);
+    return binding;
+  });
+}
+
+function normalizeWorkflowBinding(
+  input: ProxyBudgetWorkflowBinding | undefined,
+  label: string
+): ProxyBudgetWorkflowBinding {
+  if (!input || typeof input !== 'object' || Array.isArray(input))
+    throw new Error(`${label} must be an object.`);
+  assertExactKeys(input as unknown as Record<string, unknown>, [...BINDING_KEYS], label);
+  return {
+    runId: normalizeBoundedString(input.runId, 'Run ID', 256),
+    workflowDigest: normalizeBoundedString(input.workflowDigest, 'Workflow digest', 256),
+    policyDigest: normalizeBoundedString(input.policyDigest, 'Policy digest', 256),
+  };
+}
+
+function assertWorkflowBindingsContainRoot(grant: ProxyBudgetGrantV2): void {
+  if (!grant.workflowBindings.some(binding => binding.runId === grant.rootChainId)) {
+    throw new Error('Workflow bindings must contain the root chain ID.');
+  }
+}
+
+function grantContainsBinding(
+  grant: ProxyBudgetGrant,
+  binding: ProxyBudgetWorkflowBinding
+): boolean {
+  const bindings = isV2Grant(grant) ? grant.workflowBindings : [rootBinding(grant)];
+  return bindings.some(member => bindingsEqual(member, binding));
+}
+
+function rootBinding(grant: ProxyBudgetGrant): ProxyBudgetWorkflowBinding {
+  if (isV2Grant(grant)) {
+    const binding = grant.workflowBindings.find(member => member.runId === grant.rootChainId);
+    if (!binding) throw new Error('Budget grant private state is malformed.');
+    return binding;
+  }
+  return {
+    runId: grant.runId,
+    workflowDigest: grant.workflowDigest,
+    policyDigest: grant.policyDigest,
+  };
+}
+
+function bindingOrderKey(binding: ProxyBudgetWorkflowBinding): string {
+  return `${binding.runId}\u0000${binding.workflowDigest}\u0000${binding.policyDigest}`;
+}
+
+function bindingsEqual(
+  left: ProxyBudgetWorkflowBinding,
+  right: ProxyBudgetWorkflowBinding
+): boolean {
+  return (
+    left.runId === right.runId &&
+    left.workflowDigest === right.workflowDigest &&
+    left.policyDigest === right.policyDigest
+  );
+}
+
+function assertReservationBinding(row: ReservationRow, binding: ProxyBudgetWorkflowBinding): void {
+  const rowBinding = normalizeRowBinding(row);
+  if (!bindingsEqual(rowBinding, binding))
+    throw new Error('Budget reservation is not scoped to this workflow binding.');
+}
+
+function normalizeRowBinding(row: ReservationRow): ProxyBudgetWorkflowBinding {
+  return {
+    runId: normalizeBoundedString(row.run_id ?? '', 'Reservation run ID', 256),
+    workflowDigest: normalizeBoundedString(
+      row.workflow_digest ?? '',
+      'Reservation workflow digest',
+      256
+    ),
+    policyDigest: normalizeBoundedString(row.policy_digest ?? '', 'Reservation policy digest', 256),
+  };
+}
+
+function schemaVersionForGrant(grant: ProxyBudgetGrant): string {
+  return isV2Grant(grant) ? SCHEMA_VERSION_V2 : SCHEMA_VERSION_V1;
+}
+
+function isV2Grant(grant: ProxyBudgetGrant): grant is ProxyBudgetGrantV2 {
+  return grant.schema === 'archon.proxy-budget-grant.v2';
+}
+
+function cloneGrant(grant: ProxyBudgetGrant): ProxyBudgetGrant {
+  return isV2Grant(grant)
+    ? { ...grant, workflowBindings: grant.workflowBindings.map(binding => ({ ...binding })) }
+    : { ...grant };
+}
+
+function freezeGrant(grant: ProxyBudgetGrant): ProxyBudgetGrant {
+  if (!isV2Grant(grant)) return Object.freeze({ ...grant });
+  const workflowBindings = grant.workflowBindings.map(binding => Object.freeze({ ...binding }));
+  return Object.freeze({ ...grant, workflowBindings: Object.freeze(workflowBindings) });
+}
+
+function assertExactKeys(
+  record: Record<string, unknown>,
+  allowedKeys: readonly string[],
+  label: string
+): void {
+  if (Object.keys(record).some(key => !allowedKeys.includes(key)))
+    throw new Error(`${label} contains unsupported settings.`);
 }
 
 function normalizeBoundedString(input: string, label: string, maxBytes: number): string {
@@ -615,35 +876,38 @@ function assertUsageRow(row: {
     );
     return;
   }
-  if (row.input_tokens !== null || row.output_tokens !== null) {
+  if (row.input_tokens !== null || row.output_tokens !== null)
     throw new Error('Budget ledger private state is malformed.');
-  }
 }
 
 function assertReservationRow(row: ReservationRow): void {
-  if (!['pending', 'settled', 'unknown'].includes(row.status)) {
-    throw new Error('Budget ledger private state is malformed.');
-  }
+  normalizeBoundedString(row.id, 'Reservation ID', 128);
+  normalizeBoundedString(row.request_hash, 'Request hash', 256);
   assertPositiveSafeInteger(row.input_ceiling, 'Ledger input reservation ceiling');
   assertPositiveSafeInteger(row.output_ceiling, 'Ledger output reservation ceiling');
-  assertNonNegativeSafeInteger(row.created_at_ms, 'Ledger reservation timestamp');
+  if (row.status !== 'pending' && row.status !== 'settled' && row.status !== 'unknown') {
+    throw new Error('Budget ledger private state is malformed.');
+  }
+  assertNonNegativeSafeInteger(row.created_at_ms, 'Reservation creation time');
+  if (row.unknown_reason !== null)
+    normalizeBoundedString(row.unknown_reason, 'Unknown reason', MAX_REASON_BYTES);
 }
 
 function assertSettlementRow(settlement: SettlementRow, reservation: ReservationRow): void {
-  const inputTokens = assertNonNegativeSafeInteger(
-    settlement.input_tokens,
-    'Ledger settled input tokens'
-  );
-  const outputTokens = assertNonNegativeSafeInteger(
-    settlement.output_tokens,
-    'Ledger settled output tokens'
-  );
   if (settlement.reservation_id !== reservation.id)
     throw new Error('Budget ledger private state is malformed.');
+  const inputTokens = assertNonNegativeSafeInteger(settlement.input_tokens, 'Settled input tokens');
+  const outputTokens = assertNonNegativeSafeInteger(
+    settlement.output_tokens,
+    'Settled output tokens'
+  );
   assertWithinReservation(inputTokens, outputTokens, reservation);
 }
 
-function rowToReservation(row: ReservationRow): BudgetReservation {
+function rowToReservation(
+  row: ReservationRow,
+  binding: ProxyBudgetWorkflowBinding
+): BudgetReservation {
   return {
     reservationId: row.id,
     requestHash: row.request_hash,
@@ -651,6 +915,7 @@ function rowToReservation(row: ReservationRow): BudgetReservation {
     outputCeiling: row.output_ceiling,
     status: row.status,
     createdAtMs: row.created_at_ms,
+    workflowBinding: { ...binding },
   };
 }
 

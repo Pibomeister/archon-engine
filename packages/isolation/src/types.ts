@@ -14,7 +14,7 @@ import type {
 } from '@archon/providers/types';
 import type { ArtifactSnapshotResult } from './container/artifact-snapshot';
 import type { TrustedProviderBudgetPolicy } from './egress/provider-budget-contract';
-import type { ProxyBudgetGrant } from './egress/proxy-budget-ledger';
+import type { ProxyBudgetGrant, ProxyBudgetGrantV1 } from './egress/proxy-budget-ledger';
 import type { StrictHttpGrant } from './egress/strict-https-proxy';
 
 // Re-exported so isolation consumers can source the execution-context contract
@@ -605,7 +605,7 @@ export interface HardenedProxyBudgetSeed {
 export interface VerifiedProxyBudgetStatus {
   source: 'controller-proxy-ledger';
   envId: string;
-  grant: ProxyBudgetGrant;
+  grant: ProxyBudgetGrantV1;
   consumed: { input: number; output: number };
   pendingReservations: number;
   unknownReservations: number;

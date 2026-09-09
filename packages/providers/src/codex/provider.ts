@@ -362,6 +362,14 @@ function buildMcpEnvSource(
 
 function assertCodexContainerRequestSupported(requestOptions?: SendQueryOptions): void {
   if (requestOptions?.execContext?.kind !== 'container') return;
+  if (
+    requestOptions.execContext.profile === 'hardened' &&
+    Object.hasOwn(requestOptions.env ?? {}, 'CODEX_HOME')
+  ) {
+    throw new Error(
+      'Codex subscription configuration is not admitted for hardened container execution: an enforceable subscription output cap has not been verified.'
+    );
+  }
   if (requestOptions.nodeConfig?.mcp) {
     throw new Error(
       'Codex container execution does not support MCP config until controller-pinned MCP settings are implemented.'

@@ -31,6 +31,12 @@ describe('strict HTTPS CONNECT proxy', () => {
           'ok streams accounted SSE bytes before terminal settlement'
         );
         expect(result.stdout).toContain(
+          'ok serializes two accounting lifecycles and rejects a third waiter'
+        );
+        expect(result.stdout).toContain(
+          'ok removes an aborted accounting waiter without reserving tokens'
+        );
+        expect(result.stdout).toContain(
           'ok preserves fragmented UTF-8 SSE bytes and supports CRLF terminal boundaries'
         );
         expect(result.stdout).toContain(
@@ -41,6 +47,9 @@ describe('strict HTTPS CONNECT proxy', () => {
         );
         expect(result.stdout).toContain(
           'ok holds reservation when downstream cancels while settlement is pending'
+        );
+        expect(result.stdout).toContain(
+          'ok terminal settlement owns the lifecycle while downstream closes'
         );
         expect(result.stdout).toContain(
           'ok holds reservations on unknown provider completion and blocks the chain'

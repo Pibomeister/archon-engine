@@ -106,6 +106,7 @@ async function loadBudgetMaterial(
     image: imageId,
     providerPolicies: policies,
   });
+  assertSingleRunBudgetGrant(grant);
   if (grant.policyDigest !== digest) {
     throw new Error('Strict proxy budget policy digest differs from controller authority.');
   }
@@ -114,7 +115,10 @@ async function loadBudgetMaterial(
     accounting: {
       policies,
       client: createBudgetAdapter(
-        budgetClientFactory({ deadlineEpochMs: grant.deadlineEpochMs }),
+        budgetClientFactory({
+          deadlineEpochMs: grant.deadlineEpochMs,
+          workflowBinding: singleRunBudgetBinding(grant),
+        }),
         grant
       ),
     },
@@ -187,6 +191,28 @@ export function digestProxyBudgetSeed(seed: {
   return digestStable(seed);
 }
 
+function singleRunBudgetBinding(
+  grant: Extract<ProxyBudgetGrant, { schema: 'archon.proxy-budget-grant.v1' }>
+): {
+  runId: string;
+  workflowDigest: string;
+  policyDigest: string;
+} {
+  return {
+    runId: grant.runId,
+    workflowDigest: grant.workflowDigest,
+    policyDigest: grant.policyDigest,
+  };
+}
+
+function assertSingleRunBudgetGrant(
+  grant: ProxyBudgetGrant
+): asserts grant is Extract<ProxyBudgetGrant, { schema: 'archon.proxy-budget-grant.v1' }> {
+  if (grant.schema === 'archon.proxy-budget-grant.v2') {
+    throw new Error('Strict proxy shared-chain budget status is not wired.');
+  }
+}
+
 function digestStable(value: unknown): string {
   return createHash('sha256').update(stableSerialize(value)).digest('hex');
 }
@@ -254,6 +280,7 @@ export async function runStrictHttpsProxyFromEnv(): Promise<void> {
   if (!accounting || !budgetGrant) {
     throw new Error('Strict proxy requires private budget material.');
   }
+  assertSingleRunBudgetGrant(budgetGrant);
   if (process.env.ARCHON_PROXY_BUDGET_POLICY_DIGEST !== budgetGrant.policyDigest) {
     throw new Error('Strict proxy budget digest differs from controller launch binding.');
   }

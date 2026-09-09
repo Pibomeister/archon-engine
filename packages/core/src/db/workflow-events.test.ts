@@ -17,8 +17,8 @@ mock.module('@archon/paths', () => ({
 
 const mockQuery = mock(() => Promise.resolve(createQueryResult([])));
 const mockTxQuery = mock(() => Promise.resolve(createQueryResult([])));
-const mockWithTransaction = mock(
-  <T>(fn: (query: typeof mockTxQuery) => Promise<T>): Promise<T> => fn(mockTxQuery)
+const mockWithTransaction = mock(<T>(fn: (query: typeof mockTxQuery) => Promise<T>): Promise<T> =>
+  fn(mockTxQuery)
 );
 
 // Mock the connection module before importing the module under test

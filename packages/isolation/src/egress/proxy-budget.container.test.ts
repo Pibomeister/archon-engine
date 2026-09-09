@@ -8,7 +8,7 @@ import { join } from 'path';
 import { encodeStrictEgressPolicy } from './strict-policy';
 import { digestBudgetPolicy } from './strict-proxy-launcher';
 import { createEgressTlsMaterial } from './tls-material';
-import type { ProxyBudgetGrant } from './proxy-budget-ledger';
+import type { ProxyBudgetGrant, ProxyBudgetWorkflowBinding } from './proxy-budget-ledger';
 import type { TrustedProviderBudgetPolicy } from './provider-budget-contract';
 
 const ENABLED = process.env.ARCHON_RUN_PROXY_BUDGET_CONTAINER_TEST === '1';
@@ -70,20 +70,62 @@ describe.skipIf(!ENABLED)('proxy budget Docker fixture', () => {
 
   test('fixed Bun CLI and Node client preserve real SQLite reservations across resume', () => {
     const resources = createBudgetResources();
-    stagePrivateMaterial(resources, createGrant(), []);
+    const grant = createGrant();
+    stagePrivateMaterial(resources, grant, []);
 
     const created = runBudgetCli(resources, ['--create'], 'status');
     expect(created).toContain('"consumedInputTokens":0');
     expect(created).toContain('"pendingReservations":0');
 
-    const normal = runClientFixture(resources, 'normal');
+    expect(runClientFixture(resources, 'missing-binding', grant)).toContain(
+      'CLIENT_BINDING_REJECTED=PASS Command payload'
+    );
+    expect(runClientFixture(resources, 'wrong-binding', grant)).toContain(
+      'CLIENT_BINDING_REJECTED=PASS Workflow binding is not authorized'
+    );
+    expect(
+      runBudgetCliWithPayload(resources, 'reserve', {
+        requestHash: 'extra-binding-field',
+        inputCeiling: 1,
+        outputCeiling: 1,
+        workflowBinding: {
+          runId: grant.runId,
+          workflowDigest: grant.workflowDigest,
+          policyDigest: grant.policyDigest,
+          extra: true,
+        },
+      })
+    ).toContain('Command payload contains unsupported settings.');
+
+    const normal = runClientFixture(resources, 'normal', grant);
     expect(normal).toContain('CLIENT_NORMAL=PASS consumed=4/3');
 
-    const pending = runClientFixture(resources, 'reserve-only');
+    const pending = runClientFixture(resources, 'reserve-only', grant);
     expect(pending).toContain('CLIENT_PENDING=PASS');
 
-    const resumed = runClientFixture(resources, 'status-pending');
+    const resumed = runClientFixture(resources, 'status-pending', grant);
     expect(resumed).toContain('CLIENT_STATUS_PENDING=PASS pending=1');
+  }, 90_000);
+
+  test('v2 member clients share one persistent aggregate ledger across containers', () => {
+    const resources = createBudgetResources();
+    const grant = createV2Grant();
+    const [rootBinding, childBinding] = grant.workflowBindings;
+    stagePrivateMaterial(resources, grant, []);
+
+    expect(runBudgetCli(resources, ['--create'], 'status')).toContain('"consumedTotalTokens":0');
+    expect(runClientFixture(resources, 'settle-root', grant, rootBinding)).toContain(
+      'CLIENT_SETTLED=PASS consumed=3/2'
+    );
+    expect(runClientFixture(resources, 'settle-child', grant, childBinding)).toContain(
+      'CLIENT_SETTLED=PASS consumed=7/3'
+    );
+    expect(runClientFixture(resources, 'status-v2', grant, rootBinding)).toContain(
+      'CLIENT_V2_STATUS=PASS consumed=7/3 total=10'
+    );
+    expect(runClientFixture(resources, 'exhaust-v2', grant, childBinding)).toContain(
+      'CLIENT_V2_EXHAUSTED=PASS Total token budget exhausted.'
+    );
   }, 90_000);
 
   test('resume refuses missing database, grant drift, and agent containers cannot read ledger volume', () => {
@@ -182,6 +224,30 @@ function createGrant(overrides: Partial<ProxyBudgetGrant> = {}): ProxyBudgetGran
     totalTokenLimit: 1_200,
   };
   return { ...base, ...overrides };
+}
+
+function createV2Grant(): Extract<ProxyBudgetGrant, { schema: 'archon.proxy-budget-grant.v2' }> {
+  const policyDigest = digestBudgetPolicy({ egressPolicyB64, image, providerPolicies });
+  return {
+    schema: 'archon.proxy-budget-grant.v2',
+    rootChainId: 'a-root-container-test',
+    deadlineEpochMs: Date.now() + 120_000,
+    inputTokenLimit: 20,
+    outputTokenLimit: 10,
+    totalTokenLimit: 12,
+    workflowBindings: [
+      {
+        runId: 'a-root-container-test',
+        workflowDigest: 'sha256:workflow-root-container-test',
+        policyDigest,
+      },
+      {
+        runId: 'b-child-container-test',
+        workflowDigest: 'sha256:workflow-child-container-test',
+        policyDigest,
+      },
+    ],
+  };
 }
 
 function stagePrivateMaterial(
@@ -285,6 +351,17 @@ function runBudgetCli(resources: BudgetResources, cliArgs: string[], command: st
   );
 }
 
+function runBudgetCliWithPayload(
+  resources: BudgetResources,
+  command: string,
+  payload: object
+): string {
+  return dockerRunWithInput(
+    budgetCliArgs(resources, []),
+    `${JSON.stringify({ id: 'binding-negative', command, payload })}\n`
+  );
+}
+
 function runBudgetCliExpectFailure(
   resources: BudgetResources,
   cliArgs: string[],
@@ -323,12 +400,17 @@ function budgetCliArgs(resources: BudgetResources, cliArgs: string[]): string[] 
   ];
 }
 
-function runClientFixture(resources: BudgetResources, mode: string): string {
+function runClientFixture(
+  resources: BudgetResources,
+  mode: string,
+  grant: ProxyBudgetGrant,
+  workflowBinding?: ProxyBudgetWorkflowBinding
+): string {
   const dir = mkdtempSync(join(tmpdir(), 'archon-proxy-budget-fixture-'));
   ownedDirs.push(dir);
   const entry = join(dir, 'fixture.ts');
   const output = join(dir, 'proxy-budget-client-fixture.mjs');
-  writeFileSync(entry, clientFixtureSource(mode));
+  writeFileSync(entry, clientFixtureSource(mode, grant, workflowBinding));
   const build = spawnSync('bun', ['build', entry, '--target=node', '--outfile', output], {
     encoding: 'utf8',
     timeout: 30_000,
@@ -369,12 +451,34 @@ function runClientFixture(resources: BudgetResources, mode: string): string {
   return docker(['start', '-a', name]);
 }
 
-function clientFixtureSource(mode: string): string {
+function clientFixtureSource(
+  mode: string,
+  grant: ProxyBudgetGrant,
+  explicitBinding?: ProxyBudgetWorkflowBinding
+): string {
+  const workflowBinding = explicitBinding ?? v1FixtureBinding(grant);
+  const selectedBinding =
+    mode === 'missing-binding'
+      ? undefined
+      : mode === 'wrong-binding'
+        ? { ...workflowBinding, runId: 'wrong-run' }
+        : workflowBinding;
   return `
 import { createProxyBudgetClient } from ${JSON.stringify(CLIENT_SOURCE)};
-const client = createProxyBudgetClient({ deadlineEpochMs: Date.now() + 60000 });
+const client = createProxyBudgetClient({
+  deadlineEpochMs: Date.now() + 60000,
+  workflowBinding: ${JSON.stringify(selectedBinding)},
+});
 await client.ready();
-if (${JSON.stringify(mode)} === 'normal') {
+if (${JSON.stringify(mode)} === 'missing-binding' || ${JSON.stringify(mode)} === 'wrong-binding') {
+  try {
+    await client.reserveBudget({ requestHash: 'binding-negative', inputCeiling: 1, outputCeiling: 1 });
+    process.exit(2);
+  } catch (error) {
+    console.log('CLIENT_BINDING_REJECTED=PASS ' + error.message);
+    await client.close();
+  }
+} else if (${JSON.stringify(mode)} === 'normal') {
   const first = await client.reserveBudget({ requestHash: 'repeat', inputCeiling: 10, outputCeiling: 5 });
   await client.settleBudget({ reservationId: first.reservationId, inputTokens: 3, outputTokens: 2 });
   const second = await client.reserveBudget({ requestHash: 'repeat', inputCeiling: 10, outputCeiling: 5 });
@@ -386,12 +490,41 @@ if (${JSON.stringify(mode)} === 'normal') {
   await client.reserveBudget({ requestHash: 'pending', inputCeiling: 10, outputCeiling: 5 });
   console.log('CLIENT_PENDING=PASS');
   process.exit(0);
+} else if (${JSON.stringify(mode)} === 'settle-root' || ${JSON.stringify(mode)} === 'settle-child') {
+  const usage = ${JSON.stringify(mode)} === 'settle-root' ? { input: 3, output: 2 } : { input: 4, output: 1 };
+  const reservation = await client.reserveBudget({ requestHash: ${JSON.stringify(mode)}, inputCeiling: 5, outputCeiling: 2 });
+  await client.settleBudget({ reservationId: reservation.reservationId, inputTokens: usage.input, outputTokens: usage.output });
+  const status = await client.getBudgetStatus();
+  console.log('CLIENT_SETTLED=PASS consumed=' + status.consumedInputTokens + '/' + status.consumedOutputTokens);
+  await client.close();
+} else if (${JSON.stringify(mode)} === 'status-v2') {
+  const status = await client.getBudgetStatus();
+  console.log('CLIENT_V2_STATUS=PASS consumed=' + status.consumedInputTokens + '/' + status.consumedOutputTokens + ' total=' + status.consumedTotalTokens);
+  await client.close();
+} else if (${JSON.stringify(mode)} === 'exhaust-v2') {
+  try {
+    await client.reserveBudget({ requestHash: 'exhaust-v2', inputCeiling: 2, outputCeiling: 1 });
+    process.exit(2);
+  } catch (error) {
+    console.log('CLIENT_V2_EXHAUSTED=PASS ' + error.message);
+    await client.close();
+  }
 } else {
   const status = await client.getBudgetStatus();
   console.log('CLIENT_STATUS_PENDING=PASS pending=' + status.pendingReservations);
   await client.close();
 }
 `;
+}
+
+function v1FixtureBinding(grant: ProxyBudgetGrant): ProxyBudgetWorkflowBinding {
+  if (grant.schema !== 'archon.proxy-budget-grant.v1')
+    throw new Error('V2 fixture requires an explicit workflow binding.');
+  return {
+    runId: grant.runId,
+    workflowDigest: grant.workflowDigest,
+    policyDigest: grant.policyDigest,
+  };
 }
 
 function strictLauncherArgs(

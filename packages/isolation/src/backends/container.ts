@@ -44,7 +44,12 @@ import {
   extractDockerError,
   type DockerRunner,
 } from '../container/docker-exec';
-import type { BudgetStatus, ProxyBudgetGrant } from '../egress/proxy-budget-ledger';
+import { isProxyBudgetGrantV2 } from '../egress/proxy-budget-ledger';
+import type {
+  BudgetStatus,
+  ProxyBudgetGrant,
+  ProxyBudgetGrantV1,
+} from '../egress/proxy-budget-ledger';
 
 const log = createLogger('isolation.container');
 
@@ -962,6 +967,7 @@ export class ContainerBackend implements IIsolationBackend {
     if (!budget) throw new Error('Strict egress requires a controller-seeded proxy budget.');
     const providerPolicies = budget.providerPolicies.map(policy => ({ ...policy }));
     const digest = digestBudgetPolicy({ egressPolicyB64, image: imageRef, providerPolicies });
+    assertSingleRunProxyBudgetGrant(budget.grant);
     if (budget.grant.policyDigest !== digest) {
       throw new Error('Proxy budget seed does not match frozen egress policy and image.');
     }
@@ -1799,6 +1805,14 @@ function isDockerToken(value: unknown): value is string {
   return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(value);
 }
 
+function assertSingleRunProxyBudgetGrant(
+  grant: ProxyBudgetGrant
+): asserts grant is ProxyBudgetGrantV1 {
+  if (isProxyBudgetGrantV2(grant)) {
+    throw new Error('Proxy budget shared-chain status is not wired.');
+  }
+}
+
 function parseProxyBudgetStatusOutput(stdout: string): BudgetStatus {
   const lines = stdout
     .split('\n')
@@ -1820,6 +1834,8 @@ function normalizeVerifiedProxyBudgetStatus(
   expectedGrant: ProxyBudgetGrant
 ): VerifiedProxyBudgetStatus {
   assertSameGrant(status.grant, expectedGrant);
+  assertSingleRunProxyBudgetGrant(status.grant);
+  const statusGrant = status.grant;
   if (status.pendingReservations > 0 || status.unknownReservations > 0) {
     throw new Error('Proxy budget ledger has pending or unknown reservations.');
   }
@@ -1829,7 +1845,7 @@ function normalizeVerifiedProxyBudgetStatus(
   return {
     source: 'controller-proxy-ledger',
     envId,
-    grant: { ...status.grant },
+    grant: { ...statusGrant },
     consumed: {
       input: status.consumedInputTokens,
       output: status.consumedOutputTokens,
@@ -1867,7 +1883,7 @@ function readBudgetStatus(value: unknown): BudgetStatus {
   };
 }
 
-function readBudgetGrant(value: unknown): ProxyBudgetGrant {
+function readBudgetGrant(value: unknown): ProxyBudgetGrantV1 {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error('Proxy budget status grant is malformed.');
   }
@@ -1889,6 +1905,8 @@ function readBudgetGrant(value: unknown): ProxyBudgetGrant {
 }
 
 function assertSameGrant(actual: ProxyBudgetGrant, expected: ProxyBudgetGrant): void {
+  assertSingleRunProxyBudgetGrant(actual);
+  assertSingleRunProxyBudgetGrant(expected);
   if (
     actual.schema !== expected.schema ||
     actual.rootChainId !== expected.rootChainId ||
