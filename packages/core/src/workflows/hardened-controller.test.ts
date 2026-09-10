@@ -2387,7 +2387,7 @@ describe('prepareHardenedControllerSession', () => {
     const receiptPath = String(output.receipt);
     const receipt = readSealedReceiptTest(receiptPath, session.policyMetadata.hmacKeyPath);
     expect(receipt.schema).toBe('archon.candidate-blackbox-test-receipt.v1');
-    expect(receipt.authority).toBe('controller-private-static-blackbox-criteria');
+    expect(receipt.authority).toBe('controller-private-browser-blackbox-criteria');
     expect(receipt.publicOutputAuthority).toBe('none');
     expect(receipt.rawObservationAuthority).toBe('none');
     expect(receipt.rawObservationStatus).toBe('passed');
@@ -2427,6 +2427,233 @@ describe('prepareHardenedControllerSession', () => {
       /validator package digest changed/
     );
   }, 30_000);
+
+  test('seals node candidate black-box observations with startup binding from the signed manifest', async () => {
+    const rootSource = join(root, 'candidate-blackbox-node-platform');
+    createChildRepoWithParent(rootSource, 'web-app', 'parent v0\n', 'baseline v1\n');
+    const workflow = makeCandidateBlackboxWorkflow();
+    const validator = createValidatorNodeModules(home);
+    writeApprovalPolicy(
+      workflow,
+      [
+        {
+          nodeId: 'freeze',
+          action: 'finalize-evidence',
+          phase: 'planning-freeze',
+          oracleFiles: ['oracle/acceptance.browser.json'],
+        },
+        {
+          nodeId: 'approval-check',
+          action: 'verify-approval',
+          phase: 'planning-approval',
+          approvalNodeId: 'human-approval',
+          freezeNodeId: 'freeze',
+        },
+        {
+          nodeId: 'candidate-import',
+          action: 'finalize-evidence',
+          phase: 'candidate-import',
+          repositoryTarget: 'web-app',
+          bundleArtifact: 'run/candidate.bundle',
+          candidateArtifact: 'run/candidate.json',
+        },
+        {
+          nodeId: 'candidate-blackbox',
+          action: 'finalize-evidence',
+          phase: 'candidate-blackbox-test',
+          repositoryTarget: 'web-app',
+          candidateImportNodeId: 'candidate-import',
+          freezeNodeId: 'freeze',
+          approvalReceiptNodeId: 'approval-check',
+          profile: 'node-http-app-v1',
+          acceptancePolicyPath: 'oracle/acceptance.browser.json',
+          appRoot: 'app',
+          startupEntrypoint: 'server.cjs',
+          port: 4173,
+          staticHelperImage: STATIC_HELPER_IMAGE_ID,
+          verifierImage: VERIFIER_IMAGE_ID,
+          validatorPackageDigest: validator.playwrightDigest,
+          validatorCorePackageDigest: validator.coreDigest,
+        },
+      ],
+      undefined,
+      undefined,
+      validator.nodeModules
+    );
+    const session = prepareHardenedControllerSession({
+      runId: 'run-candidate-blackbox-node',
+      workflow,
+      sourceRoot: rootSource,
+      repoInputs: [{ targetPath: 'web-app' }],
+      conversationId: 'cli-conv',
+      userMessage: 'ship',
+      image: IMAGE_ID,
+    });
+    const seedApp = join(session.seed?.path ?? '', 'web-app');
+    mkdirSync(join(seedApp, 'app'), { recursive: true });
+    writeFileSync(
+      join(seedApp, 'app', 'server.cjs'),
+      "require('http').createServer((_req, res) => res.end('API Ready')).listen(Number(process.env.PORT || process.argv[2]), '127.0.0.1');\n"
+    );
+    git(seedApp, ['-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'add', 'app']);
+    git(seedApp, [
+      '-c',
+      'user.name=Test',
+      '-c',
+      'user.email=test@example.com',
+      'commit',
+      '-m',
+      'candidate',
+    ]);
+    git(seedApp, ['update-ref', 'refs/candidates/sealed', 'HEAD']);
+    const bundle = join(root, 'blackbox-node-candidate.bundle');
+    git(seedApp, ['bundle', 'create', bundle, 'refs/candidates/sealed']);
+    const candidate = {
+      schema: 'archon.candidate-proposal.v1',
+      commit: gitText(seedApp, ['rev-parse', 'HEAD']),
+      tree: gitText(seedApp, ['rev-parse', 'HEAD^{tree}']),
+    };
+    const browserPolicy = {
+      required: [
+        {
+          id: 'api-ready',
+          criterion: 'Node API candidate serves approved text',
+          path: '/',
+          assertions: [{ type: 'text', value: 'API Ready' }],
+        },
+      ],
+    };
+    const run = makeRun('run-candidate-blackbox-node', workflow, {
+      isolation_env_id: 'env-candidate-node',
+    });
+    const events: WorkflowEventRecord[] = [];
+    const store = makeStore(run, events);
+    const evidenceDir = join(session.privateDir, 'observed-node-private');
+    mkdirSync(evidenceDir, { recursive: true, mode: 0o700 });
+    const screenshotPath = join(evidenceDir, 'api-ready.png');
+    const tracePath = join(evidenceDir, 'trace.zip');
+    writeFileSync(screenshotPath, 'fake-node-png-evidence', { mode: 0o600 });
+    writeFileSync(tracePath, 'fake-node-zip-evidence', { mode: 0o600 });
+    const snapshotArtifacts = async (_envId: string, destinationDir: string): Promise<void> => {
+      if (destinationDir.includes('candidate-import')) {
+        mkdirSync(join(destinationDir, 'run'), { recursive: true });
+        copyFileSync(bundle, join(destinationDir, 'run', 'candidate.bundle'));
+        chmodSync(join(destinationDir, 'run', 'candidate.bundle'), 0o600);
+        writeFileSync(join(destinationDir, 'run', 'candidate.json'), JSON.stringify(candidate), {
+          mode: 0o600,
+        });
+        return;
+      }
+      mkdirSync(join(destinationDir, 'oracle'), { recursive: true });
+      writeFileSync(
+        join(destinationDir, 'oracle', 'acceptance.browser.json'),
+        JSON.stringify(browserPolicy),
+        { mode: 0o600 }
+      );
+    };
+    let observedCandidateSource: Record<string, unknown> | undefined;
+    const browserObservationService = {
+      observe: async (request: BrowserObservationRequest): Promise<BrowserObservationResult> => {
+        observedCandidateSource = JSON.parse(JSON.stringify(request.app.candidateSource)) as Record<
+          string,
+          unknown
+        >;
+        return {
+          authority: 'none',
+          status: 'passed',
+          runId: request.runId,
+          policyDigest: digestStableTest(request.policy),
+          observedOrigin: 'http://127.0.0.1:4173',
+          app: {
+            image: request.app.image,
+            imageId: STATIC_HELPER_IMAGE_ID,
+            commit: candidate.commit,
+            tree: candidate.tree,
+          },
+          verifier: {
+            image: String(request.verifierImage),
+            imageId: VERIFIER_IMAGE_ID,
+            playwrightVersion: '1.60.0',
+          },
+          viewport: { width: 1280, height: 720 },
+          criteria: [
+            {
+              id: 'api-ready',
+              path: '/',
+              status: 'passed',
+              observed_origin: 'http://127.0.0.1:4173',
+              assertions: [{ type: 'text', value: 'API Ready', status: 'passed' }],
+            },
+          ],
+          security: browserSecurityFixture(),
+          evidence: {
+            screenshots: [
+              {
+                criterion: 'api-ready',
+                path: 'browser-evidence/api-ready.png',
+                controllerPath: screenshotPath,
+                sha256: fileSha256(screenshotPath),
+              },
+            ],
+            traces: [
+              {
+                path: 'browser-evidence/trace.zip',
+                controllerPath: tracePath,
+                sha256: fileSha256(tracePath),
+              },
+            ],
+          },
+        };
+      },
+    };
+    const actions = createHardenedControllerActions({
+      session,
+      store,
+      playwrightNodeModules: validator.nodeModules,
+      snapshotArtifacts,
+      browserObservationService,
+    });
+
+    const freezeOutput = (await actions['finalize-evidence']!(
+      actionContext(run, workflow, grantFor(session.controllerActionGrants, 'freeze'))
+    )) as Record<string, unknown>;
+    run.metadata.approval = {
+      type: 'approval',
+      nodeId: 'human-approval',
+      resolved: 'approved',
+      message: `Approve ${String(freezeOutput.binding_id)} ${String(freezeOutput.oracle_digest)}`,
+    };
+    events.push(
+      freezeCompletedEvent(freezeOutput),
+      approvalEvent('approval_requested', 'human-approval', {
+        message: `Approve ${String(freezeOutput.binding_id)} ${String(freezeOutput.oracle_digest)}`,
+      }),
+      approvalEvent('node_completed', 'human-approval', { approval_decision: 'approved' }),
+      approvalEvent('approval_received', 'human-approval', { decision: 'approved' })
+    );
+    await actions['verify-approval']!(
+      actionContext(run, workflow, grantFor(session.controllerActionGrants, 'approval-check'))
+    );
+    await actions['finalize-evidence']!(
+      actionContext(run, workflow, grantFor(session.controllerActionGrants, 'candidate-import'))
+    );
+    const output = (await actions['finalize-evidence']!(
+      actionContext(run, workflow, grantFor(session.controllerActionGrants, 'candidate-blackbox'))
+    )) as Record<string, unknown>;
+
+    expect(output.profile).toBe('node-http-app-v1');
+    expect(observedCandidateSource?.profile).toBe('node-http-app-v1');
+    expect(observedCandidateSource?.startup).toEqual({ entrypoint: 'server.cjs' });
+    expect(observedCandidateSource?.contentDigest).toEqual(expect.stringMatching(/^[0-9a-f]{64}$/));
+    const receipt = readSealedReceiptTest(
+      String(output.receipt),
+      session.policyMetadata.hmacKeyPath
+    );
+    expect(receipt.profile).toBe('node-http-app-v1');
+    expect(receipt.startupEntrypoint).toBe('server.cjs');
+    expect(receipt.candidateSourceDigest).toBe(observedCandidateSource?.contentDigest);
+    expect(receipt.authority).toBe('controller-private-browser-blackbox-criteria');
+  }, 10_000);
 
   test('candidate black-box policy rejects mutable authority and repo-controlled commands', () => {
     const rootSource = join(root, 'candidate-blackbox-policy-platform');
@@ -2504,6 +2731,78 @@ describe('prepareHardenedControllerSession', () => {
         image: IMAGE_ID,
       })
     ).toThrow(/unsupported keys/);
+    writeApprovalPolicy(
+      workflow,
+      [{ ...grant, profile: 'static-web-http-v1', startupEntrypoint: 'server.cjs' }],
+      undefined,
+      undefined,
+      validator.nodeModules
+    );
+    expect(() =>
+      prepareHardenedControllerSession({
+        runId: 'run-blackbox-static-startup',
+        workflow,
+        sourceRoot: rootSource,
+        repoInputs: [{ targetPath: 'web-app' }],
+        conversationId: 'cli-conv',
+        userMessage: 'ship',
+        image: IMAGE_ID,
+      })
+    ).toThrow(/unsupported keys/);
+    writeApprovalPolicy(
+      workflow,
+      [{ ...grant, profile: 'node-http-app-v1', startupEntrypoint: 'server.cjs' }],
+      undefined,
+      undefined,
+      validator.nodeModules
+    );
+    expect(() =>
+      prepareHardenedControllerSession({
+        runId: 'run-blackbox-node-startup',
+        workflow,
+        sourceRoot: rootSource,
+        repoInputs: [{ targetPath: 'web-app' }],
+        conversationId: 'cli-conv',
+        userMessage: 'ship',
+        image: IMAGE_ID,
+      })
+    ).not.toThrow();
+    writeApprovalPolicy(
+      workflow,
+      [{ ...grant, profile: 'node-http-app-v1' }],
+      undefined,
+      undefined,
+      validator.nodeModules
+    );
+    expect(() =>
+      prepareHardenedControllerSession({
+        runId: 'run-blackbox-node-missing-startup',
+        workflow,
+        sourceRoot: rootSource,
+        repoInputs: [{ targetPath: 'web-app' }],
+        conversationId: 'cli-conv',
+        userMessage: 'ship',
+        image: IMAGE_ID,
+      })
+    ).toThrow(/startupEntrypoint/);
+    writeApprovalPolicy(
+      workflow,
+      [{ ...grant, profile: 'node-http-app-v1', startupEntrypoint: '--eval.cjs' }],
+      undefined,
+      undefined,
+      validator.nodeModules
+    );
+    expect(() =>
+      prepareHardenedControllerSession({
+        runId: 'run-blackbox-node-option-startup',
+        workflow,
+        sourceRoot: rootSource,
+        repoInputs: [{ targetPath: 'web-app' }],
+        conversationId: 'cli-conv',
+        userMessage: 'ship',
+        image: IMAGE_ID,
+      })
+    ).toThrow(/startup entrypoint/);
     writeApprovalPolicy(workflow, [grant]);
     expect(() =>
       prepareHardenedControllerSession({

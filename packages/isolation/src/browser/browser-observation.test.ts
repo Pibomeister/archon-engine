@@ -152,6 +152,53 @@ function compareCodepoint(left: string, right: string): number {
   return 0;
 }
 
+function nodeCandidateSource(
+  overrides: Partial<NonNullable<BrowserObservationRequest['app']['candidateSource']>> = {}
+): NonNullable<BrowserObservationRequest['app']['candidateSource']> {
+  const content = Buffer.from(
+    "const http = require('http');\n" +
+      'const port = Number(process.argv[2] || process.env.PORT);\n' +
+      'http.createServer((req, res) => {\n' +
+      "  res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });\n" +
+      "  res.end('<html><title>Goodword API</title><body><p>API Ready</p></body></html>');\n" +
+      "}).listen(port, '127.0.0.1');\n"
+  );
+  const file = {
+    type: 'file' as const,
+    path: 'app/server.cjs',
+    size: content.length,
+    sha256: createHash('sha256').update(content).digest('hex'),
+    contentBase64: content.toString('base64'),
+  };
+  const files = overrides.files ?? [file];
+  return {
+    profile: 'node-http-app-v1',
+    commit: SHA_A,
+    tree: SHA_B,
+    appRoot: 'app',
+    startup: {
+      entrypoint: 'server.cjs',
+    },
+    contentDigest: canonicalDigest({
+      appRoot: overrides.appRoot ?? 'app',
+      commit: overrides.commit ?? SHA_A,
+      files: files
+        .map(entry => ({
+          path: entry.path,
+          sha256: entry.sha256,
+          size: entry.size,
+          type: entry.type,
+        }))
+        .sort((a, b) => compareCodepoint(a.path, b.path)),
+      profile: overrides.profile ?? 'node-http-app-v1',
+      startup: overrides.startup ?? { entrypoint: 'server.cjs' },
+      tree: overrides.tree ?? SHA_B,
+    }),
+    ...overrides,
+    files,
+  };
+}
+
 async function candidateRequest(
   overrides: Partial<BrowserObservationRequest> = {}
 ): Promise<BrowserObservationRequest> {
@@ -162,6 +209,21 @@ async function candidateRequest(
       tree: SHA_B,
       port: 4173,
       candidateSource: candidateSource(),
+    },
+    ...overrides,
+  });
+}
+
+async function nodeCandidateRequest(
+  overrides: Partial<BrowserObservationRequest> = {}
+): Promise<BrowserObservationRequest> {
+  return request({
+    app: {
+      image: RUNNER_IMAGE,
+      commit: SHA_A,
+      tree: SHA_B,
+      port: 4173,
+      candidateSource: nodeCandidateSource(),
     },
     ...overrides,
   });
@@ -613,6 +675,97 @@ describe('BrowserObservationService command construction', () => {
     expect(docker.calls.filter(call => call[0] === 'volume' && call[1] === 'rm').length).toBe(3);
   });
 
+  test('starts a managed node API candidate from imported immutable source', async () => {
+    const docker = fakeDocker({ candidateSnapshot: candidateSnapshotJsonl(nodeCandidateSource()) });
+    const service = candidateService(docker);
+    const result = await service.observe(await nodeCandidateRequest());
+
+    expect(result.status).toBe('passed');
+    expect(result.authority).toBe('none');
+    const appRun = docker.calls.find(
+      call =>
+        call[0] === 'run' &&
+        call.includes('--name') &&
+        call[call.indexOf('--name') + 1]?.startsWith('archon-browser-app-')
+    );
+    expect(appRun).toBeDefined();
+    expect(appRun?.join(' ')).toContain('dst=/candidate,readonly');
+    expect(appRun?.join(' ')).toContain('--workdir /candidate/app');
+    expect(appRun).toContain('--entrypoint');
+    expect(appRun).toContain('node');
+    expect(appRun).toContain('--env');
+    expect(appRun).toContain('PORT=4173');
+    expect(appRun).toContain('--');
+    expect(appRun).toContain('server.cjs');
+    expect(appRun).toContain('4173');
+    expect(appRun?.join(' ')).not.toContain('static-web-http-v1');
+    expect(appRun).not.toContain('node server.js');
+    expect(docker.calls.filter(call => call[0] === 'volume' && call[1] === 'rm').length).toBe(3);
+  });
+
+  test('rejects node candidate hostile profile, startup path, and agent command overrides', async () => {
+    for (const mutation of [
+      {
+        app: {
+          image: RUNNER_IMAGE,
+          commit: SHA_A,
+          tree: SHA_B,
+          port: 4173,
+          candidateSource: nodeCandidateSource({ startup: { entrypoint: '../server.cjs' } }),
+        },
+        pattern: /startup entrypoint must not traverse/,
+      },
+      {
+        app: {
+          image: RUNNER_IMAGE,
+          commit: SHA_A,
+          tree: SHA_B,
+          port: 4173,
+          candidateSource: nodeCandidateSource({ startup: { entrypoint: '/server.cjs' } }),
+        },
+        pattern: /startup entrypoint must be a relative POSIX path/,
+      },
+      {
+        app: {
+          image: RUNNER_IMAGE,
+          commit: SHA_A,
+          tree: SHA_B,
+          port: 4173,
+          candidateSource: nodeCandidateSource({ startup: { entrypoint: '--eval.cjs' } }),
+        },
+        pattern: /must not be parsed as a Node option/,
+      },
+      {
+        app: {
+          image: RUNNER_IMAGE,
+          commit: SHA_A,
+          tree: SHA_B,
+          port: 4173,
+          command: ['sh', '-lc', 'evil'],
+          candidateSource: nodeCandidateSource(),
+        },
+        pattern: /fixed controller startup/,
+      },
+      {
+        app: {
+          image: RUNNER_IMAGE,
+          commit: SHA_A,
+          tree: SHA_B,
+          port: 4173,
+          candidateSource: nodeCandidateSource({ profile: 'shell-http-v1' }),
+        },
+        pattern: /Unsupported candidate source profile/,
+      },
+    ]) {
+      const docker = fakeDocker();
+      const service = candidateService(docker);
+      await expect(
+        service.observe(await nodeCandidateRequest({ app: mutation.app }))
+      ).rejects.toThrow(mutation.pattern);
+      expect(docker.calls.length).toBe(0);
+    }
+  });
+
   test('rejects candidate volume drift after Docker staging verification', async () => {
     const drifted = candidateSource({
       files: [
@@ -708,7 +861,7 @@ describe('BrowserObservationService command construction', () => {
           },
         })
       )
-    ).rejects.toThrow(/fixed controller command/);
+    ).rejects.toThrow(/fixed controller (command|startup)/);
 
     await expect(
       service.observe(
@@ -1281,6 +1434,78 @@ describe('actual Docker browser observation fixture', () => {
       expect(result.app.image).toBe(runnerImage);
       expect(result.criteria[0]?.assertions?.map(assertion => assertion.status)).toEqual([
         'passed',
+        'passed',
+        'passed',
+      ]);
+      const survivors = await docker([
+        'ps',
+        '-aq',
+        '--filter',
+        `label=archon.browser-observation.run=${result.runId}`,
+      ]);
+      expect(survivors.trim()).toBe('');
+      const volumes = await docker([
+        'volume',
+        'ls',
+        '-q',
+        '--filter',
+        `label=archon.browser-observation.run=${result.runId}`,
+      ]);
+      expect(volumes.trim()).toBe('');
+    },
+    240_000
+  );
+
+  test.skipIf(process.env.ARCHON_RUN_ACTUAL_DOCKER_BROWSER_CANDIDATE !== '1')(
+    'starts sealed node API candidate source from a read-only volume without an app Dockerfile',
+    async () => {
+      const nodeModules = process.env.ARCHON_PLAYWRIGHT_NODE_MODULES;
+      const runnerImage = process.env.ARCHON_CONTAINER_TEST_IMAGE;
+      if (!nodeModules) throw new Error('ARCHON_PLAYWRIGHT_NODE_MODULES is required.');
+      if (!runnerImage) throw new Error('ARCHON_CONTAINER_TEST_IMAGE is required.');
+      await docker(['version', '--format', '{{.Server.Version}}'], 10_000);
+      await ensureDockerImage();
+      const root = await mkdtemp(join(tmpdir(), 'archon-browser-node-candidate-docker-'));
+      cleanupDirs.push(root);
+      const evidenceDir = join(root, 'controller-evidence');
+      const source = nodeCandidateSource();
+      const service = new BrowserObservationService(undefined, {
+        trustedCandidateHelperImage: runnerImage,
+      });
+      const result = await service.observe(
+        await request({
+          runId: `node-candidate-${randomUUID().slice(0, 8)}`,
+          app: {
+            image: runnerImage,
+            commit: SHA_A,
+            tree: SHA_B,
+            port: 4173,
+            candidateSource: source,
+          },
+          playwrightNodeModules: resolve(nodeModules),
+          evidenceDir,
+          timeoutMs: 5000,
+          canaryUrl: 'http://host.docker.internal/',
+          policy: {
+            required: [
+              {
+                id: 'browser-node-candidate-api',
+                criterion: 'Node candidate serves the operator-pinned API/web response',
+                path: '/',
+                assertions: [
+                  { type: 'title', value: 'Goodword API' },
+                  { type: 'text', value: 'API Ready' },
+                ],
+              },
+            ],
+          },
+        })
+      );
+      if (result.status !== 'passed') throw new Error(JSON.stringify(result.criteria, null, 2));
+      expect(result.status).toBe('passed');
+      expect(result.authority).toBe('none');
+      expect(result.app.image).toBe(runnerImage);
+      expect(result.criteria[0]?.assertions?.map(assertion => assertion.status)).toEqual([
         'passed',
         'passed',
       ]);

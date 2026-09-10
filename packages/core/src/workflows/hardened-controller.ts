@@ -66,6 +66,8 @@ const APPROVAL_RECEIPT_SCHEMA = 'archon.planning-approval-receipt.v1';
 const CANDIDATE_IMPORT_RECEIPT_SCHEMA = 'archon.candidate-import-receipt.v1';
 const CANDIDATE_BLACKBOX_RECEIPT_SCHEMA = 'archon.candidate-blackbox-test-receipt.v1';
 const STATIC_WEB_PROFILE = 'static-web-http-v1';
+const NODE_HTTP_PROFILE = 'node-http-app-v1';
+type CandidateBlackboxProfile = typeof STATIC_WEB_PROFILE | typeof NODE_HTTP_PROFILE;
 const HMAC_KEY_BASENAME = 'controller-approval.hmac';
 const SESSION_BINDING_BASENAME = 'controller-session-binding.json';
 const COPIED_APPROVAL_POLICY_BASENAME = 'operator-planning-approval-policy.json';
@@ -256,9 +258,10 @@ interface OperatorApprovalGrant {
   freezeNodeId?: string;
   candidateImportNodeId?: string;
   approvalReceiptNodeId?: string;
-  profile?: typeof STATIC_WEB_PROFILE;
+  profile?: CandidateBlackboxProfile;
   acceptancePolicyPath?: string;
   appRoot?: string;
+  startupEntrypoint?: string;
   port?: number;
   staticHelperImage?: string;
   verifierImage?: string;
@@ -461,7 +464,7 @@ async function runCandidateBlackboxTest(
   }
   const dependencies = await readBlackboxDependencies(ctx, deps, binding);
   const policy = readFrozenBrowserPolicy(dependencies.freeze, binding.acceptancePolicyPath);
-  const candidateSource = candidateSourceFromImport(dependencies.importReceipt, binding.appRoot);
+  const candidateSource = candidateSourceFromImport(dependencies.importReceipt, binding);
   const validator = snapshotValidatorNodeModules(ctx, deps, binding);
   const observation = await runBrowserObservation(
     ctx,
@@ -498,9 +501,10 @@ interface CandidateBlackboxBinding {
   candidateImportNodeId: string;
   freezeNodeId: string;
   approvalReceiptNodeId: string;
-  profile: typeof STATIC_WEB_PROFILE;
+  profile: CandidateBlackboxProfile;
   acceptancePolicyPath: string;
   appRoot: string;
+  startupEntrypoint?: string;
   port: number;
   staticHelperImage: string;
   verifierImage: string;
@@ -579,6 +583,7 @@ function buildCandidateBlackboxReceipt(
     acceptancePolicyDigest: digestStable(policy),
     acceptanceCriteria: policy.required.map(criterion => criterion.id),
     appRoot: binding.appRoot,
+    ...(binding.startupEntrypoint ? { startupEntrypoint: binding.startupEntrypoint } : {}),
     port: binding.port,
     candidateSourceDigest: candidateSource.contentDigest,
     staticHelperImage: binding.staticHelperImage,
@@ -596,10 +601,10 @@ function buildCandidateBlackboxReceipt(
     rawObservationDigest: digestStable(observation),
     evidence: digestBrowserEvidence(observation),
     security: observation.security,
-    authority: 'controller-private-static-blackbox-criteria',
+    authority: 'controller-private-browser-blackbox-criteria',
     publicOutputAuthority: 'none',
     provenance:
-      'controller-private candidate black-box receipt; authenticates frozen static-web criteria only, not release readiness or general API correctness',
+      'controller-private candidate black-box receipt; authenticates frozen browser criteria only, not release readiness or general API correctness',
   };
 }
 
@@ -2356,6 +2361,7 @@ function parseOperatorApprovalGrant(value: unknown): OperatorApprovalGrant {
     };
   }
   if (action === 'finalize-evidence' && phase === 'candidate-blackbox-test') {
+    const profile = fixedProfileInput(record);
     assertExactKeys(
       record,
       [
@@ -2371,6 +2377,7 @@ function parseOperatorApprovalGrant(value: unknown): OperatorApprovalGrant {
         'profile',
         'repositoryTarget',
         'staticHelperImage',
+        ...(profile === NODE_HTTP_PROFILE ? ['startupEntrypoint'] : []),
         'validatorCorePackageDigest',
         'validatorPackageDigest',
         'verifierImage',
@@ -2388,12 +2395,17 @@ function parseOperatorApprovalGrant(value: unknown): OperatorApprovalGrant {
       candidateImportNodeId: stringInput(record, 'candidateImportNodeId'),
       freezeNodeId: stringInput(record, 'freezeNodeId'),
       approvalReceiptNodeId: stringInput(record, 'approvalReceiptNodeId'),
-      profile: fixedProfileInput(record),
+      profile,
       acceptancePolicyPath: assertSafeRelativePath(
         stringInput(record, 'acceptancePolicyPath'),
         'Candidate black-box acceptance policy'
       ),
       appRoot: candidateSourceRelativePath(stringInput(record, 'appRoot'), 'appRoot', true),
+      ...(profile === NODE_HTTP_PROFILE
+        ? {
+            startupEntrypoint: candidateStartupEntrypointInput(record),
+          }
+        : {}),
       port: boundedPortInput(record),
       staticHelperImage: assertImmutableImageRef(
         stringInput(record, 'staticHelperImage'),
@@ -2432,11 +2444,22 @@ function parseOperatorApprovalGrant(value: unknown): OperatorApprovalGrant {
   );
 }
 
-function fixedProfileInput(record: Record<string, unknown>): typeof STATIC_WEB_PROFILE {
-  if (record.profile !== STATIC_WEB_PROFILE) {
-    throw new Error('Candidate black-box profile is unsupported.');
+function fixedProfileInput(record: Record<string, unknown>): CandidateBlackboxProfile {
+  if (record.profile === STATIC_WEB_PROFILE || record.profile === NODE_HTTP_PROFILE) {
+    return record.profile;
   }
-  return STATIC_WEB_PROFILE;
+  throw new Error('Candidate black-box profile is unsupported.');
+}
+
+function candidateStartupEntrypointInput(record: Record<string, unknown>): string {
+  const entrypoint = candidateSourceRelativePath(
+    stringInput(record, 'startupEntrypoint'),
+    'startupEntrypoint'
+  );
+  if (entrypoint.startsWith('-')) {
+    throw new Error('Candidate black-box startup entrypoint must not be parsed as a Node option.');
+  }
+  return entrypoint;
 }
 
 function boundedPortInput(record: Record<string, unknown>): number {
@@ -2653,6 +2676,7 @@ function buildActionManifest(
       ? { acceptancePolicyPath: policyGrant.acceptancePolicyPath }
       : {}),
     ...(policyGrant.appRoot ? { appRoot: policyGrant.appRoot } : {}),
+    ...(policyGrant.startupEntrypoint ? { startupEntrypoint: policyGrant.startupEntrypoint } : {}),
     ...(policyGrant.port ? { port: policyGrant.port } : {}),
     ...(policyGrant.staticHelperImage ? { staticHelperImage: policyGrant.staticHelperImage } : {}),
     ...(policyGrant.verifierImage ? { verifierImage: policyGrant.verifierImage } : {}),
@@ -3206,10 +3230,7 @@ function sourceBindingDigest(
 }
 
 function blackboxBinding(input: Record<string, unknown>): CandidateBlackboxBinding {
-  const profile = stringInput(input, 'profile');
-  if (profile !== STATIC_WEB_PROFILE) {
-    throw new Error('Candidate black-box profile is unsupported.');
-  }
+  const profile = fixedProfileInput(input);
   const port = numberInput(input, 'port');
   if (!Number.isSafeInteger(port) || port < 1 || port > 65535) {
     throw new Error('Candidate black-box port is malformed.');
@@ -3228,6 +3249,11 @@ function blackboxBinding(input: Record<string, unknown>): CandidateBlackboxBindi
       'Candidate black-box acceptance policy'
     ),
     appRoot: candidateSourceRelativePath(stringInput(input, 'appRoot'), 'appRoot', true),
+    ...(profile === NODE_HTTP_PROFILE
+      ? {
+          startupEntrypoint: candidateStartupEntrypointInput(input),
+        }
+      : {}),
     port,
     staticHelperImage: assertImmutableImageRef(
       stringInput(input, 'staticHelperImage'),
@@ -3481,15 +3507,16 @@ function browserPathInput(record: Record<string, unknown>): string {
 
 function candidateSourceFromImport(
   receipt: Record<string, unknown>,
-  appRoot: string
+  binding: CandidateBlackboxBinding
 ): CandidateSourceDescriptor {
   const content = readCandidateContentRecord(receipt.content);
   const files = content.files.map(file => candidateSourceFile(content.destination, file));
   const source: Omit<CandidateSourceDescriptor, 'contentDigest'> = {
-    profile: STATIC_WEB_PROFILE,
+    profile: binding.profile,
     commit: stringInput(receipt, 'candidateCommit'),
     tree: stringInput(receipt, 'candidateTreeOid'),
-    appRoot,
+    appRoot: binding.appRoot,
+    ...(binding.startupEntrypoint ? { startup: { entrypoint: binding.startupEntrypoint } } : {}),
     files,
   };
   const withDigest: CandidateSourceDescriptor = {
@@ -3517,13 +3544,15 @@ function candidateSourceFile(root: string, file: SeedManifestFile): CandidateSou
 }
 
 function candidateSourceDigest(source: Omit<CandidateSourceDescriptor, 'contentDigest'>): string {
-  return digestStable({
+  const descriptor: Record<string, unknown> = {
     profile: source.profile,
     commit: source.commit,
     tree: source.tree,
     appRoot: source.appRoot,
     files: candidateSourceFileDigestManifest(source.files),
-  });
+  };
+  if (source.startup) descriptor.startup = source.startup;
+  return digestStable(descriptor);
 }
 
 function candidateSourceFileDigestManifest(
@@ -3898,7 +3927,7 @@ async function assertCandidateBlackboxReceiptBound(
   assertCandidateBlackboxReceiptContext(receipt, ctx, deps.session);
   const dependencies = await readBlackboxDependencies(ctx, deps, binding);
   const policy = readFrozenBrowserPolicy(dependencies.freeze, binding.acceptancePolicyPath);
-  const candidateSource = candidateSourceFromImport(dependencies.importReceipt, binding.appRoot);
+  const candidateSource = candidateSourceFromImport(dependencies.importReceipt, binding);
   if (stringInput(receipt, 'rawObservationStatus') !== 'passed') {
     throw new Error('Candidate black-box receipt is not passing.');
   }
@@ -3944,6 +3973,10 @@ function assertBlackboxReceiptDependencies(
   }
   if (stringInput(receipt, 'repositoryTarget') !== binding.repositoryTarget) {
     throw new Error('Candidate black-box repository target changed.');
+  }
+  const startupEntrypoint = optionalStringInput(receipt, 'startupEntrypoint');
+  if (startupEntrypoint !== binding.startupEntrypoint) {
+    throw new Error('Candidate black-box startup entrypoint changed.');
   }
   if (stringInput(receipt, 'staticHelperImage') !== binding.staticHelperImage) {
     throw new Error('Candidate black-box static helper image changed.');
@@ -4612,6 +4645,11 @@ function stringInput(input: Record<string, unknown>, key: string): string {
     throw new Error(`Controller policy field '${key}' is missing or malformed.`);
   }
   return value;
+}
+
+function optionalStringInput(input: Record<string, unknown>, key: string): string | undefined {
+  if (!(key in input)) return undefined;
+  return stringInput(input, key);
 }
 
 function numberInput(input: Record<string, unknown>, key: string): number {

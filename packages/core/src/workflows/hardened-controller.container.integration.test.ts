@@ -42,6 +42,9 @@ const PROVIDER_ID = `hardened-controller-docker-${Date.now().toString(36)}`;
 const DEFAULT_PLAYWRIGHT_NODE_MODULES = join(process.cwd(), 'node_modules');
 const DEFAULT_PLAYWRIGHT_VERIFIER_IMAGE =
   'sha256:48887be1c4f7b4800e4879a96a5f761038b6fb616e6d03961768d8f2cb9d0a8f';
+type BlackboxProfile = 'static-web-http-v1' | 'node-http-app-v1';
+type ProxyBudgetSeed = NonNullable<ReturnType<typeof getHardenedControllerProxyBudgetSeed>>;
+
 const BROWSER_POLICY = {
   required: [
     {
@@ -103,371 +106,397 @@ describe('hardened controller Docker integration', () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  for (const decision of ['approve', 'reject'] as const) {
+  const scenarios: Array<{ decision: 'approve' | 'reject'; profile: BlackboxProfile }> = [
+    { decision: 'approve', profile: 'static-web-http-v1' },
+    { decision: 'reject', profile: 'static-web-http-v1' },
+    { decision: 'approve', profile: 'node-http-app-v1' },
+  ];
+
+  for (const { decision, profile } of scenarios) {
     test.skipIf(process.env.ARCHON_RUN_DOCKER_CONTROLLER_TEST !== '1')(
-      `freezes real artifact volume evidence and enforces the human ${decision} operation`,
-      async () => {
-        const workflow = makeWorkflow();
-        const image = await resolveTestImage();
-        const playwrightNodeModules = resolvePlaywrightNodeModules();
-        const verifierImage = await resolveVerifierImage();
-        writeApprovalPolicy(archonHome, workflow, image, verifierImage, playwrightNodeModules);
-        const modules = await loadRuntimeModules();
-        await seedParents(modules.db, source);
-        const run = await modules.workflowDb.createWorkflowRun({
-          workflow_name: workflow.name,
-          conversation_id: 'conv-docker',
-          codebase_id: 'cb-docker',
-          user_message: 'ship',
-          working_path: '/workspace',
-          metadata: { isolation: 'container' },
-        });
-        const session = modules.prepareHardenedControllerSession({
-          runId: run.id,
-          workflow,
-          sourceRoot: source,
-          repoInputs: [{ targetPath: 'api' }],
-          conversationId: 'conv-docker',
-          userMessage: 'ship',
-          image,
-          requestedImage: process.env.ARCHON_CONTAINER_TEST_IMAGE,
-          budget: { deadlineAt: '2030-01-01T00:00:00.000Z', tokens: { total: 100_000 } },
-        });
-        const proxyBudget = getHardenedControllerProxyBudgetSeed(session);
-        if (!proxyBudget) throw new Error('missing proxy budget seed');
-        const backend = new ContainerBackend({
-          store: modules.createIsolationStore(),
-          config: {
-            profile: 'hardened',
-            image,
-            network: 'none',
-            memoryMb: 2048,
-            pidsLimit: 256,
-            egressPolicy: getHardenedControllerEgressPolicy(session),
-            proxyBudget,
-          },
-        });
-        let envId: string | undefined;
-
-        try {
-          const prepared = await backend.prepare({
-            codebase: {
-              id: 'cb-docker',
-              defaultCwd: '/workspace',
-              name: 'fixture',
-              kind: 'folder',
-            },
-            seed: session.seed,
-            ownerRunId: run.id,
-          });
-          envId = prepared.envId;
-          const isolation = await modules.createIsolationStore().getById(envId);
-          expect(typeof isolation?.metadata.egressPolicyB64).toBe('string');
-          expect(isolation?.metadata.egressPolicyB64).toBe(session.policyMetadata.egressPolicyB64);
-          expect(isolation?.metadata.proxyBudgetSeedDigest).toBe(
-            session.policyMetadata.proxyBudgetSeedDigest
-          );
-          const budgetBinding = proxyBudgetBinding(session);
-          const budgetStatus = await backend.readProxyBudgetStatus(prepared.envId, budgetBinding);
-          expect(budgetStatus).toMatchObject({
-            source: 'controller-proxy-ledger',
-            envId: prepared.envId,
-            pendingReservations: 0,
-            unknownReservations: 0,
-            acceptingReservations: true,
-            consumed: { input: 0, output: 0 },
-          });
-          expect(budgetStatus.grant).toMatchObject({
-            runId: run.id,
-            workflowDigest: computeControllerWorkflowDigest(workflow),
-            totalTokenLimit: 100_000,
-          });
-          assertNoCanariesInContainer(prepared.execContext.containerId);
-          assertBudgetMaterialInaccessibleToAgent(prepared.execContext.containerId);
-          await assertPreparedOwnership(modules.createIsolationStore(), prepared.envId, run.id);
-          await modules.workflowDb.updateWorkflowRun(run.id, {
-            metadata: {
-              isolation: 'container',
-              isolation_env_id: prepared.envId,
-              hardened_controller_policy: session.policyMetadata,
-              hardened_controller_policy_path: session.policyPath,
-              hardened_budget: persistedBudget(session),
-              [WORKFLOW_PIN_METADATA_KEY]: buildWorkflowPinState(workflow, 'project'),
-            },
-          });
-          const deps = makeDeps(
-            modules.createWorkflowStore(),
-            session,
-            (envId, destinationDir) => backend.snapshotArtifacts(envId, destinationDir),
-            playwrightNodeModules
-          );
-          const container = {
-            envId: prepared.envId,
-            writeBack: 'auto' as const,
-            backend,
-            ...budgetBinding,
-          };
-
-          const first = await modules.executeWorkflow(
-            deps,
-            makePlatform(),
-            'conv-platform',
-            prepared.cwd,
-            workflow,
-            'ship',
-            'conv-docker',
-            {
-              preCreatedRun: {
-                ...run,
-                metadata: (await modules.workflowDb.getWorkflowRun(run.id))?.metadata ?? {},
-              },
-              codebaseId: 'cb-docker',
-              execContext: prepared.execContext,
-              container,
-              source: 'project',
-            }
-          );
-          expect(first.success).toBe(true);
-          expect((await modules.workflowDb.getWorkflowRun(run.id))?.status).toBe('paused');
-          const freezeOutput = await completedOutput(
-            modules.createWorkflowStore(),
-            run.id,
-            'freeze'
-          );
-          expect(freezeOutput.binding_id).toEqual(expect.stringMatching(/^[0-9a-f]{64}$/));
-          expect(freezeOutput.oracle_digest).toEqual(expect.any(String));
-          const frozenReceiptBytes = readFileSync(String(freezeOutput.receipt), 'utf8');
-          const freezeReceipt = JSON.parse(frozenReceiptBytes) as Record<string, unknown>;
-          const oracleFiles = freezeReceipt.oracleFiles as Record<string, unknown>[];
-          expect(oracleFiles.map(file => file.path).sort()).toEqual([
-            'run/oracle/acceptance.browser.json',
-            'run/oracle/plan.md',
-          ]);
-          expect(oracleFiles.find(file => file.path === 'run/oracle/plan.md')?.size).toBe(29);
-          expect(
-            readFileSync(join(String(freezeReceipt.snapshotDir), 'run/oracle/plan.md'), 'utf8')
-          ).toBe('approved acceptance criteria\n');
-          expect(() =>
-            readFileSync(join(String(freezeReceipt.snapshotDir), '.env'), 'utf8')
-          ).toThrow();
-          const freezeCompleted = await eventRecord(
-            modules.createWorkflowStore(),
-            run.id,
-            'node_completed',
-            'freeze'
-          );
-          const requestedEvent = await eventRecord(
-            modules.createWorkflowStore(),
-            run.id,
-            'approval_requested',
-            'human-approval'
-          );
-          expect(Number(freezeCompleted.event_order)).toBeLessThan(
-            Number(requestedEvent.event_order)
-          );
-          const requested = readEventData(requestedEvent.data);
-          expect(String(requested.message)).toContain(String(freezeOutput.binding_id));
-          expect(String(requested.message)).toContain(String(freezeOutput.oracle_digest));
-
-          if (decision === 'reject') {
-            const result = await modules.rejectWorkflow(run.id, 'acceptance checks need revision');
-            expect(result.cancelled).toBe(true);
-            expect((await modules.workflowDb.getWorkflowRun(run.id))?.status).toBe('cancelled');
-            await expect(modules.resumeWorkflow(run.id)).rejects.toThrow(
-              "Cannot resume run with status 'cancelled'"
-            );
-            const rejected = await eventRecord(
-              modules.createWorkflowStore(),
-              run.id,
-              'approval_received',
-              'human-approval'
-            );
-            expect(readEventData(rejected.data)).toMatchObject({
-              decision: 'rejected',
-              reason: 'acceptance checks need revision',
-              fresh_guarded_run_required: true,
-            });
-            expect(readFileSync(String(freezeOutput.receipt), 'utf8')).toBe(frozenReceiptBytes);
-            return;
-          }
-
-          await modules.approveWorkflow(run.id, `approved ${String(freezeOutput.binding_id)}`);
-          const approvalCompleted = await eventRecord(
-            modules.createWorkflowStore(),
-            run.id,
-            'node_completed',
-            'human-approval'
-          );
-          const approvalReceived = await eventRecord(
-            modules.createWorkflowStore(),
-            run.id,
-            'approval_received',
-            'human-approval'
-          );
-          expect(Number(requestedEvent.event_order)).toBeLessThan(
-            Number(approvalCompleted.event_order)
-          );
-          expect(Number(approvalCompleted.event_order)).toBeLessThan(
-            Number(approvalReceived.event_order)
-          );
-          const currentRun = await modules.workflowDb.getWorkflowRun(run.id);
-          if (!currentRun) throw new Error('missing workflow run after approval');
-          expect(currentRun.metadata.hardened_controller_policy).not.toHaveProperty(
-            'workflowSource'
-          );
-          const persistedPolicy = currentRun.metadata.hardened_controller_policy;
-          const missingSeedDigest = { ...persistedPolicy };
-          delete (missingSeedDigest as Record<string, unknown>).proxyBudgetSeedDigest;
-          expect(() =>
-            modules.resumeHardenedControllerSession({
-              runId: run.id,
-              workflow,
-              image,
-              policyMetadata: missingSeedDigest,
-              budget: { deadlineAt: '2030-01-01T00:00:00.000Z', tokens: { total: 100_000 } },
-            })
-          ).toThrow(
-            /private session binding changed|provider budget seed lacks egress authority|persisted egress policy lacks operator authority/
-          );
-          expect(() =>
-            modules.resumeHardenedControllerSession({
-              runId: run.id,
-              workflow,
-              image,
-              policyMetadata: persistedPolicy,
-              budget: { deadlineAt: '2030-01-01T00:00:00.000Z', tokens: { total: 100_001 } },
-            })
-          ).toThrow(/budget grant does not match/);
-          const authenticated = modules.resumeHardenedControllerSession({
-            runId: run.id,
-            workflow,
-            image,
-            policyMetadata: persistedPolicy,
-            budget: { deadlineAt: '2030-01-01T00:00:00.000Z', tokens: { total: 100_000 } },
-          });
-          expect(getHardenedControllerProxyBudgetSeed(authenticated)?.grant.runId).toBe(run.id);
-          const resumeBinding = {
-            egressPolicyB64: authenticated.policyMetadata.egressPolicyB64,
-            image: authenticated.policyMetadata.image,
-            ownerRunId: authenticated.policyMetadata.runId,
-            proxyBudgetSeedDigest: authenticated.policyMetadata.proxyBudgetSeedDigest,
-          };
-          const resumed = await backend.resumeEnv(prepared.envId, resumeBinding);
-          await expect(
-            backend.readProxyBudgetStatus(prepared.envId, resumeBinding)
-          ).resolves.toMatchObject({
-            source: 'controller-proxy-ledger',
-            envId: prepared.envId,
-            pendingReservations: 0,
-            unknownReservations: 0,
-            acceptingReservations: true,
-            consumed: { input: 0, output: 0 },
-          });
-          const hydrated = await modules.hydrateResumableRun(deps, currentRun);
-          if (!hydrated) throw new Error('expected resumable DAG state');
-          const second = await modules.executeWorkflow(
-            deps,
-            makePlatform(),
-            'conv-platform',
-            resumed.cwd,
-            workflow,
-            'ship',
-            'conv-docker',
-            {
-              ...hydrated,
-              codebaseId: 'cb-docker',
-              execContext: resumed.execContext,
-              container: {
-                envId: prepared.envId,
-                writeBack: 'auto' as const,
-                backend,
-                ...resumeBinding,
-              },
-              source: 'project',
-            }
-          );
-
-          expect(second.success).toBe(false);
-          const failedEvents =
-            (await modules.createWorkflowStore().listWorkflowEvents?.(run.id))?.filter(
-              event => event.event_type === 'node_failed'
-            ) ?? [];
-          expect(`${second.error ?? ''} ${JSON.stringify(failedEvents)}`).toContain(
-            'hardened container write-back is not implemented'
-          );
-          const approvalOutput = await completedOutput(
-            modules.createWorkflowStore(),
-            run.id,
-            'approval-check'
-          );
-          expect(approvalOutput).toMatchObject({
-            approved: true,
-            binding_id: freezeOutput.binding_id,
-            oracle_digest: freezeOutput.oracle_digest,
-          });
-          const importOutput = await completedOutput(
-            modules.createWorkflowStore(),
-            run.id,
-            'candidate-import'
-          );
-          expect(importOutput.schema).toBe('archon.candidate-import-result.v1');
-          expect(importOutput.authority).toBe('none');
-          expect(importOutput.repositoryTarget).toBe('api');
-          const imported = importOutput.import as Record<string, unknown>;
-          expect(imported.authority).toBe('none');
-          const content = imported.content as Record<string, unknown>;
-          const candidate = importOutput.candidate as Record<string, unknown>;
-          expect(imported.candidateCommit).toBe(candidate.commit);
-          expect(imported.candidateTreeOid).toBe(candidate.tree);
-          expect(readFileSync(join(String(content.destination), 'README.md'), 'utf8')).toBe(
-            'candidate v2\n'
-          );
-          expect(Object.keys(candidate).sort()).toEqual(['commit', 'tree']);
-          const blackboxOutput = await completedOutput(
-            modules.createWorkflowStore(),
-            run.id,
-            'candidate-blackbox'
-          );
-          expect(blackboxOutput).toMatchObject({
-            schema: 'archon.candidate-blackbox-test-result.v1',
-            authority: 'none',
-            status: 'passed',
-            repositoryTarget: 'api',
-            profile: 'static-web-http-v1',
-            verifiedOnly: true,
-          });
-          const blackboxReceipt = JSON.parse(readFileSync(String(blackboxOutput.receipt), 'utf8'));
-          expect(blackboxReceipt.schema).toBe('archon.candidate-blackbox-test-receipt.v1');
-          expect(blackboxReceipt.rawObservationAuthority).toBe('none');
-          expect(blackboxReceipt.validatorNodeModulesPath).toContain('validator-node-modules');
-          await modules.workflowDb.updateWorkflowRun(run.id, { status: 'running' });
-          const replayOutput = await replayBlackboxControllerAction(
-            deps,
-            modules,
-            run.id,
-            workflow,
-            prepared.cwd,
-            prepared.execContext
-          );
-          expect(replayOutput).toMatchObject({
-            schema: 'archon.candidate-blackbox-test-result.v1',
-            authority: 'none',
-            status: 'passed',
-            verifiedOnly: true,
-          });
-          expect(replayOutput.receipt).toBe(blackboxOutput.receipt);
-          expect(readFileSync(String(freezeOutput.receipt), 'utf8')).toContain(
-            String(freezeOutput.binding_id)
-          );
-        } finally {
-          if (envId) await backend.destroy(envId);
-          await assertNoOwnedDockerResources(run.id);
-        }
-      },
+      `freezes real artifact volume evidence and enforces the human ${decision} operation for ${profile}`,
+      async () => runControllerScenario({ decision, profile, source, archonHome }),
       120_000
     );
   }
 });
+
+async function runControllerScenario(args: {
+  decision: 'approve' | 'reject';
+  profile: BlackboxProfile;
+  source: string;
+  archonHome: string;
+}): Promise<void> {
+  const { decision, profile, source, archonHome } = args;
+  const workflow = makeWorkflow(profile);
+  const image = await resolveTestImage();
+  const playwrightNodeModules = resolvePlaywrightNodeModules();
+  const verifierImage = await resolveVerifierImage();
+  writeApprovalPolicy(archonHome, workflow, image, verifierImage, playwrightNodeModules, profile);
+  const modules = await loadRuntimeModules();
+  await seedParents(modules.db, source);
+  const run = await modules.workflowDb.createWorkflowRun({
+    workflow_name: workflow.name,
+    conversation_id: 'conv-docker',
+    codebase_id: 'cb-docker',
+    user_message: 'ship',
+    working_path: '/workspace',
+    metadata: { isolation: 'container' },
+  });
+  const session = modules.prepareHardenedControllerSession({
+    runId: run.id,
+    workflow,
+    sourceRoot: source,
+    repoInputs: [{ targetPath: 'api' }],
+    conversationId: 'conv-docker',
+    userMessage: 'ship',
+    image,
+    requestedImage: process.env.ARCHON_CONTAINER_TEST_IMAGE,
+    budget: { deadlineAt: '2030-01-01T00:00:00.000Z', tokens: { total: 100_000 } },
+  });
+  const proxyBudget = requireProxyBudget(session);
+  const backend = new ContainerBackend({
+    store: modules.createIsolationStore(),
+    config: {
+      profile: 'hardened',
+      image,
+      network: 'none',
+      memoryMb: 2048,
+      pidsLimit: 256,
+      egressPolicy: getHardenedControllerEgressPolicy(session),
+      proxyBudget,
+    },
+  });
+  let envId: string | undefined;
+
+  try {
+    const prepared = await backend.prepare({
+      codebase: {
+        id: 'cb-docker',
+        defaultCwd: '/workspace',
+        name: 'fixture',
+        kind: 'folder',
+      },
+      seed: session.seed,
+      ownerRunId: run.id,
+    });
+    envId = prepared.envId;
+    const isolation = await modules.createIsolationStore().getById(envId);
+    expect(typeof isolation?.metadata.egressPolicyB64).toBe('string');
+    expect(isolation?.metadata.egressPolicyB64).toBe(session.policyMetadata.egressPolicyB64);
+    expect(isolation?.metadata.proxyBudgetSeedDigest).toBe(
+      session.policyMetadata.proxyBudgetSeedDigest
+    );
+    const budgetBinding = proxyBudgetBinding(session);
+    const budgetStatus = await backend.readProxyBudgetStatus(prepared.envId, budgetBinding);
+    expect(budgetStatus).toMatchObject({
+      source: 'controller-proxy-ledger',
+      envId: prepared.envId,
+      pendingReservations: 0,
+      unknownReservations: 0,
+      acceptingReservations: true,
+      consumed: { input: 0, output: 0 },
+    });
+    expect(budgetStatus.grant).toMatchObject({
+      runId: run.id,
+      workflowDigest: computeControllerWorkflowDigest(workflow),
+      totalTokenLimit: 100_000,
+    });
+    assertNoCanariesInContainer(prepared.execContext.containerId);
+    assertBudgetMaterialInaccessibleToAgent(prepared.execContext.containerId);
+    await assertPreparedOwnership(modules.createIsolationStore(), prepared.envId, run.id);
+    await modules.workflowDb.updateWorkflowRun(run.id, {
+      metadata: {
+        isolation: 'container',
+        isolation_env_id: prepared.envId,
+        hardened_controller_policy: session.policyMetadata,
+        hardened_controller_policy_path: session.policyPath,
+        hardened_budget: persistedBudget(session),
+        [WORKFLOW_PIN_METADATA_KEY]: buildWorkflowPinState(workflow, 'project'),
+      },
+    });
+    const deps = makeDeps(
+      modules.createWorkflowStore(),
+      session,
+      (envId, destinationDir) => backend.snapshotArtifacts(envId, destinationDir),
+      playwrightNodeModules
+    );
+    const container = {
+      envId: prepared.envId,
+      writeBack: 'auto' as const,
+      backend,
+      ...budgetBinding,
+    };
+
+    const first = await modules.executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-platform',
+      prepared.cwd,
+      workflow,
+      'ship',
+      'conv-docker',
+      {
+        preCreatedRun: {
+          ...run,
+          metadata: (await modules.workflowDb.getWorkflowRun(run.id))?.metadata ?? {},
+        },
+        codebaseId: 'cb-docker',
+        execContext: prepared.execContext,
+        container,
+        source: 'project',
+      }
+    );
+    expect(first.success).toBe(true);
+    expect((await modules.workflowDb.getWorkflowRun(run.id))?.status).toBe('paused');
+    const freezeOutput = await completedOutput(modules.createWorkflowStore(), run.id, 'freeze');
+    expect(freezeOutput.binding_id).toEqual(expect.stringMatching(/^[0-9a-f]{64}$/));
+    expect(freezeOutput.oracle_digest).toEqual(expect.any(String));
+    const frozenReceiptBytes = readFileSync(String(freezeOutput.receipt), 'utf8');
+    const freezeReceipt = JSON.parse(frozenReceiptBytes) as Record<string, unknown>;
+    const oracleFiles = freezeReceipt.oracleFiles as Record<string, unknown>[];
+    expect(oracleFiles.map(file => file.path).sort()).toEqual([
+      'run/oracle/acceptance.browser.json',
+      'run/oracle/plan.md',
+    ]);
+    expect(oracleFiles.find(file => file.path === 'run/oracle/plan.md')?.size).toBe(29);
+    expect(
+      readFileSync(join(String(freezeReceipt.snapshotDir), 'run/oracle/plan.md'), 'utf8')
+    ).toBe('approved acceptance criteria\n');
+    expect(() => readFileSync(join(String(freezeReceipt.snapshotDir), '.env'), 'utf8')).toThrow();
+    const freezeCompleted = await eventRecord(
+      modules.createWorkflowStore(),
+      run.id,
+      'node_completed',
+      'freeze'
+    );
+    const requestedEvent = await eventRecord(
+      modules.createWorkflowStore(),
+      run.id,
+      'approval_requested',
+      'human-approval'
+    );
+    expect(Number(freezeCompleted.event_order)).toBeLessThan(Number(requestedEvent.event_order));
+    const requested = readEventData(requestedEvent.data);
+    expect(String(requested.message)).toContain(String(freezeOutput.binding_id));
+    expect(String(requested.message)).toContain(String(freezeOutput.oracle_digest));
+
+    if (decision === 'reject') {
+      const result = await modules.rejectWorkflow(run.id, 'acceptance checks need revision');
+      expect(result.cancelled).toBe(true);
+      expect((await modules.workflowDb.getWorkflowRun(run.id))?.status).toBe('cancelled');
+      await expect(modules.resumeWorkflow(run.id)).rejects.toThrow(
+        "Cannot resume run with status 'cancelled'"
+      );
+      const rejected = await eventRecord(
+        modules.createWorkflowStore(),
+        run.id,
+        'approval_received',
+        'human-approval'
+      );
+      expect(readEventData(rejected.data)).toMatchObject({
+        decision: 'rejected',
+        reason: 'acceptance checks need revision',
+        fresh_guarded_run_required: true,
+      });
+      expect(readFileSync(String(freezeOutput.receipt), 'utf8')).toBe(frozenReceiptBytes);
+      return;
+    }
+
+    await modules.approveWorkflow(run.id, `approved ${String(freezeOutput.binding_id)}`);
+    const approvalCompleted = await eventRecord(
+      modules.createWorkflowStore(),
+      run.id,
+      'node_completed',
+      'human-approval'
+    );
+    const approvalReceived = await eventRecord(
+      modules.createWorkflowStore(),
+      run.id,
+      'approval_received',
+      'human-approval'
+    );
+    expect(Number(requestedEvent.event_order)).toBeLessThan(Number(approvalCompleted.event_order));
+    expect(Number(approvalCompleted.event_order)).toBeLessThan(
+      Number(approvalReceived.event_order)
+    );
+    const currentRun = await modules.workflowDb.getWorkflowRun(run.id);
+    if (!currentRun) throw new Error('missing workflow run after approval');
+    expect(currentRun.metadata.hardened_controller_policy).not.toHaveProperty('workflowSource');
+    const persistedPolicy = currentRun.metadata.hardened_controller_policy;
+    const missingSeedDigest = { ...persistedPolicy };
+    delete (missingSeedDigest as Record<string, unknown>).proxyBudgetSeedDigest;
+    expect(() =>
+      modules.resumeHardenedControllerSession({
+        runId: run.id,
+        workflow,
+        image,
+        policyMetadata: missingSeedDigest,
+        budget: { deadlineAt: '2030-01-01T00:00:00.000Z', tokens: { total: 100_000 } },
+      })
+    ).toThrow(
+      /private session binding changed|provider budget seed lacks egress authority|persisted egress policy lacks operator authority/
+    );
+    expect(() =>
+      modules.resumeHardenedControllerSession({
+        runId: run.id,
+        workflow,
+        image,
+        policyMetadata: persistedPolicy,
+        budget: { deadlineAt: '2030-01-01T00:00:00.000Z', tokens: { total: 100_001 } },
+      })
+    ).toThrow(/budget grant does not match/);
+    const authenticated = modules.resumeHardenedControllerSession({
+      runId: run.id,
+      workflow,
+      image,
+      policyMetadata: persistedPolicy,
+      budget: { deadlineAt: '2030-01-01T00:00:00.000Z', tokens: { total: 100_000 } },
+    });
+    expect(getHardenedControllerProxyBudgetSeed(authenticated)?.grant.runId).toBe(run.id);
+    const resumeBinding = {
+      egressPolicyB64: authenticated.policyMetadata.egressPolicyB64,
+      image: authenticated.policyMetadata.image,
+      ownerRunId: authenticated.policyMetadata.runId,
+      proxyBudgetSeedDigest: authenticated.policyMetadata.proxyBudgetSeedDigest,
+    };
+    const resumed = await backend.resumeEnv(prepared.envId, resumeBinding);
+    await expect(
+      backend.readProxyBudgetStatus(prepared.envId, resumeBinding)
+    ).resolves.toMatchObject({
+      source: 'controller-proxy-ledger',
+      envId: prepared.envId,
+      pendingReservations: 0,
+      unknownReservations: 0,
+      acceptingReservations: true,
+      consumed: { input: 0, output: 0 },
+    });
+    const hydrated = await modules.hydrateResumableRun(deps, currentRun);
+    if (!hydrated) throw new Error('expected resumable DAG state');
+    const second = await modules.executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-platform',
+      resumed.cwd,
+      workflow,
+      'ship',
+      'conv-docker',
+      {
+        ...hydrated,
+        codebaseId: 'cb-docker',
+        execContext: resumed.execContext,
+        container: {
+          envId: prepared.envId,
+          writeBack: 'auto' as const,
+          backend,
+          ...resumeBinding,
+        },
+        source: 'project',
+      }
+    );
+
+    expect(second.success).toBe(false);
+    const failedEvents =
+      (await modules.createWorkflowStore().listWorkflowEvents?.(run.id))?.filter(
+        event => event.event_type === 'node_failed'
+      ) ?? [];
+    expect(`${second.error ?? ''} ${JSON.stringify(failedEvents)}`).toContain(
+      'hardened container write-back is not implemented'
+    );
+    const approvalOutput = await completedOutput(
+      modules.createWorkflowStore(),
+      run.id,
+      'approval-check'
+    );
+    expect(approvalOutput).toMatchObject({
+      approved: true,
+      binding_id: freezeOutput.binding_id,
+      oracle_digest: freezeOutput.oracle_digest,
+    });
+    const importOutput = await completedOutput(
+      modules.createWorkflowStore(),
+      run.id,
+      'candidate-import'
+    );
+    expect(importOutput.schema).toBe('archon.candidate-import-result.v1');
+    expect(importOutput.authority).toBe('none');
+    expect(importOutput.repositoryTarget).toBe('api');
+    const imported = importOutput.import as Record<string, unknown>;
+    expect(imported.authority).toBe('none');
+    const content = imported.content as Record<string, unknown>;
+    const candidate = importOutput.candidate as Record<string, unknown>;
+    expect(imported.candidateCommit).toBe(candidate.commit);
+    expect(imported.candidateTreeOid).toBe(candidate.tree);
+    if (profile === 'node-http-app-v1') {
+      expect(readFileSync(join(String(content.destination), 'server.cjs'), 'utf8')).toContain(
+        'candidate v2'
+      );
+    } else {
+      expect(readFileSync(join(String(content.destination), 'README.md'), 'utf8')).toBe(
+        'candidate v2\n'
+      );
+    }
+    expect(Object.keys(candidate).sort()).toEqual(['commit', 'tree']);
+    const blackboxOutput = await completedOutput(
+      modules.createWorkflowStore(),
+      run.id,
+      'candidate-blackbox'
+    );
+    expect(blackboxOutput).toMatchObject({
+      schema: 'archon.candidate-blackbox-test-result.v1',
+      authority: 'none',
+      status: 'passed',
+      repositoryTarget: 'api',
+      profile,
+      verifiedOnly: true,
+    });
+    const blackboxReceipt = JSON.parse(readFileSync(String(blackboxOutput.receipt), 'utf8'));
+    expect(blackboxReceipt.schema).toBe('archon.candidate-blackbox-test-receipt.v1');
+    expect(blackboxReceipt.rawObservationAuthority).toBe('none');
+    expect(blackboxReceipt.validatorNodeModulesPath).toContain('validator-node-modules');
+    if (profile === 'node-http-app-v1') {
+      expect(blackboxReceipt.startupEntrypoint).toBe('server.cjs');
+    } else {
+      expect(blackboxReceipt).not.toHaveProperty('startupEntrypoint');
+    }
+    await modules.workflowDb.updateWorkflowRun(run.id, { status: 'running' });
+    const replayOutput = await replayBlackboxControllerAction(
+      deps,
+      modules,
+      run.id,
+      workflow,
+      prepared.cwd,
+      prepared.execContext
+    );
+    expect(replayOutput).toMatchObject({
+      schema: 'archon.candidate-blackbox-test-result.v1',
+      authority: 'none',
+      status: 'passed',
+      verifiedOnly: true,
+    });
+    expect(replayOutput.receipt).toBe(blackboxOutput.receipt);
+    expect(readFileSync(String(freezeOutput.receipt), 'utf8')).toContain(
+      String(freezeOutput.binding_id)
+    );
+  } finally {
+    await destroyPreparedEnv(backend, envId, run.id);
+  }
+}
+
+function requireProxyBudget(session: HardenedControllerSession): ProxyBudgetSeed {
+  const proxyBudget = getHardenedControllerProxyBudgetSeed(session);
+  if (!proxyBudget) throw new Error('missing proxy budget seed');
+  return proxyBudget;
+}
+
+async function destroyPreparedEnv(
+  backend: ContainerBackend,
+  envId: string | undefined,
+  ownerRunId: string
+): Promise<void> {
+  if (envId) await backend.destroy(envId);
+  await assertNoOwnedDockerResources(ownerRunId);
+}
 
 async function loadRuntimeModules() {
   const connection = await import('../db/connection');
@@ -757,7 +786,7 @@ function assertBudgetMaterialInaccessibleToAgent(containerId: string): void {
   expect(output.trim().split('\n'), output).toEqual(['ledger=absent', 'grant=absent']);
 }
 
-function makeWorkflow(): WorkflowDefinition {
+function makeWorkflow(profile: BlackboxProfile = 'static-web-http-v1'): WorkflowDefinition {
   return {
     name: 'hardened-controller-docker-e2e',
     mutates_checkout: false,
@@ -798,18 +827,7 @@ function makeWorkflow(): WorkflowDefinition {
       {
         id: 'export-candidate',
         depends_on: ['approval-check'],
-        bash: [
-          'cd /workspace/api',
-          'printf "candidate v2\\n" > README.md',
-          'printf "<main>candidate v2</main>\\n" > index.html',
-          'git add index.html',
-          'git -c user.name=Test -c user.email=test@example.com commit -am candidate',
-          'git update-ref refs/candidates/sealed HEAD',
-          'git bundle create "$ARTIFACTS_DIR/candidate.bundle" refs/candidates/sealed',
-          'commit=$(git rev-parse HEAD)',
-          'tree=$(git rev-parse HEAD^{tree})',
-          `printf '{"schema":"archon.candidate-proposal.v1","commit":"%s","tree":"%s"}\n' "$commit" "$tree" > "$ARTIFACTS_DIR/candidate.json"`,
-        ].join(' && '),
+        bash: candidateExportCommand(profile),
       },
       {
         id: 'candidate-import',
@@ -827,12 +845,44 @@ function makeWorkflow(): WorkflowDefinition {
   } as WorkflowDefinition;
 }
 
+function candidateExportCommand(profile: BlackboxProfile): string {
+  const writeCandidate =
+    profile === 'node-http-app-v1'
+      ? [
+          "cat > server.cjs <<'JS'",
+          "const http = require('node:http');",
+          'const port = Number(process.argv[2] || process.env.PORT);',
+          'http.createServer((_req, res) => {',
+          "  res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });",
+          "  res.end('<main>candidate v2</main>');",
+          "}).listen(port, '127.0.0.1');",
+          'JS',
+          'git add server.cjs',
+        ].join('\n')
+      : [
+          'printf "candidate v2\\n" > README.md',
+          'printf "<main>candidate v2</main>\\n" > index.html',
+          'git add index.html',
+        ].join(' && ');
+  return [
+    'cd /workspace/api',
+    writeCandidate,
+    'git -c user.name=Test -c user.email=test@example.com commit -am candidate',
+    'git update-ref refs/candidates/sealed HEAD',
+    'git bundle create "$ARTIFACTS_DIR/candidate.bundle" refs/candidates/sealed',
+    'commit=$(git rev-parse HEAD)',
+    'tree=$(git rev-parse HEAD^{tree})',
+    `printf '{"schema":"archon.candidate-proposal.v1","commit":"%s","tree":"%s"}\n' "$commit" "$tree" > "$ARTIFACTS_DIR/candidate.json"`,
+  ].join(' && ');
+}
+
 function writeApprovalPolicy(
   home: string,
   workflow: WorkflowDefinition,
   image: string,
   verifierImage: string,
-  playwrightNodeModules: string
+  playwrightNodeModules: string,
+  profile: BlackboxProfile = 'static-web-http-v1'
 ): void {
   const policyPath = join(home, 'controller-policy', 'planning-approval.json');
   mkdirSync(dirname(policyPath), { recursive: true, mode: 0o700 });
@@ -897,7 +947,8 @@ function writeApprovalPolicy(
         candidateImportNodeId: 'candidate-import',
         freezeNodeId: 'freeze',
         approvalReceiptNodeId: 'approval-check',
-        profile: 'static-web-http-v1',
+        profile,
+        ...(profile === 'node-http-app-v1' ? { startupEntrypoint: 'server.cjs' } : {}),
         acceptancePolicyPath: 'run/oracle/acceptance.browser.json',
         appRoot: '.',
         port: 4173,

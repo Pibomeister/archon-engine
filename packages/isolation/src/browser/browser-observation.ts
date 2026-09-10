@@ -27,10 +27,13 @@ const HEX64 = /^[0-9a-f]{64}$/i;
 const IMAGE_ID = /^sha256:[0-9a-f]{64}$/i;
 const ASSERTION_TYPES = new Set(['text', 'selector', 'url', 'title', 'testid', 'click', 'fill']);
 const STATIC_WEB_PROFILE = 'static-web-http-v1';
+const NODE_HTTP_PROFILE = 'node-http-app-v1';
+const CANDIDATE_PROFILES = new Set([STATIC_WEB_PROFILE, NODE_HTTP_PROFILE]);
 const MAX_CANDIDATE_FILES = 1000;
 const MAX_CANDIDATE_FILE_BYTES = 16 * 1024 * 1024;
 const MAX_CANDIDATE_TOTAL_BYTES = 64 * 1024 * 1024;
 const BASE64_BYTES = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+type CandidateSourceProfile = typeof STATIC_WEB_PROFILE | typeof NODE_HTTP_PROFILE;
 
 export interface BrowserAssertion {
   type: string;
@@ -57,11 +60,16 @@ export interface CandidateSourceFile {
   contentBase64: string;
 }
 
+export interface CandidateStartupDescriptor {
+  entrypoint: string;
+}
+
 export interface CandidateSourceDescriptor {
-  profile: typeof STATIC_WEB_PROFILE;
+  profile: CandidateSourceProfile;
   commit: string;
   tree: string;
   appRoot: string;
+  startup?: CandidateStartupDescriptor;
   contentDigest: string;
   files: CandidateSourceFile[];
 }
@@ -540,7 +548,9 @@ export class BrowserObservationService {
       '1',
       '--pids-limit',
       '256',
+      ...candidateEnvArgs(app),
       ...candidateEntrypointArgs(app),
+      ...candidateWorkdirArgs(app),
       ...candidateMountArgs(resources, app),
       appImageId,
       ...app.command,
@@ -756,7 +766,12 @@ function normalizedAppCommand(
   app: ApplicationDescriptor,
   candidateSource: NormalizedCandidateSourceDescriptor | undefined
 ): string[] {
-  if (candidateSource) return staticWebCommand(app.port, candidateSource.appRoot);
+  if (candidateSource?.profile === STATIC_WEB_PROFILE) {
+    return staticWebCommand(app.port, candidateSource.appRoot);
+  }
+  if (candidateSource?.profile === NODE_HTTP_PROFILE) {
+    return nodeHttpCommand(app.port, candidateSource);
+  }
   return app.command ?? ['sh', '-lc', `python3 -m http.server ${app.port} --bind 127.0.0.1`];
 }
 
@@ -767,15 +782,16 @@ function normalizeCandidateSource(
   const source = app.candidateSource;
   if (!source) return undefined;
   validateTrustedCandidateHelperImage(app, options.trustedCandidateHelperImage);
-  if (app.command) throw new Error('Candidate source profile uses a fixed controller command.');
+  if (app.command) throw new Error('Candidate source profile uses a fixed controller startup.');
   validateCandidateBinding(app, source);
   const appRoot = normalizeCandidatePath(source.appRoot, 'appRoot', { directory: true });
   const files = normalizeCandidateFiles(source.files, appRoot);
-  const contentDigest = candidateContentDigest(source, appRoot, files);
+  const startup = normalizeCandidateStartup(source, appRoot, files);
+  const contentDigest = candidateContentDigest(source, appRoot, files, startup);
   if (contentDigest !== source.contentDigest) {
     throw new Error('Candidate source content digest does not match the file manifest.');
   }
-  return { ...source, appRoot, files };
+  return { ...source, appRoot, files, ...(startup ? { startup } : {}) };
 }
 
 function validateTrustedCandidateHelperImage(
@@ -797,7 +813,7 @@ function validateCandidateBinding(
   app: ApplicationDescriptor,
   source: CandidateSourceDescriptor
 ): void {
-  if (source.profile !== STATIC_WEB_PROFILE) {
+  if (!CANDIDATE_PROFILES.has(source.profile)) {
     throw new Error(`Unsupported candidate source profile '${source.profile}'.`);
   }
   if (!HEX40.test(source.commit) || !HEX40.test(source.tree)) {
@@ -809,6 +825,30 @@ function validateCandidateBinding(
   if (!HEX64.test(source.contentDigest)) {
     throw new Error('Candidate source content digest must be sha256 hex.');
   }
+}
+
+function normalizeCandidateStartup(
+  source: CandidateSourceDescriptor,
+  appRoot: string,
+  files: NormalizedCandidateSourceFile[]
+): CandidateStartupDescriptor | undefined {
+  if (source.profile === STATIC_WEB_PROFILE) {
+    if (source.startup) throw new Error('Static candidate source profile cannot set startup.');
+    return undefined;
+  }
+  const startup = source.startup;
+  if (!startup || typeof startup !== 'object') {
+    throw new Error('Node candidate source profile requires controller startup.');
+  }
+  const entrypoint = normalizeCandidatePath(startup.entrypoint, 'startup entrypoint');
+  if (entrypoint.startsWith('-')) {
+    throw new Error('Node candidate startup entrypoint must not be parsed as a Node option.');
+  }
+  const expectedPath = appRoot === '.' ? entrypoint : `${appRoot}/${entrypoint}`;
+  if (!files.some(file => file.path === expectedPath)) {
+    throw new Error('Node candidate startup entrypoint is not present in appRoot.');
+  }
+  return { entrypoint };
 }
 
 function normalizeCandidateFiles(
@@ -891,18 +931,21 @@ function candidatePathWithinRoot(path: string, appRoot: string): boolean {
 function candidateContentDigest(
   source: CandidateSourceDescriptor,
   appRoot: string,
-  files: NormalizedCandidateSourceFile[]
+  files: NormalizedCandidateSourceFile[],
+  startup: CandidateStartupDescriptor | undefined
 ): string {
   const manifest = files
     .map(file => ({ path: file.path, sha256: file.sha256, size: file.size, type: file.type }))
     .sort((a, b) => compareCodepoint(a.path, b.path));
-  return canonicalDigest({
+  const descriptor: Record<string, unknown> = {
     appRoot,
     commit: source.commit,
     files: manifest,
     profile: source.profile,
     tree: source.tree,
-  });
+  };
+  if (startup) descriptor.startup = startup;
+  return canonicalDigest(descriptor);
 }
 
 function compareCodepoint(left: string, right: string): number {
@@ -1200,8 +1243,27 @@ function candidateEntrypointArgs(app: NormalizedApplicationDescriptor): string[]
   return ['--entrypoint', 'node'];
 }
 
+function candidateEnvArgs(app: NormalizedApplicationDescriptor): string[] {
+  if (app.candidateSource?.profile !== NODE_HTTP_PROFILE) return [];
+  return ['--env', `PORT=${app.port}`];
+}
+
+function candidateWorkdirArgs(app: NormalizedApplicationDescriptor): string[] {
+  if (app.candidateSource?.profile !== NODE_HTTP_PROFILE) return [];
+  return ['--workdir', candidateRootMountPath(app.candidateSource.appRoot)];
+}
+
 function staticWebCommand(port: number, appRoot: string): string[] {
   return ['-e', STATIC_WEB_SERVER_JS, String(port), candidateRootMountPath(appRoot)];
+}
+
+function nodeHttpCommand(
+  port: number,
+  candidateSource: NormalizedCandidateSourceDescriptor
+): string[] {
+  const entrypoint = candidateSource.startup?.entrypoint;
+  if (!entrypoint) throw new Error('Node candidate source profile requires controller startup.');
+  return ['--', entrypoint, String(port)];
 }
 
 function candidateRootMountPath(appRoot: string): string {
