@@ -58,6 +58,7 @@ export {
 // Provider classes
 export { ClaudeProvider } from './claude/provider';
 export { CodexProvider } from './codex/provider';
+export { GrokProvider } from './grok/provider';
 
 // Config parsers
 export {
@@ -67,6 +68,7 @@ export {
   type ParsedSettingSources,
 } from './claude/config';
 export { parseCodexConfig, type CodexProviderDefaults } from './codex/config';
+export { parseGrokConfig, parseGrokRunConfig, type GrokProviderDefaults } from './grok/config';
 
 // Utilities (needed by consumers)
 export { resetCodexSingleton } from './codex/provider';

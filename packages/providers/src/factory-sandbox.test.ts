@@ -7,6 +7,7 @@ import {
   factoryClaudeScope,
   factoryCodexScope,
   factoryCodexConfigOverrides,
+  factoryGrokSandboxToml,
 } from './factory-sandbox';
 
 // `validateFactoryProviderScope` qualifies darwin and linux only — anywhere else it
@@ -46,6 +47,55 @@ describe.skipIf(!factorySandboxQualified)('trusted factory provider writable sco
       }
     }
   );
+  test('Grok factory sandbox extends strict and denies the manual checkout', async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'factory-grok-scope-')));
+    try {
+      const worktree = join(root, 'worktree');
+      const artifacts = join(root, 'artifacts');
+      const knowledge = join(root, 'knowledge');
+      const manual = join(root, 'manual');
+      for (const path of [worktree, artifacts, knowledge, manual]) mkdirSync(path);
+      const toml = factoryGrokSandboxToml(
+        {
+          workspaceRoot: worktree,
+          writableRoots: [worktree, artifacts],
+          readableRoots: [knowledge],
+          deniedRoots: [manual],
+        },
+        worktree
+      );
+      expect(toml).toContain('[profiles.archon-factory]');
+      expect(toml).toContain('extends = "strict"');
+      expect(toml).toContain(JSON.stringify(worktree));
+      expect(toml).toContain(JSON.stringify(knowledge));
+      expect(toml).toContain(`deny = [${JSON.stringify(manual)}]`);
+      const gitDir = join(manual, '.git');
+      mkdirSync(gitDir);
+      const nested = factoryGrokSandboxToml(
+        {
+          workspaceRoot: worktree,
+          writableRoots: [worktree],
+          readableRoots: [gitDir],
+          deniedRoots: [manual],
+        },
+        worktree
+      );
+      expect(nested).toContain(`read_only = [${JSON.stringify(gitDir)}]`);
+      expect(nested).not.toContain(`deny = [${JSON.stringify(manual)}]`);
+      expect(() =>
+        factoryGrokSandboxToml(
+          {
+            workspaceRoot: worktree,
+            writableRoots: [worktree],
+            deniedRoots: [manual],
+          },
+          manual
+        )
+      ).toThrow('factory_provider_workspace_mismatch');
+    } finally {
+      await removeTempTree(root);
+    }
+  });
   test('uses native workspace-write and only explicit extra directories for Codex', async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), 'factory-scope-')));
     try {
