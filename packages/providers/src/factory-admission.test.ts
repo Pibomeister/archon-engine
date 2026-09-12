@@ -99,6 +99,12 @@ describe('factory provider exclusive stream admission', () => {
     ).rejects.toThrow('factory_provider_not_qualified');
     expect(f.counts().constructions).toBe(0);
   });
+  test('managed grok is a qualified factory provider', async () => {
+    const f = fixture();
+    await consume(createAdmittedProvider({ ...f.entry, id: 'grok' }, f.broker));
+    expect(f.counts()).toEqual({ constructions: 1, executions: 1, active: false });
+    expect(f.requests[0]?.provider).toBe('grok');
+  });
   test('a declined or mismatched broker response never starts a provider', async () => {
     const f = fixture();
     f.broker.acquire = async request => ({

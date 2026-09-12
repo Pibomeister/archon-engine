@@ -45,7 +45,7 @@ export const configSchema = z
           .array(
             z
               .object({
-                provider: z.enum(['codex', 'claude']),
+                provider: z.enum(['codex', 'claude', 'grok']),
                 models: z.array(text).min(1),
                 purpose: z.enum(['implementation', 'auxiliary-call', 'title-generation']),
               })

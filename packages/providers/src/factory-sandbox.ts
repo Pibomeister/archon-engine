@@ -86,6 +86,29 @@ export function factoryCodexScope(
   };
 }
 
+export function factoryGrokSandboxToml(scope: FactoryProviderScope, cwd: string): string {
+  const checked = validateFactoryProviderScope(scope, cwd);
+  const readableRoots = checked.readableRoots ?? [];
+  const kernelDenied = checked.deniedRoots.filter(
+    denied => !readableRoots.some(readable => contains(denied, readable) || readable === denied)
+  );
+  const lines = ['[profiles.archon-factory]', 'extends = "strict"'];
+  if (checked.writableRoots.length > 0) {
+    lines.push(`read_write = ${tomlStringArray(checked.writableRoots)}`);
+  }
+  if (readableRoots.length > 0) {
+    lines.push(`read_only = ${tomlStringArray(readableRoots)}`);
+  }
+  if (kernelDenied.length > 0) {
+    lines.push(`deny = ${tomlStringArray(kernelDenied)}`);
+  }
+  return `${lines.join('\n')}\n`;
+}
+
+function tomlStringArray(values: readonly string[]): string {
+  return `[${values.map(value => JSON.stringify(value)).join(', ')}]`;
+}
+
 export function factoryClaudeScope(scope: FactoryProviderScope, cwd: string): Partial<Options> {
   const checked = validateFactoryProviderScope(scope, cwd);
   // Read/Edit permission rules use // for absolute paths; sandbox filesystem

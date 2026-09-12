@@ -113,7 +113,7 @@ export function createAdmittedProvider(
     getCapabilities: () => entry.capabilities,
     async *sendQuery(prompt, cwd, resumeSessionId, options): AsyncGenerator<MessageChunk> {
       if (!broker) throw new Error('factory_provider_broker_required');
-      if (entry.id !== 'claude' && entry.id !== 'codex') {
+      if (entry.id !== 'claude' && entry.id !== 'codex' && entry.id !== 'grok') {
         throw new Error('factory_provider_not_qualified');
       }
       const admittedOptions = snapshot(options);
