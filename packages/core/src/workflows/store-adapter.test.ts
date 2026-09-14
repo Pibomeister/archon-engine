@@ -43,6 +43,8 @@ mock.module('../db/workflows', () => ({
   cancelWorkflowRun: mockCancelWorkflowRun,
   cancelFanOutRun: mockCancelFanOutRun,
   pauseWorkflowRun: mockPauseWorkflowRun,
+  pauseWorkflowRunForFactoryHumanInput: mock(async (_id, _context) => {}),
+  resolveFactoryHumanInput: mock(async (_id, _context) => ({ resolved: true })),
   pauseWorkflowRunForWait: mockPauseWorkflowRunForWait,
   clearWorkflowWaitContext: mockClearWorkflowWaitContext,
   resolveApprovalGate: mockResolveApprovalGate,

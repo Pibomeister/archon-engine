@@ -7,13 +7,57 @@ import {
   existsSync,
   writeFileSync,
   readFileSync,
+  chmodSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { factoryCodexConfig } from './factory-sandbox';
+import { Codex } from '@openai/codex-sdk';
+import { factoryCodexConfigOverrides } from './factory-sandbox';
 
 const binary = process.env.ARCHON_TEST_CODEX_SANDBOX_BINARY;
+
+describe('factory Codex SDK configuration serialization', () => {
+  test('passes absolute filesystem permissions as one raw TOML table', async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'factory-sdk-config-')));
+    try {
+      const worktree = join(root, 'worktree');
+      const manual = join(root, 'manual.with dots space "quote"');
+      const capture = join(root, 'argv');
+      const recorder = join(root, 'codex-recorder');
+      mkdirSync(worktree);
+      mkdirSync(join(manual, '.git'), { recursive: true });
+      writeFileSync(
+        recorder,
+        '#!/bin/sh\nprintf "%s\\n" "$@" > ' + JSON.stringify(capture) + '\nexit 1\n'
+      );
+      chmodSync(recorder, 0o700);
+      const overrides = factoryCodexConfigOverrides(
+        {
+          workspaceRoot: worktree,
+          writableRoots: [worktree],
+          readableRoots: [join(manual, '.git')],
+          deniedRoots: [manual],
+        },
+        worktree
+      );
+      const thread = new Codex({
+        codexPathOverride: recorder,
+        configOverrides: overrides,
+      }).startThread({
+        workingDirectory: worktree,
+        sandboxMode: undefined,
+      });
+      await expect(thread.run('fixture')).rejects.toThrow('Codex Exec exited');
+      const args = readFileSync(capture, 'utf8');
+      expect(args).toContain('permissions.archon-factory.filesystem={');
+      expect(args).toContain(JSON.stringify(join(manual, '.git')));
+      expect(args).not.toContain('filesystem.' + join(manual, '.git'));
+    } finally {
+      await removeTempTree(root);
+    }
+  });
+});
 
 describe.skipIf(!binary || process.platform !== 'darwin')(
   'actual pinned Codex native workspace sandbox (no model)',
@@ -44,7 +88,7 @@ describe.skipIf(!binary || process.platform !== 'darwin')(
         git('commit', '-qm', 'Fixture');
         git('worktree', 'add', '-q', '-b', 'factory-fixture', worktree);
         writeFileSync(join(worktree, 'app.txt'), 'changed\n');
-        const config = factoryCodexConfig(
+        const configOverrides = factoryCodexConfigOverrides(
           {
             workspaceRoot: worktree,
             writableRoots: [worktree],
@@ -53,23 +97,24 @@ describe.skipIf(!binary || process.platform !== 'darwin')(
           },
           worktree
         );
-        const profile = (
-          config.permissions as { 'archon-factory': { filesystem: Record<string, string> } }
-        )['archon-factory'];
-        writeFileSync(
-          join(home, 'config.toml'),
-          '[permissions.archon-factory.filesystem]\n' +
-            Object.entries(profile.filesystem)
-              .map(([key, value]) => JSON.stringify(key) + ' = ' + JSON.stringify(value))
-              .join('\n') +
-            '\n'
-        );
         const run = (args: string[]) =>
-          spawnSync(binary!, ['sandbox', '-P', 'archon-factory', '-C', worktree, ...args], {
-            env,
-            encoding: 'utf8',
-            timeout: 15000,
-          });
+          spawnSync(
+            binary!,
+            [
+              'sandbox',
+              ...configOverrides.flatMap(value => ['--config', value]),
+              '-P',
+              'archon-factory',
+              '-C',
+              worktree,
+              ...args,
+            ],
+            {
+              env,
+              encoding: 'utf8',
+              timeout: 15000,
+            }
+          );
         const status = run(['/usr/bin/git', 'status', '--porcelain']);
         expect(status.status, status.stderr).toBe(0);
         expect(status.stdout).toContain('app.txt');
@@ -93,26 +138,16 @@ describe.skipIf(!binary || process.platform !== 'darwin')(
         for (const path of [worktree, manual, home]) mkdirSync(path);
         const sentinel = join(manual, 'sentinel');
         writeFileSync(sentinel, 'unchanged');
-        const config = factoryCodexConfig(
+        const configOverrides = factoryCodexConfigOverrides(
           { workspaceRoot: worktree, writableRoots: [worktree], deniedRoots: [manual] },
           worktree
-        );
-        const profile = (
-          config.permissions as { 'archon-factory': { filesystem: Record<string, string> } }
-        )['archon-factory'];
-        writeFileSync(
-          join(home, 'config.toml'),
-          '[permissions.archon-factory.filesystem]\n' +
-            Object.entries(profile.filesystem)
-              .map(([key, value]) => JSON.stringify(key) + ' = ' + JSON.stringify(value))
-              .join('\n') +
-            '\n'
         );
         const run = (target: string) =>
           spawnSync(
             binary!,
             [
               'sandbox',
+              ...configOverrides.flatMap(value => ['--config', value]),
               '--permission-profile',
               'archon-factory',
               '-C',

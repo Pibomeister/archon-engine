@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import {
   factoryClaudeScope,
   factoryCodexScope,
-  factoryCodexConfig,
+  factoryCodexConfigOverrides,
   factoryGrokSandboxToml,
 } from './factory-sandbox';
 
@@ -21,13 +21,13 @@ describe('trusted factory provider writable scope', () => {
         mkdirSync(worktree);
         mkdirSync(manual);
         expect(() =>
-          factoryCodexConfig(
+          factoryCodexConfigOverrides(
             { workspaceRoot: worktree, writableRoots: [worktree], deniedRoots: [manual] },
             worktree
           )
         ).toThrow('factory_provider_protected_tmp_root_unqualified');
         expect(() =>
-          factoryCodexConfig(
+          factoryCodexConfigOverrides(
             {
               workspaceRoot: worktree,
               writableRoots: [worktree],
@@ -107,14 +107,11 @@ describe('trusted factory provider writable scope', () => {
         additionalDirectories: [],
         approvalPolicy: 'never',
       });
-      expect(factoryCodexConfig(scope, worktree)).toMatchObject({
-        default_permissions: 'archon-factory',
-        permissions: {
-          'archon-factory': {
-            filesystem: { [worktree]: 'write', [artifacts]: 'write', [manual]: 'deny' },
-          },
-        },
-      });
+      expect(factoryCodexConfigOverrides(scope, worktree)).toEqual([
+        'default_permissions="archon-factory"',
+        `permissions.archon-factory.filesystem={":minimal" = "read", ${JSON.stringify(worktree)} = "write", ${JSON.stringify(artifacts)} = "write", ${JSON.stringify(manual)} = "deny"}`,
+        'permissions.archon-factory.network.enabled=true',
+      ]);
       expect(() => factoryCodexScope(scope, manual)).toThrow('factory_provider_workspace_mismatch');
       expect(() =>
         factoryCodexScope({ ...scope, writableRoots: [worktree, root] }, worktree)

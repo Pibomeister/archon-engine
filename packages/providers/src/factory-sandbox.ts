@@ -2,7 +2,7 @@
 import { realpathSync } from 'node:fs';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
 import type { Options } from '@anthropic-ai/claude-agent-sdk';
-import type { CodexOptions, ThreadOptions } from '@openai/codex-sdk';
+import type { ThreadOptions } from '@openai/codex-sdk';
 
 export interface FactoryProviderScope {
   workspaceRoot: string;
@@ -58,19 +58,29 @@ export function validateFactoryProviderScope(
   };
 }
 
-export function factoryCodexConfig(
-  scope: FactoryProviderScope,
-  cwd: string
-): NonNullable<CodexOptions['config']> {
+/**
+ * The Codex SDK flattens object config keys with dots. Filesystem entries use
+ * absolute paths, so that serialization turns one path into several config
+ * segments and silently drops the intended permission. Keep the filesystem
+ * map as one TOML inline table and pass it through the SDK unchanged.
+ */
+export function factoryCodexConfigOverrides(scope: FactoryProviderScope, cwd: string): string[] {
   const checked = validateFactoryProviderScope(scope, cwd);
   const filesystem: Record<string, string> = { ':minimal': 'read' };
   for (const path of checked.readableRoots ?? []) filesystem[path] = 'read';
   for (const path of checked.writableRoots) filesystem[path] = 'write';
   for (const path of checked.deniedRoots) filesystem[path] = 'deny';
-  return {
-    default_permissions: 'archon-factory',
-    permissions: { 'archon-factory': { filesystem, network: { enabled: true } } },
-  };
+  const inlineTable =
+    '{' +
+    Object.entries(filesystem)
+      .map(([path, mode]) => `${JSON.stringify(path)} = ${JSON.stringify(mode)}`)
+      .join(', ') +
+    '}';
+  return [
+    'default_permissions="archon-factory"',
+    `permissions.archon-factory.filesystem=${inlineTable}`,
+    'permissions.archon-factory.network.enabled=true',
+  ];
 }
 
 export function factoryCodexScope(

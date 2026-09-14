@@ -1,6 +1,12 @@
 import { createHash } from 'node:crypto';
 import { getDatabase, getDatabaseType } from './connection';
+import { insertWorkflowEvent } from './workflow-events';
 import type { IDatabase } from './adapters/types';
+import {
+  FACTORY_HUMAN_INPUT_METADATA_KEY,
+  factoryHumanInputContextSchema,
+  isFactoryHumanInputContext,
+} from '@archon/workflows/schemas/workflow-run';
 
 export const GATE_EVIDENCE_POLICY = 'approval-evidence.v1';
 
@@ -9,6 +15,17 @@ export interface GateCommandBinding {
   commandId: string;
   expectedOccurrence: string;
   expectedEvidenceDigest: string;
+}
+export interface FactoryHumanInputCommandBinding {
+  commandId: string;
+  expectedNodeId: string;
+  expectedInvocationId: string;
+  expectedRequestDigest: string;
+  expectedLeaseId: string;
+}
+export interface FactoryHumanInputCommand extends FactoryHumanInputCommandBinding {
+  runId: string;
+  text: string;
 }
 export interface GateCommand extends GateCommandBinding {
   runId: string;
@@ -113,10 +130,25 @@ export async function gateCommandReceipt(
   command: GateCommand,
   rejection?: { code: string; message: string }
 ): Promise<CommandReceipt | null> {
+  return commandReceipt('respond', command, rejection);
+}
+
+export async function factoryHumanInputCommandReceipt(
+  command: FactoryHumanInputCommand,
+  rejection?: { code: string; message: string }
+): Promise<CommandReceipt | null> {
+  return commandReceipt('factory-human-input', command, rejection);
+}
+
+async function commandReceipt(
+  kind: string,
+  command: { commandId: string; runId: string },
+  rejection?: { code: string; message: string }
+): Promise<CommandReceipt | null> {
   return getDatabase().withTransaction(async query => {
     const existing = await readCommand(
       query,
-      'respond',
+      kind,
       command.commandId,
       evidenceDigest(command),
       command.runId
@@ -128,7 +160,121 @@ export async function gateCommandReceipt(
       runId: command.runId,
       ...rejection,
     };
-    await storeCommandReceipt(query, 'respond', command.commandId, receipt);
+    await storeCommandReceipt(query, kind, command.commandId, receipt);
+    return receipt;
+  });
+}
+
+export async function storeFactoryHumanInputCommandReceipt(
+  command: FactoryHumanInputCommand,
+  receipt: CommandReceipt
+): Promise<void> {
+  await getDatabase().withTransaction(async query => {
+    const existing = await readCommand(
+      query,
+      'factory-human-input',
+      command.commandId,
+      evidenceDigest(command),
+      command.runId
+    );
+    if (existing) return;
+    await storeCommandReceipt(query, 'factory-human-input', command.commandId, receipt);
+  });
+}
+
+function parseMetadata(raw: unknown): Record<string, unknown> {
+  if (typeof raw === 'string') {
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+        ? (parsed as Record<string, unknown>)
+        : {};
+    } catch {
+      return {};
+    }
+  }
+  return raw !== null && typeof raw === 'object' && !Array.isArray(raw)
+    ? (raw as Record<string, unknown>)
+    : {};
+}
+
+/** The factory human-input effect, audit event and receipt share one transaction. */
+export async function resolveFactoryHumanInputWithCommand(
+  command: FactoryHumanInputCommand,
+  respondedAt: string
+): Promise<CommandReceipt> {
+  return getDatabase().withTransaction(async query => {
+    const existing = await readCommand(
+      query,
+      'factory-human-input',
+      command.commandId,
+      evidenceDigest(command),
+      command.runId
+    );
+    if (existing) return existing;
+
+    const row = (
+      await query<{ status: string; metadata: unknown }>(
+        `SELECT status, metadata FROM remote_agent_workflow_runs WHERE id = $1${getDatabaseType() === 'postgresql' ? ' FOR UPDATE' : ''}`,
+        [command.runId]
+      )
+    ).rows[0];
+    const metadata = parseMetadata(row?.metadata);
+    const stored = metadata[FACTORY_HUMAN_INPUT_METADATA_KEY];
+    const matches =
+      row?.status === 'paused' &&
+      isFactoryHumanInputContext(stored) &&
+      stored.nodeId === command.expectedNodeId &&
+      stored.invocationId === command.expectedInvocationId &&
+      stored.requestDigest === command.expectedRequestDigest &&
+      stored.leaseId === command.expectedLeaseId &&
+      stored.response === undefined;
+
+    let receipt: CommandReceipt;
+    if (matches) {
+      const context = factoryHumanInputContextSchema.parse({
+        ...stored,
+        response: { commandId: command.commandId, text: command.text, respondedAt },
+      });
+      metadata[FACTORY_HUMAN_INPUT_METADATA_KEY] = context;
+      await query(
+        `UPDATE remote_agent_workflow_runs SET metadata = $2${getDatabaseType() === 'postgresql' ? '::jsonb' : ''} WHERE id = $1 AND status = 'paused'`,
+        [command.runId, JSON.stringify(metadata)]
+      );
+      await insertWorkflowEvent(query, {
+        workflow_run_id: command.runId,
+        event_type: 'factory_human_input_received',
+        step_name: context.nodeId,
+        data: {
+          invocation_id: context.invocationId,
+          request_digest: context.requestDigest,
+          lease_id: context.leaseId,
+          command_id: context.response?.commandId,
+          responded_at: context.response?.respondedAt,
+        },
+      });
+      receipt = {
+        ok: true,
+        commandId: command.commandId,
+        runId: command.runId,
+        occurrenceId: command.expectedInvocationId,
+        evidenceDigest: command.expectedRequestDigest,
+        resumable: true,
+      };
+    } else {
+      receipt = {
+        ok: false,
+        commandId: command.commandId,
+        runId: command.runId,
+        code: 'stale_factory_human_input',
+        message:
+          row === undefined
+            ? `Workflow run not found (id: ${command.runId})`
+            : 'Run or factory human-input identity no longer matches.',
+      };
+    }
+
+    await storeCommandReceipt(query, 'factory-human-input', command.commandId, receipt);
     return receipt;
   });
 }

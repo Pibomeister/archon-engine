@@ -2,13 +2,27 @@ import {
   reserveWorkflowLaunch,
   getWorkflowLaunch,
   getGateEvidence,
+  canonicalJson,
 } from '@archon/core/db/workflow-commands';
 import { computeLaunchIntent } from '../utils/launch-intent';
-import type { GateCommandBinding } from '@archon/core/db/workflow-commands';
+import type {
+  FactoryHumanInputCommandBinding,
+  GateCommandBinding,
+} from '@archon/core/db/workflow-commands';
 /**
  * Workflow command - list and run workflows
  */
-import { existsSync, readdirSync, type Dirent } from 'node:fs';
+import { createHash } from 'node:crypto';
+import {
+  constants,
+  existsSync,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readdirSync,
+  statSync,
+  type Dirent,
+} from 'node:fs';
 import * as archonPaths from '@archon/paths';
 import {
   registerRepository,
@@ -68,7 +82,7 @@ import {
   factorySuccessorParent,
   factoryLaunchContext,
 } from '@archon/providers/factory-mode';
-import { mkdirSync, openSync, closeSync, readFileSync, rmSync, writeSync } from 'node:fs';
+import { mkdirSync, closeSync, readFileSync, rmSync, writeSync } from 'node:fs';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createWorkflowDeps } from '@archon/core/workflows/store-adapter';
 import { createChildWorktreeResolver } from '@archon/core/workflows/child-isolation-resolver';
@@ -138,6 +152,7 @@ import {
   rejectWorkflow,
   respondToWorkflow,
   respondToWorkflowConditionally,
+  respondToFactoryHumanInputConditionally,
   resumeWorkflow as resumeWorkflowOp,
   abandonWorkflow,
   getWorkflowStatus,
@@ -4910,6 +4925,51 @@ export async function workflowRejectCommand(
   }
 }
 
+function readFactoryHumanInputResponse(responseFile?: string): string {
+  const source = responseFile && responseFile !== '-' ? responseFile : undefined;
+  const text = source ? readProtectedFactoryInputFile(source) : readFileSync(0, 'utf8');
+  if (text.length === 0) throw new Error('Factory human-input response is empty.');
+  return text;
+}
+
+function readProtectedFactoryInputFile(path: string): string {
+  const link = lstatSync(path);
+  if (link.isSymbolicLink())
+    throw new Error('Factory human-input response file must not be a symlink.');
+  const file = statSync(path);
+  if (!file.isFile()) throw new Error('Factory human-input response file must be a regular file.');
+  if ((file.mode & 0o077) !== 0) {
+    throw new Error(
+      'Factory human-input response file permissions must not allow group or other access.'
+    );
+  }
+  return readFileSync(path, 'utf8');
+}
+
+export interface WorkflowFactoryHumanInputOptions {
+  json?: boolean;
+  cwd?: string;
+  responseFile?: string;
+  binding: FactoryHumanInputCommandBinding;
+}
+
+/**
+ * Resolve a provider-native human-input pause through an exact factory binding.
+ * This command records the response only; bridge/coordinator code must resume
+ * the run with a separate `workflow resume <run-id>` admission.
+ */
+export async function workflowFactoryHumanInputCommand(
+  runId: string,
+  options: WorkflowFactoryHumanInputOptions
+): Promise<void> {
+  if (!options.json) throw new Error('Factory human-input response requires --json.');
+  const resolvedId = await resolveRunIdArg(runId, options.cwd);
+  const text = readFactoryHumanInputResponse(options.responseFile);
+  const receipt = await respondToFactoryHumanInputConditionally(resolvedId, text, options.binding);
+  await writeJsonLine({ ...receipt, action: 'factory-human-input' });
+  if (!receipt.ok) throw new WorkflowCommandRejectedError(receipt.code);
+}
+
 /**
  * Resolve a paused workflow run with any of its gate's declared decisions (#2707 step 2).
  * `approve`/`reject` delegate to the existing commands' exact behavior (the general-purpose
@@ -5490,4 +5550,324 @@ export async function workflowGateEvidenceCommand(
   const evidence = await getGateEvidence(runId, occurrenceId);
   await writeJsonLine(evidence ?? { ok: false, code: 'gate_evidence_not_found' });
   return evidence ? 0 : 1;
+}
+
+const FINAL_EVIDENCE_ALLOWED_FILES = [
+  'pr-evidence.json',
+  'merge-review-manifest.json',
+  'no-change-closure-intent.json',
+  'no-change-closure-status.json',
+  'run-context.json',
+] as const;
+const FINAL_EVIDENCE_MAX_FILE_BYTES = 256 * 1024;
+const FINAL_EVIDENCE_MAX_TOTAL_BYTES = 1024 * 1024;
+const SHA_40_RE = /^[a-f0-9]{40}$/u;
+
+interface FinalEvidenceArtifact {
+  path: string;
+  digest: string;
+  sizeBytes: number;
+  contentType: 'application/json';
+  safeToRender: true;
+  contentBase64: string;
+}
+
+interface FinalEvidencePr {
+  href: string;
+  repository: { provider: 'github'; owner: string; name: string };
+  number: number;
+  headSha: string;
+  headBranch: string;
+  baseBranch: string;
+}
+
+function isoFromRunDate(value: unknown): string {
+  if (value instanceof Date) return value.toISOString();
+  if (typeof value === 'string' && value.length > 0) {
+    const date = new Date(value);
+    if (!Number.isNaN(date.getTime())) return date.toISOString();
+  }
+  throw new Error('Workflow run has no deterministic timestamp for final evidence');
+}
+
+function finalEvidenceDigest(bytes: Buffer): string {
+  return `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
+}
+
+function readBoundedFinalEvidenceArtifact(
+  root: string,
+  relativePath: string
+): { artifact: FinalEvidenceArtifact; text: string } {
+  if (!(FINAL_EVIDENCE_ALLOWED_FILES as readonly string[]).includes(relativePath)) {
+    throw new Error('Forbidden final evidence artifact path');
+  }
+  const path = join(root, relativePath);
+  const before = lstatSync(path);
+  if (before.isSymbolicLink() || !before.isFile() || before.nlink !== 1) {
+    throw new Error(
+      `Final evidence artifact must be a regular file without links: ${relativePath}`
+    );
+  }
+  if (before.size > FINAL_EVIDENCE_MAX_FILE_BYTES) {
+    throw new Error(`Final evidence artifact exceeds byte limit: ${relativePath}`);
+  }
+  const fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  try {
+    const opened = fstatSync(fd);
+    if (
+      opened.dev !== before.dev ||
+      opened.ino !== before.ino ||
+      opened.size !== before.size ||
+      opened.nlink !== 1
+    ) {
+      throw new Error(`Final evidence artifact changed while opening: ${relativePath}`);
+    }
+    const bytes = readFileSync(fd);
+    const after = fstatSync(fd);
+    if (
+      after.size !== before.size ||
+      after.mtimeMs !== before.mtimeMs ||
+      bytes.length !== before.size
+    ) {
+      throw new Error(`Final evidence artifact changed while reading: ${relativePath}`);
+    }
+    return {
+      artifact: {
+        path: relativePath,
+        digest: finalEvidenceDigest(bytes),
+        sizeBytes: bytes.length,
+        contentType: 'application/json',
+        safeToRender: true,
+        contentBase64: bytes.toString('base64'),
+      },
+      text: bytes.toString('utf8'),
+    };
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function optionalFinalEvidenceArtifact(
+  root: string,
+  relativePath: string
+): { artifact: FinalEvidenceArtifact; value: Record<string, unknown> } | undefined {
+  const path = join(root, relativePath);
+  if (!existsSync(path)) return undefined;
+  const { artifact, text } = readBoundedFinalEvidenceArtifact(root, relativePath);
+  let value: unknown;
+  try {
+    value = JSON.parse(text) as unknown;
+  } catch {
+    throw new Error(`Final evidence artifact is not valid JSON: ${relativePath}`);
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`Final evidence artifact must contain a JSON object: ${relativePath}`);
+  }
+  return { artifact, value: value as Record<string, unknown> };
+}
+
+function stringField(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+function positiveIntegerField(value: unknown): number | undefined {
+  return Number.isInteger(value) && Number(value) > 0 ? Number(value) : undefined;
+}
+
+function recordField(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function parseFinalEvidenceGithubPullRequest(href: string): {
+  owner: string;
+  name: string;
+  number: number;
+} {
+  let url: URL;
+  try {
+    url = new URL(href);
+  } catch {
+    throw new Error('Final evidence PR URL is invalid');
+  }
+  if (
+    url.protocol !== 'https:' ||
+    url.hostname !== 'github.com' ||
+    url.username ||
+    url.password ||
+    url.port ||
+    url.search ||
+    url.hash
+  ) {
+    throw new Error('Final evidence PR URL must be an exact github.com pull request URL');
+  }
+  const [owner, name, pull, numberText] = url.pathname.split('/').filter(Boolean);
+  const number = Number.parseInt(numberText ?? '', 10);
+  if (!owner || !name || pull !== 'pull' || !Number.isInteger(number) || number <= 0) {
+    throw new Error('Final evidence PR URL must identify one pull request');
+  }
+  return { owner, name, number };
+}
+
+function repositoryFromManifest(value: unknown): {
+  provider: 'github';
+  owner: string;
+  name: string;
+} {
+  const repository = recordField(value);
+  const provider = stringField(repository?.provider);
+  const owner = stringField(repository?.owner);
+  const name = stringField(repository?.name);
+  if (provider !== 'github' || !owner || !name)
+    throw new Error('Final evidence manifest repository is invalid');
+  return { provider, owner, name };
+}
+
+function executionFromManifest(value: unknown): Record<string, unknown> | undefined {
+  const execution = recordField(value);
+  if (!execution) return undefined;
+  const required = [
+    'factoryJobId',
+    'logicalChainId',
+    'readySnapshotId',
+    'readyDigest',
+    'commandId',
+    'launchId',
+    'attemptId',
+    'runtimeBundleId',
+  ];
+  for (const key of required) {
+    if (!stringField(execution[key]))
+      throw new Error(`Final evidence manifest execution is missing ${key}`);
+  }
+  return execution;
+}
+
+function finalEvidencePrFromArtifacts(
+  prEvidence: Record<string, unknown>,
+  manifest: Record<string, unknown> | undefined,
+  context: Record<string, unknown> | undefined
+): FinalEvidencePr | undefined {
+  const href = stringField(prEvidence.url) ?? stringField(prEvidence.href);
+  if (!href) return undefined;
+  const parsed = parseFinalEvidenceGithubPullRequest(href);
+  if (!manifest) {
+    if (prEvidence.ready === true && prEvidence.draft === true) {
+      throw new Error('Managed PR final evidence is missing merge-review-manifest.json');
+    }
+    return undefined;
+  }
+  if (manifest.kind !== 'factory-merge-review.v1') {
+    throw new Error('Final evidence manifest has an unsupported kind');
+  }
+  const embedded = recordField(prEvidence.mergeReviewManifest);
+  if (!embedded || canonicalJson(embedded) !== canonicalJson(manifest)) {
+    throw new Error('Final evidence PR artifact and manifest do not match');
+  }
+  const repository = repositoryFromManifest(manifest.repository);
+  const pullRequestNumber = positiveIntegerField(manifest.pullRequestNumber);
+  const headSha = stringField(manifest.headSha);
+  if (!pullRequestNumber || !headSha || !SHA_40_RE.test(headSha)) {
+    throw new Error('Final evidence manifest PR metadata is invalid');
+  }
+  if (
+    repository.owner.toLowerCase() !== parsed.owner.toLowerCase() ||
+    repository.name.toLowerCase() !== parsed.name.toLowerCase() ||
+    pullRequestNumber !== parsed.number
+  ) {
+    throw new Error('Final evidence manifest does not match PR URL');
+  }
+  const contextBinding = recordField(context?.binding);
+  const contextProfile = recordField(context?.profile);
+  const contextDelivery = recordField(contextProfile?.delivery);
+  const contextRepository = recordField(contextProfile?.repository);
+  const headBranch =
+    stringField(prEvidence.headBranch) ??
+    stringField(prEvidence.branch) ??
+    stringField(contextBinding?.branch);
+  const baseBranch =
+    stringField(prEvidence.baseBranch) ??
+    stringField(contextDelivery?.baseBranch) ??
+    stringField(contextRepository?.defaultBranch);
+  if (!headBranch || !baseBranch) {
+    throw new Error('Final evidence PR branch metadata is missing');
+  }
+  executionFromManifest(manifest.execution);
+  return { href, repository, number: pullRequestNumber, headSha, headBranch, baseBranch };
+}
+
+export async function workflowFinalEvidenceCommand(runId: string): Promise<number> {
+  const run = await workflowDb.getWorkflowRun(runId);
+  if (!run) {
+    await writeJsonLine({ ok: false, code: 'final_evidence_not_found' });
+    return 1;
+  }
+  if (!run.output_root) {
+    await writeJsonLine({ ok: false, code: 'final_evidence_missing_output_root', runId: run.id });
+    return 1;
+  }
+  const artifactsRoot = archonPaths.getRunArtifactsDirForRoot(run.output_root, run.id);
+  const prArtifact = optionalFinalEvidenceArtifact(artifactsRoot, 'pr-evidence.json');
+  const artifactRecords = prArtifact ? [prArtifact.artifact] : [];
+  let total = prArtifact?.artifact.sizeBytes ?? 0;
+  const addArtifact = (
+    item: { artifact: FinalEvidenceArtifact; value: Record<string, unknown> } | undefined
+  ): Record<string, unknown> | undefined => {
+    if (!item) return undefined;
+    total += item.artifact.sizeBytes;
+    if (total > FINAL_EVIDENCE_MAX_TOTAL_BYTES)
+      throw new Error('Final evidence artifacts exceed the total byte limit');
+    artifactRecords.push(item.artifact);
+    return item.value;
+  };
+  const manifest = addArtifact(
+    optionalFinalEvidenceArtifact(artifactsRoot, 'merge-review-manifest.json')
+  );
+  const noChangeIntent = addArtifact(
+    optionalFinalEvidenceArtifact(artifactsRoot, 'no-change-closure-intent.json')
+  );
+  const noChangeStatus = addArtifact(
+    optionalFinalEvidenceArtifact(artifactsRoot, 'no-change-closure-status.json')
+  );
+  const context = optionalFinalEvidenceArtifact(artifactsRoot, 'run-context.json')?.value;
+  const pr = prArtifact
+    ? finalEvidencePrFromArtifacts(prArtifact.value, manifest, context)
+    : undefined;
+  const lifecycleResult =
+    stringField(prArtifact?.value.lifecycleResult) ?? stringField(noChangeIntent?.lifecycleResult);
+  const status =
+    stringField(prArtifact?.value.status) ?? stringField(noChangeStatus?.status) ?? run.status;
+  const createdAt = isoFromRunDate(run.completed_at ?? run.last_activity_at ?? run.started_at);
+  const revision = 1;
+  const evidence: Record<string, unknown> = {
+    ok: true,
+    finalEvidence: {
+      runId: run.id,
+      workflowId: run.workflow_name,
+      createdAt,
+      revision,
+      status,
+      ...(lifecycleResult ? { lifecycleResult } : {}),
+      ...(manifest ? { execution: manifest.execution } : {}),
+      ...(pr
+        ? {
+            pullRequest: {
+              href: pr.href,
+              repository: pr.repository,
+              number: pr.number,
+              headSha: pr.headSha,
+              headBranch: pr.headBranch,
+              baseBranch: pr.baseBranch,
+            },
+          }
+        : {}),
+      artifacts: artifactRecords.sort((a, b) => a.path.localeCompare(b.path)),
+      summary: pr
+        ? `Native Archon final evidence sealed for ${pr.repository.owner}/${pr.repository.name}#${String(pr.number)}.`
+        : `Native Archon final evidence sealed for ${run.workflow_name} run ${run.id}.`,
+    },
+  };
+  await writeJsonLine(evidence);
+  return 0;
 }

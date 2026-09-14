@@ -978,6 +978,77 @@ describe('ClaudeProvider', () => {
       ]);
     });
 
+    test('maps Claude AskUserQuestion tool use to a factory human-input request', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield {
+          type: 'assistant',
+          message: {
+            content: [
+              {
+                type: 'tool_use',
+                id: 'ask-1',
+                name: 'AskUserQuestion',
+                input: {
+                  questions: [
+                    {
+                      header: 'Deploy',
+                      question: 'Which deployment target should be used?',
+                      options: [
+                        { label: 'staging', description: 'Use staging credentials.' },
+                        { label: 'production', description: 'Use production credentials.' },
+                      ],
+                      multiSelect: false,
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+        };
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) chunks.push(chunk);
+
+      expect(chunks).toEqual([
+        {
+          type: 'tool',
+          toolName: 'AskUserQuestion',
+          toolInput: {
+            questions: [
+              {
+                header: 'Deploy',
+                question: 'Which deployment target should be used?',
+                options: [
+                  { label: 'staging', description: 'Use staging credentials.' },
+                  { label: 'production', description: 'Use production credentials.' },
+                ],
+                multiSelect: false,
+              },
+            ],
+          },
+          toolCallId: 'ask-1',
+        },
+        {
+          type: 'human_input_request',
+          message: 'Deploy: Which deployment target should be used?',
+          reason: 'claude_ask_user_question',
+          choices: ['staging', 'production'],
+          questions: [
+            {
+              header: 'Deploy',
+              question: 'Which deployment target should be used?',
+              options: [
+                { label: 'staging', description: 'Use staging credentials.' },
+                { label: 'production', description: 'Use production credentials.' },
+              ],
+              multiSelect: false,
+            },
+          ],
+        },
+      ]);
+    });
+
     test('yields hook_response with error outcome and no exit_code', async () => {
       mockQuery.mockImplementation(async function* () {
         yield {

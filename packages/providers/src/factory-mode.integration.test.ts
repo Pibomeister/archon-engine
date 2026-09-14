@@ -33,6 +33,8 @@ test('actual registry consumes a one-shot FD and broker lease without forwarding
                 requestDigest: body.requestDigest,
                 leaseId: 'fixture-lease',
                 leaseExpiresAt: new Date(Date.now() + 60000).toISOString(),
+                budgetReservationId: 'budget:fixture',
+                admittedActiveExecutionSeconds: 60,
               }
             : { outcome: body.outcome }
         )
@@ -58,6 +60,11 @@ test('actual registry consumes a one-shot FD and broker lease without forwarding
       runtimeBundleId: 'runtime:fixture',
       runtimeBindingDigest: 'sha256:runtime',
       projectId: 'project:fixture',
+      launchKey: 'launch:fixture',
+      commandId: 'command:fixture',
+      originalReadyBaseRevision: 'a'.repeat(40),
+      executionBaseRevision: 'b'.repeat(40),
+      repairAttemptId: 'repair:fixture',
       worktreePath: worktree,
     };
     const config = {
@@ -72,6 +79,7 @@ test('actual registry consumes a one-shot FD and broker lease without forwarding
         allowedWriteRoots: [worktree],
         allowedReadRoots: [worktree],
         deniedRoots: [manual],
+        limits: { maxInvocations: 1, maxRunMs: 60000, maxExecutionMs: 60000 },
       },
     };
     const runner = join(root, 'runner.ts');
@@ -124,6 +132,15 @@ console.log(JSON.stringify({constructed,fdClosed,capabilityInEnv:JSON.stringify(
     );
     expect(requests[1]!.outcome).toBe('released');
     expect(requests[1]!.invocationId).toBe(requests[0]!.invocationId);
+    expect(requests[1]!.signals).toEqual([
+      expect.objectContaining({
+        kind: 'factory-invocation-outcome',
+        outcome: 'completed',
+        invocationId: requests[0]!.invocationId,
+        requestDigest: requests[0]!.requestDigest,
+        leaseId: 'fixture-lease',
+      }),
+    ]);
   } finally {
     await new Promise<void>(accept => {
       server.close(() => accept());

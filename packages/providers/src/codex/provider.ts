@@ -30,7 +30,7 @@ import {
   normalizeJsonSchemaForOpenAiStrict,
 } from '../shared/structured-output';
 import { withResumedOutcome, resumedOutcome } from '../shared/resumed';
-import { factoryCodexConfig, factoryCodexScope } from '../factory-sandbox';
+import { factoryCodexConfigOverrides, factoryCodexScope } from '../factory-sandbox';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -911,9 +911,14 @@ export class CodexProvider implements IAgentProvider {
   private async createCodexClient(
     configCodexBinaryPath: string | undefined,
     requestEnv?: Record<string, string>,
-    codexConfigOverrides?: CodexConfigOverrides
+    codexConfigOverrides?: CodexConfigOverrides,
+    rawConfigOverrides?: string[]
   ): Promise<Codex> {
-    if ((!requestEnv || Object.keys(requestEnv).length === 0) && !codexConfigOverrides) {
+    if (
+      (!requestEnv || Object.keys(requestEnv).length === 0) &&
+      !codexConfigOverrides &&
+      (!rawConfigOverrides || rawConfigOverrides.length === 0)
+    ) {
       return getCodex(configCodexBinaryPath);
     }
 
@@ -924,6 +929,7 @@ export class CodexProvider implements IAgentProvider {
           ? { env: buildCodexEnv(requestEnv) }
           : {}),
         ...(codexConfigOverrides ? { config: codexConfigOverrides } : {}),
+        ...(rawConfigOverrides?.length ? { configOverrides: rawConfigOverrides } : {}),
       };
       return new Codex(codexOptions);
     } catch (error) {
@@ -973,9 +979,9 @@ export class CodexProvider implements IAgentProvider {
     const workflowConfigOverrides = suppressWorkflowSkillCatalog
       ? withWorkflowSkillCatalogDisabled(declaredMcpConfigOverrides)
       : declaredMcpConfigOverrides;
-    const initialConfigOverrides = requestOptions?.factoryScope
-      ? { ...workflowConfigOverrides, ...factoryCodexConfig(requestOptions.factoryScope, cwd) }
-      : workflowConfigOverrides;
+    const factoryConfigOverrides = requestOptions?.factoryScope
+      ? factoryCodexConfigOverrides(requestOptions.factoryScope, cwd)
+      : undefined;
 
     for (const warning of providerWarnings) {
       yield { type: 'system', content: `⚠️ ${warning.message}` };
@@ -985,7 +991,8 @@ export class CodexProvider implements IAgentProvider {
     let codex = await this.createCodexClient(
       codexConfig.codexBinaryPath,
       requestOptions?.env,
-      initialConfigOverrides
+      workflowConfigOverrides,
+      factoryConfigOverrides
     );
     const threadOptions = buildThreadOptions(
       cwd,

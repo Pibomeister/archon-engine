@@ -10,7 +10,13 @@
  */
 
 /** Workflow subcommands that continue an existing run. */
-const CONTINUE_SUBCOMMANDS = ['resume', 'approve', 'reject', 'respond'] as const;
+const CONTINUE_SUBCOMMANDS = [
+  'resume',
+  'approve',
+  'reject',
+  'respond',
+  'factory-human-input',
+] as const;
 
 /**
  * Rejects --model on subcommands that continue an existing workflow run: the

@@ -8,6 +8,8 @@ import { validateFactoryProviderScope, type FactoryProviderScope } from './facto
 import { factoryRequestDigest } from './factory-digest';
 
 const text = z.string().min(1).max(4096);
+const finitePositiveInteger = z.number().int().positive().finite();
+const finitePositive = z.number().positive().finite();
 export const factoryBindingSchema = z
   .object({
     machineId: text,
@@ -20,6 +22,14 @@ export const factoryBindingSchema = z
     runtimeBundleId: text,
     runtimeBindingDigest: text,
     projectId: text,
+    /** Control command/launch key for this native invocation chain. */
+    launchId: text.optional(),
+    /** The command identity and frozen execution baseline issued by Control. */
+    launchKey: text.optional(),
+    commandId: text.optional(),
+    originalReadyBaseRevision: text.optional(),
+    executionBaseRevision: text.optional(),
+    repairAttemptId: text.optional(),
   })
   .strict();
 export const configSchema = z
@@ -55,6 +65,17 @@ export const configSchema = z
         allowedWriteRoots: z.array(text).min(1),
         allowedReadRoots: z.array(text),
         deniedRoots: z.array(text).min(1),
+        limits: z
+          .object({
+            maxInvocations: finitePositiveInteger,
+            maxRunMs: finitePositiveInteger,
+            maxExecutionMs: finitePositiveInteger,
+            maxInputTokens: finitePositiveInteger.optional(),
+            maxOutputTokens: finitePositiveInteger.optional(),
+            maxConsecutiveNoWorkAttempts: finitePositiveInteger.optional(),
+          })
+          .strict()
+          .optional(),
       })
       .strict(),
   })
@@ -68,8 +89,19 @@ export const leaseSchema = z
     requestDigest: text,
     leaseId: text,
     leaseExpiresAt: z.iso.datetime(),
+    budgetReservationId: text.optional(),
+    admittedActiveExecutionSeconds: finitePositive.optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((lease, context) => {
+    const hasReservation = lease.budgetReservationId !== undefined;
+    const hasActiveSeconds = lease.admittedActiveExecutionSeconds !== undefined;
+    if (hasReservation === hasActiveSeconds) return;
+    context.addIssue({
+      code: 'custom',
+      message: 'budgetReservationId and admittedActiveExecutionSeconds must be supplied together',
+    });
+  });
 
 function readConfig(fd: number): BrokerConfig {
   if (!Number.isInteger(fd) || fd < 3 || fd > 64) throw new Error('factory_broker_fd_invalid');
@@ -188,13 +220,18 @@ class HttpBroker implements AdmissionBroker {
       throw new Error('factory_provider_lease_expired');
     return lease;
   }
-  async settle(lease: AdmissionLease, outcome: 'released' | 'quarantined'): Promise<void> {
+  async settle(
+    lease: AdmissionLease,
+    outcome: 'released' | 'quarantined',
+    signals?: readonly unknown[]
+  ): Promise<void> {
     const body = {
       version: 'archon.provider-admission.v1',
       leaseId: lease.leaseId,
       invocationId: lease.invocationId,
       requestDigest: lease.requestDigest,
       outcome,
+      ...(signals?.length ? { signals } : {}),
       settledAt: new Date().toISOString(),
     };
     const response = await this.post('/settle', body);

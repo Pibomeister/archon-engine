@@ -63,6 +63,11 @@ export const cliArgOptions: CliArgOptions = {
   'command-id': { type: 'string' },
   'expected-occurrence': { type: 'string' },
   'expected-evidence-digest': { type: 'string' },
+  'expected-node': { type: 'string' },
+  'expected-invocation': { type: 'string' },
+  'expected-request-digest': { type: 'string' },
+  'expected-lease': { type: 'string' },
+  'response-file': { type: 'string' },
   'launch-key': { type: 'string' },
   'launch-payload-digest': { type: 'string' },
   // Private sealed handoff appended by the parent of a detached workflow run.

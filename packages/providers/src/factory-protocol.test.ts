@@ -42,3 +42,76 @@ test('legacy config aliases and incomplete lease receipts fail closed', () => {
   void version;
   expect(leaseSchema.safeParse(withoutVersion).success).toBe(false);
 });
+
+test('budgeted lease receipts require a complete positive reservation pair while legacy receipts remain valid', () => {
+  const budgeted = {
+    ...golden.lease,
+    budgetReservationId: 'budget:fixture',
+    admittedActiveExecutionSeconds: 60,
+  };
+  expect(leaseSchema.parse(budgeted)).toMatchObject({
+    budgetReservationId: 'budget:fixture',
+    admittedActiveExecutionSeconds: 60,
+  });
+  expect(
+    leaseSchema.parse({ ...budgeted, admittedActiveExecutionSeconds: 0.5 })
+      .admittedActiveExecutionSeconds
+  ).toBe(0.5);
+  const { budgetReservationId, ...missingReservation } = budgeted;
+  void budgetReservationId;
+  expect(leaseSchema.safeParse(missingReservation).success).toBe(false);
+  expect(leaseSchema.safeParse({ ...budgeted, admittedActiveExecutionSeconds: 0 }).success).toBe(
+    false
+  );
+  expect(leaseSchema.parse(golden.lease).leaseId).toBe(golden.lease.leaseId);
+});
+
+test('strict broker bindings retain the bridge execution identity while legacy envelopes remain valid', () => {
+  const extended = structuredClone(golden.config);
+  const executionIdentity = {
+    launchKey: 'launch:fixture',
+    commandId: 'command:fixture',
+    originalReadyBaseRevision: 'a'.repeat(40),
+    executionBaseRevision: 'b'.repeat(40),
+    repairAttemptId: 'repair:fixture',
+  };
+  Object.assign(extended.managedRun, executionIdentity);
+
+  const parsed = configSchema.parse(extended);
+  const { worktreePath, ...binding } = parsed.managedRun;
+  void worktreePath;
+  expect(factoryBindingSchema.parse(binding)).toMatchObject(executionIdentity);
+  expect(factoryMarkerForConfig(parsed)).toMatchObject(executionIdentity);
+  expect(configSchema.parse(golden.config).managedRun).not.toHaveProperty('commandId');
+});
+
+test('factory provider policy accepts only finite explicit limit values', () => {
+  type Limits = {
+    maxInvocations: number;
+    maxRunMs: number;
+    maxExecutionMs: number;
+    maxInputTokens?: number;
+    maxOutputTokens?: number;
+    maxConsecutiveNoWorkAttempts?: number;
+  };
+  const limited = structuredClone(golden.config) as typeof golden.config & {
+    providerPolicy: typeof golden.config.providerPolicy & {
+      limits?: Limits;
+    };
+  };
+  limited.providerPolicy.limits = {
+    maxInvocations: 3,
+    maxRunMs: 3_600_000,
+    maxExecutionMs: 1_800_000,
+    maxInputTokens: 250_000,
+    maxOutputTokens: 60_000,
+    maxConsecutiveNoWorkAttempts: 2,
+  };
+  expect(configSchema.parse(limited).providerPolicy.limits).toEqual(limited.providerPolicy.limits);
+
+  const invalid = structuredClone(limited) as typeof limited & {
+    providerPolicy: typeof limited.providerPolicy & { limits: Limits };
+  };
+  invalid.providerPolicy.limits.maxInvocations = Number.POSITIVE_INFINITY;
+  expect(configSchema.safeParse(invalid).success).toBe(false);
+});
