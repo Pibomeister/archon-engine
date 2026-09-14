@@ -264,20 +264,38 @@ export function createAdmittedProvider(
       let terminalSignal: FactoryInvocationSignal | undefined;
       const backgroundTasks = new Set<string>();
       const expiryController = new AbortController();
-      let expiryTimer: ReturnType<typeof setTimeout> | undefined;
-      if (lease.leaseExpiresAt && admittedOptions) {
-        const remaining = Date.parse(lease.leaseExpiresAt) - Date.now();
-        admittedOptions.abortSignal = admittedOptions.abortSignal
-          ? AbortSignal.any([admittedOptions.abortSignal, expiryController.signal])
-          : expiryController.signal;
-        if (!Number.isFinite(remaining) || remaining <= 0) expiryController.abort();
-        else
-          expiryTimer = setTimeout(
+      const limitTimers = new Set<ReturnType<typeof setTimeout>>();
+      // Arm one abort deadline. The lease expiry and the admitted active
+      // execution limit both funnel through here, so whichever elapses first
+      // aborts the invocation; a non-finite or already-elapsed budget aborts
+      // immediately. Downstream is unchanged: the abort leaves `closed` false,
+      // so the existing uncertain-termination signal and quarantined
+      // settlement run as they already do for an expired lease.
+      const armFactoryLimit = (ms: number): void => {
+        if (!Number.isFinite(ms) || ms <= 0) {
+          expiryController.abort();
+          return;
+        }
+        limitTimers.add(
+          setTimeout(
             () => {
               expiryController.abort();
             },
-            Math.min(remaining, 2147483647)
-          );
+            Math.min(ms, 2147483647)
+          )
+        );
+      };
+      if (
+        admittedOptions &&
+        (lease.leaseExpiresAt || lease.admittedActiveExecutionSeconds !== undefined)
+      ) {
+        admittedOptions.abortSignal = admittedOptions.abortSignal
+          ? AbortSignal.any([admittedOptions.abortSignal, expiryController.signal])
+          : expiryController.signal;
+        if (lease.leaseExpiresAt) armFactoryLimit(Date.parse(lease.leaseExpiresAt) - Date.now());
+        if (lease.admittedActiveExecutionSeconds !== undefined) {
+          armFactoryLimit(lease.admittedActiveExecutionSeconds * 1000);
+        }
       }
       try {
         if (admittedOptions?.abortSignal?.aborted) throw new Error('factory_provider_aborted');
@@ -330,7 +348,7 @@ export function createAdmittedProvider(
           throw new Error('factory_provider_transport_uncertain');
         }
       } finally {
-        if (expiryTimer) clearTimeout(expiryTimer);
+        for (const timer of limitTimers) clearTimeout(timer);
         const signals = [
           terminalSignal ??
             signalForUncertainTermination(entry.id, request, lease, 'factory_provider_exception'),
