@@ -44,6 +44,7 @@ unsupported provider at load time and an implicitly resolved one at runtime.
 | Skills (`skills:`) | ✅ | ❌ | ❌ | ✅ | ✅ |
 | Inline sub-agents (`agents:`) | ✅ | ❌ | ✅¹ | ❌ | ✅ |
 | Tool restrictions (`allowed_tools`/`denied_tools`) | ✅ | ❌ | ✅ | ✅ | ✅ |
+| Human-input requests (`human_input_request`) | ✅ | ❌ | ❌ | ❌ | ❌ |
 | Structured output (`output_format`) | **enforced** | **enforced** | **enforced** | best-effort | best-effort |
 | Env injection (`env:`) | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Cost control (`maxBudgetUsd`) | ✅ | ❌ | ❌ | ❌ | ❌ |

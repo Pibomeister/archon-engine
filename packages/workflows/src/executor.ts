@@ -2,6 +2,13 @@
  * Workflow Executor - runs DAG-based workflows
  */
 import { mkdir, readdir, rename, rm, stat, writeFile } from 'fs/promises';
+import {
+  assertFactoryRunMode,
+  assertFactorySuccessorMode,
+  assertFactoryWorkingPath,
+  factoryRunMarker,
+  factorySuccessorRecord,
+} from '@archon/providers/factory-mode';
 import { randomUUID } from 'crypto';
 import { existsSync } from 'fs';
 import { dirname, join } from 'path';
@@ -1100,6 +1107,7 @@ export async function hydrateResumableRun(
   priorNodeSessions: WorkflowRunNodeSession[];
 } | null> {
   const inspection = await inspectResumableRun(deps, candidate);
+  assertFactoryRunMode(candidate.metadata);
   if (inspection === null) return null;
   const { priorCompletedNodes, priorUsage } = inspection;
   // A gate whose node deliberately writes NO node_completed on pause must still be
@@ -1449,6 +1457,7 @@ async function runChildWorkflow(
         user_id: userId,
         metadata: {
           [SUBRUN_METADATA_KEYS.parentNodeId]: nodeId,
+          ...(factoryRunMarker() ? { factory_provider_admission: factoryRunMarker() } : {}),
           // Fan-out instance index (slice 2, PR-C) — stamped only for a fan-out child so
           // parent resume can re-key the ordered instance set by index (findChildRuns is
           // started_at-ordered, which ≠ items order under max_parallel concurrency). A
@@ -1814,6 +1823,13 @@ export async function executeWorkflow(
   } = opts;
 
   const executionUserId = preCreatedRun ? (preCreatedRun.user_id ?? undefined) : userId;
+  assertFactoryWorkingPath(cwd);
+  if (preCreatedRun)
+    assertFactoryRunMode(preCreatedRun.metadata, preCreatedRun.status === 'pending');
+  if (adoptedFromRunId) {
+    const original = await deps.store.getWorkflowRun(adoptedFromRunId);
+    if (original) assertFactorySuccessorMode(original.metadata, original.id);
+  }
   const modelOverrides =
     modelOverrideLayer?.kind === 'raw' ? modelOverrideLayer.overrides : undefined;
   const callerResolvedModelOverrides =
@@ -2182,6 +2198,10 @@ export async function executeWorkflow(
         // path passes to `backend.resumeEnv()` (Phase C).
         metadata: {
           ...(issueContext ? { github_context: issueContext } : {}),
+          ...(factorySuccessorRecord(adoptedFromRunId)
+            ? { factory_provider_successor: factorySuccessorRecord(adoptedFromRunId) }
+            : {}),
+          ...(factoryRunMarker() ? { factory_provider_admission: factoryRunMarker() } : {}),
           ...(execContext.kind === 'container' ? { isolation: 'container' } : {}),
           ...(containerCtx ? { isolation_env_id: containerCtx.envId } : {}),
           // Declared inputs supplied by a direct top-level invocation (#2554), already
@@ -2225,6 +2245,7 @@ export async function executeWorkflow(
     // is null on a row created before its checkout existed (#2872, `run --detach`)
     // — write-once in the store, so re-running this can never repoint a live run.
     const invocationMetadata: Record<string, unknown> = {
+      ...(factoryRunMarker() ? { factory_provider_admission: factoryRunMarker() } : {}),
       [RUN_MODEL_BINDINGS_METADATA_KEY]: modelBindingsMetadata,
       ...(runConfigMetadata ? { [WORKFLOW_RUN_CONFIG_METADATA_KEY]: runConfigMetadata } : {}),
       ...(execContext.kind === 'container' ? { isolation: 'container' } : {}),

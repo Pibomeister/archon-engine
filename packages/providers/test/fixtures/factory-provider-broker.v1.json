@@ -1,0 +1,136 @@
+{
+  "fixtureVersion": "factory.provider-broker.golden.v1",
+  "config": {
+    "version": "factory.provider-broker.config.v1",
+    "transport": "http+loopback",
+    "endpoint": "http://127.0.0.1:4319",
+    "capability": "FIXTURE_ONLY_NARROW_CAPABILITY_0123456789",
+    "expiresAt": "2099-01-01T00:00:00.000Z",
+    "managedRun": {
+      "machineId": "machine:fixture",
+      "hostEpoch": "epoch:fixture",
+      "factoryJobId": "job:fixture",
+      "logicalChainId": "chain:fixture",
+      "attemptId": "attempt:fixture",
+      "readySnapshotId": "ready:fixture",
+      "readyDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "runtimeBundleId": "runtime:fixture",
+      "runtimeBindingDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "projectId": "project:fixture",
+      "worktreePath": "/factory/worktree"
+    },
+    "providerPolicy": {
+      "providers": [
+        {
+          "provider": "codex",
+          "models": ["fixture-model"],
+          "purpose": "implementation"
+        }
+      ],
+      "allowedWriteRoots": ["/factory/worktree", "/factory/artifacts"],
+      "allowedReadRoots": ["/factory/knowledge"],
+      "deniedRoots": ["/factory/manual-checkout"]
+    }
+  },
+  "acquire": {
+    "version": "archon.provider-admission.v1",
+    "invocationId": "00000000-0000-4000-8000-000000000001",
+    "provider": "codex",
+    "purpose": "implementation",
+    "factoryBinding": {
+      "machineId": "machine:fixture",
+      "hostEpoch": "epoch:fixture",
+      "factoryJobId": "job:fixture",
+      "logicalChainId": "chain:fixture",
+      "attemptId": "attempt:fixture",
+      "readySnapshotId": "ready:fixture",
+      "readyDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "runtimeBundleId": "runtime:fixture",
+      "runtimeBindingDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "projectId": "project:fixture"
+    },
+    "context": {
+      "runId": "run:fixture",
+      "nodeId": "implement",
+      "iteration": 1,
+      "reask": 0
+    },
+    "cwd": "/factory/worktree",
+    "model": "fixture-model",
+    "promptDigest": "194713ad972b9125a463802fa203cc68e814e7b681bece09a1975df5efd0fa11",
+    "requestDigest": "ec3b234ed030d7b07dccfbe49796b99ef980574963acc3fbc355eb47066e9691"
+  },
+  "lease": {
+    "version": "archon.provider-admission.v1",
+    "invocationId": "00000000-0000-4000-8000-000000000001",
+    "requestDigest": "ec3b234ed030d7b07dccfbe49796b99ef980574963acc3fbc355eb47066e9691",
+    "leaseId": "lease:fixture",
+    "leaseExpiresAt": "2099-01-01T00:00:00.000Z"
+  },
+  "settle": {
+    "version": "archon.provider-admission.v1",
+    "leaseId": "lease:fixture",
+    "invocationId": "00000000-0000-4000-8000-000000000001",
+    "requestDigest": "ec3b234ed030d7b07dccfbe49796b99ef980574963acc3fbc355eb47066e9691",
+    "outcome": "released",
+    "settledAt": "2026-09-06T08:00:00.000Z"
+  },
+  "settleAck": {
+    "outcome": "released"
+  },
+  "parentMarker": {
+    "version": 1,
+    "mode": "broker",
+    "machineId": "machine:fixture",
+    "hostEpoch": "epoch:fixture",
+    "factoryJobId": "job:fixture",
+    "logicalChainId": "chain:fixture",
+    "attemptId": "attempt:fixture",
+    "readySnapshotId": "ready:fixture",
+    "readyDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "runtimeBundleId": "runtime:fixture",
+    "runtimeBindingDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "projectId": "project:fixture",
+    "worktreePath": "/factory/worktree",
+    "providerPolicyDigest": "8d35b342f7f9fda3ba001fb9b796528f6da40188aac632bee5144c059852be05",
+    "policyTemplateDigest": "a1e81c5e8abab2410ec527f895b0bbe4977e61676f8d0a0ac5142bae7a89d643"
+  },
+  "successorConfig": {
+    "version": "factory.provider-broker.config.v1",
+    "transport": "http+loopback",
+    "endpoint": "http://127.0.0.1:4319",
+    "capability": "FIXTURE_ONLY_NARROW_CAPABILITY_0123456789",
+    "expiresAt": "2099-01-01T00:00:00.000Z",
+    "managedRun": {
+      "machineId": "machine:fixture",
+      "hostEpoch": "epoch:fixture",
+      "factoryJobId": "job:fixture",
+      "logicalChainId": "chain:fixture",
+      "attemptId": "attempt:successor",
+      "readySnapshotId": "ready:fixture",
+      "readyDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "runtimeBundleId": "runtime:fixture",
+      "runtimeBindingDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "projectId": "project:fixture",
+      "worktreePath": "/factory/worktree"
+    },
+    "providerPolicy": {
+      "providers": [
+        {
+          "provider": "codex",
+          "models": ["fixture-model"],
+          "purpose": "implementation"
+        }
+      ],
+      "allowedWriteRoots": ["/factory/worktree", "/factory/artifacts"],
+      "allowedReadRoots": ["/factory/knowledge"],
+      "deniedRoots": ["/factory/manual-checkout"]
+    },
+    "successor": {
+      "parentRunId": "run:fixture",
+      "parentAttemptId": "attempt:fixture",
+      "parentBindingDigest": "64f39a7e023c6740b51b89db0117f174929f0a580c336ec10492892f6020a9e2",
+      "commandId": "command:bounded-recovery"
+    }
+  }
+}

@@ -1,5 +1,6 @@
+import { removeTempTree } from '@archon/paths/test-utils';
 import { describe, test, expect, mock, beforeEach, afterEach, spyOn } from 'bun:test';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Options, query as sdkQuery } from '@anthropic-ai/claude-agent-sdk';
@@ -77,6 +78,36 @@ describe('shouldPassNoEnvFile', () => {
 
 describe('ClaudeProvider', () => {
   let client: ClaudeProvider;
+  test('managed source scope overrides bypass defaults at the actual SDK boundary', async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'claude-factory-scope-')));
+    try {
+      const worktree = join(root, 'worktree');
+      const manual = join(root, 'manual');
+      mkdirSync(worktree);
+      mkdirSync(manual);
+      mockQuery.mockImplementation(async function* () {
+        /* no model fixture */
+      });
+      for await (const _chunk of client.sendQuery('fixture', worktree, undefined, {
+        factoryScope: { workspaceRoot: worktree, writableRoots: [worktree], deniedRoots: [manual] },
+      })) {
+        /* consume */
+      }
+      expect(mockQuery.mock.calls[0]?.[0].options).toMatchObject({
+        permissionMode: 'dontAsk',
+        allowDangerouslySkipPermissions: false,
+        settingSources: [],
+        sandbox: {
+          enabled: true,
+          failIfUnavailable: true,
+          allowUnsandboxedCommands: false,
+          filesystem: { allowWrite: [worktree], denyWrite: [manual] },
+        },
+      });
+    } finally {
+      await removeTempTree(root);
+    }
+  });
 
   beforeEach(() => {
     client = new ClaudeProvider({ retryBaseDelayMs: 1 });
@@ -942,6 +973,77 @@ describe('ClaudeProvider', () => {
           hookEvent: 'PreToolUse',
           outcome: 'success',
           exitCode: 0,
+        },
+      ]);
+    });
+
+    test('maps Claude AskUserQuestion tool use to a factory human-input request', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield {
+          type: 'assistant',
+          message: {
+            content: [
+              {
+                type: 'tool_use',
+                id: 'ask-1',
+                name: 'AskUserQuestion',
+                input: {
+                  questions: [
+                    {
+                      header: 'Deploy',
+                      question: 'Which deployment target should be used?',
+                      options: [
+                        { label: 'staging', description: 'Use staging credentials.' },
+                        { label: 'production', description: 'Use production credentials.' },
+                      ],
+                      multiSelect: false,
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+        };
+      });
+
+      const chunks = [];
+      for await (const chunk of client.sendQuery('test', '/workspace')) chunks.push(chunk);
+
+      expect(chunks).toEqual([
+        {
+          type: 'tool',
+          toolName: 'AskUserQuestion',
+          toolInput: {
+            questions: [
+              {
+                header: 'Deploy',
+                question: 'Which deployment target should be used?',
+                options: [
+                  { label: 'staging', description: 'Use staging credentials.' },
+                  { label: 'production', description: 'Use production credentials.' },
+                ],
+                multiSelect: false,
+              },
+            ],
+          },
+          toolCallId: 'ask-1',
+        },
+        {
+          type: 'human_input_request',
+          message: 'Deploy: Which deployment target should be used?',
+          reason: 'claude_ask_user_question',
+          choices: ['staging', 'production'],
+          questions: [
+            {
+              header: 'Deploy',
+              question: 'Which deployment target should be used?',
+              options: [
+                { label: 'staging', description: 'Use staging credentials.' },
+                { label: 'production', description: 'Use production credentials.' },
+              ],
+              multiSelect: false,
+            },
+          ],
         },
       ]);
     });

@@ -1,5 +1,6 @@
+import { removeTempTree } from '@archon/paths/test-utils';
 import { describe, test, expect, mock, beforeEach, type Mock } from 'bun:test';
-import { mkdtemp, rm, writeFile } from 'fs/promises';
+import { mkdtemp, mkdir, realpath, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import type { Codex as SdkCodex, Thread as SdkThread, Usage } from '@openai/codex-sdk';
@@ -88,6 +89,39 @@ describe('CodexProvider', () => {
       expect(client.getType()).toBe('codex');
     });
   });
+  test('managed source scope reaches the actual SDK options without a broad sandbox override', async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), 'codex-factory-scope-')));
+    try {
+      const worktree = join(root, 'worktree');
+      const manual = join(root, 'manual');
+      await mkdir(worktree);
+      await mkdir(manual);
+      for await (const _chunk of client.sendQuery('fixture', worktree, undefined, {
+        model: 'gpt-5.4',
+        factoryScope: { workspaceRoot: worktree, writableRoots: [worktree], deniedRoots: [manual] },
+        assistantConfig: { additionalDirectories: [manual] },
+      })) {
+        /* consume the SDK fixture */
+      }
+      // The scope reaches Codex as raw `configOverrides` lines, not a structured
+      // `config` object: a named permissions profile is expressed as TOML the SDK
+      // forwards verbatim. Asserted exactly — a widened entry (an extra writable
+      // root, or `:minimal` losing its read-only floor) is the failure that matters.
+      expect(MockCodex.mock.calls[0]?.[0]?.configOverrides).toEqual([
+        'default_permissions="archon-factory"',
+        'permissions.archon-factory.filesystem={":minimal" = "read", ' +
+          `${JSON.stringify(worktree)} = "write", ${JSON.stringify(manual)} = "deny"}`,
+        'permissions.archon-factory.network.enabled=true',
+      ]);
+      expect(mockStartThread.mock.calls[0]?.[0]).toMatchObject({
+        sandboxMode: undefined,
+        additionalDirectories: [],
+        approvalPolicy: 'never',
+      });
+    } finally {
+      await removeTempTree(root);
+    }
+  });
 
   describe('getCapabilities', () => {
     test('returns limited capability set for Codex provider', () => {
@@ -100,6 +134,7 @@ describe('CodexProvider', () => {
         skills: false,
         agents: false,
         toolRestrictions: false,
+        humanInputRequests: false,
         structuredOutput: 'enforced',
         envInjection: true,
         costControl: false,
