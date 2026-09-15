@@ -5,6 +5,11 @@ import {
 } from '../shared/run-config';
 
 export interface GrokProviderDefaults {
+  // Matches ClaudeProviderDefaults/CodexProviderDefaults: a run config layer has
+  // to be assignable to ProviderDefaults (Record<string, unknown>) for
+  // ProviderRunConfigParser. Those two live in ../types.ts, which calls itself the
+  // single source of truth for these shapes; this one is declared locally instead.
+  [key: string]: unknown;
   model?: string;
   grokBinaryPath?: string;
 }
