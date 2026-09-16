@@ -240,7 +240,12 @@ async function discoverFixtures(roots: readonly string[]): Promise<DiscoveredFix
       }
     }
   }
-  return found;
+  // Discovery walks the filesystem with readdir, which promises no order, so the report came
+  // out in whatever order the filesystem handed back -- plan before ship on APFS, after it on
+  // ext4. Sorting by label makes the report reproducible across machines, which is what its
+  // consumers and its tests already assumed. Ordering here rather than per scope: the dedup
+  // above is what applies scope precedence, and it has finished by this point.
+  return found.sort((a, b) => (a.label < b.label ? -1 : a.label > b.label ? 1 : 0));
 }
 
 export interface FixtureCheckResult {
