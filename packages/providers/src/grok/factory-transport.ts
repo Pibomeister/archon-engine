@@ -3,12 +3,12 @@ import { spawn } from 'node:child_process';
 export const GROK_TERM_GRACE_MS = 10_000;
 export const GROK_KILL_GRACE_MS = 2_000;
 
-export type GrokCommandResult = {
+export interface GrokCommandResult {
   exitCode: number;
   stdout: string;
   stderr: string;
   nativeClosed: boolean;
-};
+}
 
 export type GrokCommandRunner = (input: {
   argv: readonly string[];
