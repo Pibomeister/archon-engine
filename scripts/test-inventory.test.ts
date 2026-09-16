@@ -87,12 +87,15 @@ const ISOLATED_RUNNER = 'scripts/run-isolated-tests.ts';
 const LEG_SEPARATOR = '---';
 
 /**
- * Package test scripts run their legs through scripts/run-isolated-tests.ts, which runs every leg
- * and then fails if any failed. They used to be joined with `&&`, where the first red leg stopped
- * the rest and a green run only proved that nothing failed before the first thing that did. The
- * legs themselves are unchanged -- still one `bun test` process per group, because `mock.module()`
- * state is process-global -- so normalise the runner form back into the equivalent `bun test`
- * commands and let the guards below keep reading the inventory straight off the script.
+ * Test scripts run their legs through scripts/run-isolated-tests.ts, which runs every leg and then
+ * fails if any failed. They used to be joined with `&&`, where the first red leg stopped the rest
+ * and a green run only proved that nothing failed before the first thing that did.
+ *
+ * The legs themselves are unchanged -- still one process per group, because `mock.module()` state
+ * is process-global -- so undo the join and hand the guards below the `&&` chain they have always
+ * read. Each leg carries its own command, which is what lets the root script's workspace-wide
+ * `bun --filter '*' --parallel test` leg through this same path; the quoting survives because this
+ * reads the script text, where `'*'` is still written out.
  */
 function normalizeTestScript(testScript: string): string {
   const tokens = testScript.trim().split(/\s+/);
@@ -105,7 +108,6 @@ function normalizeTestScript(testScript: string): string {
     .split(LEG_SEPARATOR)
     .map((leg): string => leg.trim())
     .filter((leg): boolean => leg.length > 0)
-    .map((leg): string => `bun test ${leg}`)
     .join(' && ');
 }
 
