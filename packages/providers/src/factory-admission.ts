@@ -285,6 +285,14 @@ export function createAdmittedProvider(
           )
         );
       };
+      // A lease that had already lapsed when it was acquired is an admission failure, not a
+      // mid-flight abort, and the frozen campaign criteria name the two separately. Both funnel
+      // through the same abort controller below, so record which cause applies before arming:
+      // only an already-elapsed lease expiry is an expired admission. A lease that expires while
+      // the invocation is running stays an abort, because by then the provider was admitted.
+      const admissionExpired = Boolean(
+        lease.leaseExpiresAt && Date.parse(lease.leaseExpiresAt) - Date.now() <= 0
+      );
       if (
         admittedOptions &&
         (lease.leaseExpiresAt || lease.admittedActiveExecutionSeconds !== undefined)
@@ -298,7 +306,11 @@ export function createAdmittedProvider(
         }
       }
       try {
-        if (admittedOptions?.abortSignal?.aborted) throw new Error('factory_provider_aborted');
+        if (admittedOptions?.abortSignal?.aborted) {
+          throw new Error(
+            admissionExpired ? 'factory_provider_admission_expired' : 'factory_provider_aborted'
+          );
+        }
         const provider = entry.factory();
         for await (const chunk of provider.sendQuery(
           prompt,
