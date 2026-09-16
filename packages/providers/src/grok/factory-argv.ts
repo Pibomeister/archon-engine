@@ -86,9 +86,5 @@ export function buildGrokFactoryArgv(input: {
   if (flags.some(value => FORBIDDEN_FLAG_RE.test(value))) {
     throw new Error('grok_factory_argv_forbidden');
   }
-  return [
-    ...flags,
-    '--prompt-json',
-    JSON.stringify([{ type: 'text', text: input.prompt }]),
-  ];
+  return [...flags, '--prompt-json', JSON.stringify([{ type: 'text', text: input.prompt }])];
 }

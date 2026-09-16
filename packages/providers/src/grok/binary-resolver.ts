@@ -12,7 +12,8 @@ export function resolveGrokBinaryPath(configGrokBinaryPath?: string): string {
   const pathEntries = (process.env.PATH ?? '').split(delimiter);
   for (const entry of pathEntries) {
     if (!entry) continue;
-    const candidate = entry.endsWith('/') || entry.endsWith('\\') ? `${entry}grok` : `${entry}/grok`;
+    const candidate =
+      entry.endsWith('/') || entry.endsWith('\\') ? `${entry}grok` : `${entry}/grok`;
     if (fileExists(candidate)) return candidate;
   }
   throw new Error('grok_binary_missing');
