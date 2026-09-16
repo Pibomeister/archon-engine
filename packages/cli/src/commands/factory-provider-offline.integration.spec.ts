@@ -113,7 +113,12 @@ nodes:
   const continued = await invoke(['resume', runId], true, false);
   expect(continued.code).not.toBe(0);
   expect(continued.stdout + continued.stderr).toContain('factory_provider_broker_required');
-});
+  // Six sequential CLI subprocesses, each a full bun startup: about 5.7s of real work on an
+  // idle machine, against bun's 5s default. It cleared that default only while nothing else
+  // competed for the host, so `bun --filter '*' --parallel test` failed it deterministically
+  // while running the file alone passed. The budget matches the process-spawning integration
+  // specs alongside it rather than hugging the measured time.
+}, 60_000);
 
 test('native offline deterministic workflow completes with local title generation', async () => {
   const root = await mkdtemp(join(tmpdir(), 'archon-factory-no-model-'));

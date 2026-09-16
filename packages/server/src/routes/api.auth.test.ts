@@ -155,7 +155,17 @@ function makeApp(): OpenAPIHono {
       await fn();
       return { status: 'started' };
     }),
-    getStats: mock(() => ({ active: 0, queued: 0 })),
+    // Mirrors ConversationLockManager.getStats(). The previous shape invented `queued` and
+    // omitted activeConversationIds, which the `as unknown as` cast below hid: GET /api/health
+    // spreads that field, so the route threw and answered 500. The gate assertion only checks
+    // "not 401", so a 500 sailed through while the test's own comment said it expected a 404.
+    getStats: mock(() => ({
+      active: 0,
+      queuedTotal: 0,
+      queuedByConversation: [],
+      maxConcurrent: 1,
+      activeConversationIds: [],
+    })),
   } as unknown as ConversationLockManager;
   registerApiRoutes(app, mockWebAdapter, mockLockManager);
   return app;
@@ -225,10 +235,12 @@ describe('server-side /api/* gate', () => {
 
   test('gate on → /api/health is never blocked by the gate (healthcheck allowlist)', async () => {
     apiGateEnabled = true;
-    // /api/health is registered in startServer, not registerApiRoutes, so it 404s
-    // in this app — but the assertion that matters is it is NOT a 401 (the gate let it through).
+    // registerApiRoutes does register /api/health, so this answers 200 rather than the 404
+    // this comment used to claim. Assert that, not merely "not 401": the weaker form could not
+    // tell a healthy route from a broken one, and for a while it was hiding a 500 thrown out of
+    // the handler itself.
     const res = await makeApp().request('/api/health');
-    expect(res.status).not.toBe(401);
+    expect(res.status).toBe(200);
   });
 
   test('gate on + Better Auth session → protected route passes', async () => {
