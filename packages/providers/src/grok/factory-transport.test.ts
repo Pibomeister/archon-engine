@@ -76,7 +76,13 @@ describe.skipIf(process.platform === 'win32')(
       const cwd = realpathSync(mkdtempSync(join(tmpdir(), 'factory-grok-transport-kill-')));
       try {
         const script = join(cwd, 'ignore-term.sh');
-        writeFileSync(script, '#!/bin/sh\ntrap "" TERM\nsleep 30\n');
+        // The sleep runs in the background with its own stdio, so only the shell holds the
+        // transport's stdout and stderr. `trap "" TERM` keeps the shell alive through SIGTERM,
+        // and SIGKILL cannot be trapped, so the escalation closes those pipes and close fires.
+        // A foreground `sleep 30` instead left the grandchild holding those pipes for its full
+        // duration, so close could not arrive and nativeClosed was never observable -- which is
+        // what made this assertion depend on the platform rather than on the transport.
+        writeFileSync(script, '#!/bin/sh\ntrap "" TERM\nsleep 30 >/dev/null 2>&1 &\nwait\n');
         chmodSync(script, 0o755);
         const abort = new AbortController();
         const running = runGrokCommand({
@@ -85,9 +91,10 @@ describe.skipIf(process.platform === 'win32')(
           env: { PATH: '/usr/bin:/bin' },
           signal: abort.signal,
           termGraceMs: 50,
-          // Fallback only: the close event settles this first and clears the timer. Kept generous
-          // so observing the SIGKILL is not a race against the scheduler.
-          killGraceMs: 5_000,
+          // Fallback only: with the fixture above, close lands as soon as SIGKILL does and settles
+          // this first. Generous against the scheduler, and inside the 5s test timeout so a real
+          // regression fails on the assertion rather than timing out.
+          killGraceMs: 1_000,
           onLine() {},
         });
         await new Promise(resolve => setTimeout(resolve, 30));

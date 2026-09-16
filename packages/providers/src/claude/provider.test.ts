@@ -78,36 +78,46 @@ describe('shouldPassNoEnvFile', () => {
 
 describe('ClaudeProvider', () => {
   let client: ClaudeProvider;
-  test('managed source scope overrides bypass defaults at the actual SDK boundary', async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), 'claude-factory-scope-')));
-    try {
-      const worktree = join(root, 'worktree');
-      const manual = join(root, 'manual');
-      mkdirSync(worktree);
-      mkdirSync(manual);
-      mockQuery.mockImplementation(async function* () {
-        /* no model fixture */
-      });
-      for await (const _chunk of client.sendQuery('fixture', worktree, undefined, {
-        factoryScope: { workspaceRoot: worktree, writableRoots: [worktree], deniedRoots: [manual] },
-      })) {
-        /* consume */
+  // Managed source scope goes through validateFactoryProviderScope, which qualifies the factory
+  // provider path to darwin and linux only. On Windows this fails with
+  // factory_provider_platform_unqualified from production before the SDK boundary is reached.
+  test.skipIf(process.platform === 'win32')(
+    'managed source scope overrides bypass defaults at the actual SDK boundary',
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), 'claude-factory-scope-')));
+      try {
+        const worktree = join(root, 'worktree');
+        const manual = join(root, 'manual');
+        mkdirSync(worktree);
+        mkdirSync(manual);
+        mockQuery.mockImplementation(async function* () {
+          /* no model fixture */
+        });
+        for await (const _chunk of client.sendQuery('fixture', worktree, undefined, {
+          factoryScope: {
+            workspaceRoot: worktree,
+            writableRoots: [worktree],
+            deniedRoots: [manual],
+          },
+        })) {
+          /* consume */
+        }
+        expect(mockQuery.mock.calls[0]?.[0].options).toMatchObject({
+          permissionMode: 'dontAsk',
+          allowDangerouslySkipPermissions: false,
+          settingSources: [],
+          sandbox: {
+            enabled: true,
+            failIfUnavailable: true,
+            allowUnsandboxedCommands: false,
+            filesystem: { allowWrite: [worktree], denyWrite: [manual] },
+          },
+        });
+      } finally {
+        await removeTempTree(root);
       }
-      expect(mockQuery.mock.calls[0]?.[0].options).toMatchObject({
-        permissionMode: 'dontAsk',
-        allowDangerouslySkipPermissions: false,
-        settingSources: [],
-        sandbox: {
-          enabled: true,
-          failIfUnavailable: true,
-          allowUnsandboxedCommands: false,
-          filesystem: { allowWrite: [worktree], denyWrite: [manual] },
-        },
-      });
-    } finally {
-      await removeTempTree(root);
     }
-  });
+  );
 
   beforeEach(() => {
     client = new ClaudeProvider({ retryBaseDelayMs: 1 });
