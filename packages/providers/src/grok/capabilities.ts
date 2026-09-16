@@ -35,13 +35,15 @@ export const GROK_CAPABILITIES: ProviderCapabilities = {
   hooks: false,
   skills: false,
   agents: false,
+  // No adapter path surfaces a bounded human-input request for Grok; only the
+  // Claude adapter emits `human_input_request` chunks today.
+  humanInputRequests: false,
   toolRestrictions: true,
   knownToolNames: GROK_KNOWN_TOOL_NAMES,
   structuredOutput: 'enforced',
   envInjection: true,
   costControl: false,
   effortControl: true,
-  thinkingControl: true,
   fallbackModel: false,
   sandbox: true,
   settingSources: false,

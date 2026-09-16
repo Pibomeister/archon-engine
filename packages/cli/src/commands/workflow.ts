@@ -5853,6 +5853,9 @@ const FINAL_EVIDENCE_ALLOWED_FILES = [
   'no-change-closure-status.json',
   'run-context.json',
 ] as const;
+// completed/failed/cancelled are the statuses a run cannot leave; running,
+// paused and pending can all still mutate their artifacts.
+const FINAL_EVIDENCE_TERMINAL_STATUSES = new Set(['completed', 'failed', 'cancelled']);
 const FINAL_EVIDENCE_MAX_FILE_BYTES = 256 * 1024;
 const FINAL_EVIDENCE_MAX_TOTAL_BYTES = 1024 * 1024;
 const SHA_40_RE = /^[a-f0-9]{40}$/u;
@@ -6101,6 +6104,18 @@ export async function workflowFinalEvidenceCommand(runId: string): Promise<numbe
     await writeJsonLine({ ok: false, code: 'final_evidence_missing_output_root', runId: run.id });
     return 1;
   }
+  // A run still in flight has no final evidence to seal: its artifacts can change
+  // under us, and certifying them would date the envelope to a moment the run had
+  // not reached.
+  if (!FINAL_EVIDENCE_TERMINAL_STATUSES.has(run.status)) {
+    await writeJsonLine({
+      ok: false,
+      code: 'final_evidence_run_not_terminal',
+      runId: run.id,
+      status: run.status,
+    });
+    return 1;
+  }
   const artifactsRoot = archonPaths.getRunArtifactsDirForRoot(run.output_root, run.id);
   const prArtifact = optionalFinalEvidenceArtifact(artifactsRoot, 'pr-evidence.json');
   const artifactRecords = prArtifact ? [prArtifact.artifact] : [];
@@ -6124,7 +6139,53 @@ export async function workflowFinalEvidenceCommand(runId: string): Promise<numbe
   const noChangeStatus = addArtifact(
     optionalFinalEvidenceArtifact(artifactsRoot, 'no-change-closure-status.json')
   );
-  const context = optionalFinalEvidenceArtifact(artifactsRoot, 'run-context.json')?.value;
+  // Bind run-context as evidence rather than reading it as loose side input:
+  // the PR envelope is derived from it, so an unbound copy left the derivation
+  // unattributable and outside the total byte cap.
+  const context = addArtifact(optionalFinalEvidenceArtifact(artifactsRoot, 'run-context.json'));
+  // Nothing was bound, so there is no evidence to certify. Emitting an envelope
+  // here would assert a sealed result over an empty artifact set.
+  if (artifactRecords.length === 0) {
+    await writeJsonLine({
+      ok: false,
+      code: 'final_evidence_missing_artifacts',
+      runId: run.id,
+    });
+    return 1;
+  }
+  // Evidence is only evidence for the run it was produced by. The run carries its
+  // own admission marker, so a copied artifact tree surfaces here as an identity
+  // disagreement rather than a silently certified envelope.
+  const manifestExecution = manifest ? executionFromManifest(manifest.execution) : undefined;
+  const runBinding = recordField(run.metadata?.factory_provider_admission);
+  // A broker-admitted run has an admission identity, so its evidence has to carry
+  // an execution manifest to bind against. Without one there is nothing to compare
+  // and the envelope would be unattributable to the admission that paid for it.
+  if (runBinding && !manifestExecution) {
+    await writeJsonLine({
+      ok: false,
+      code: 'final_evidence_unbound_broker_evidence',
+      runId: run.id,
+      error:
+        'Broker-admitted run presents no execution manifest to bind its evidence to the run binding',
+    });
+    return 1;
+  }
+  if (manifestExecution && runBinding) {
+    const conflicting = Object.keys(manifestExecution).filter(key => {
+      const bound = stringField(runBinding[key]);
+      return bound !== undefined && bound !== stringField(manifestExecution[key]);
+    });
+    if (conflicting.length > 0) {
+      await writeJsonLine({
+        ok: false,
+        code: 'final_evidence_run_binding_mismatch',
+        runId: run.id,
+        error: `Final evidence execution identity does not match run binding for ${conflicting.join(', ')}`,
+      });
+      return 1;
+    }
+  }
   const pr = prArtifact
     ? finalEvidencePrFromArtifacts(prArtifact.value, manifest, context)
     : undefined;

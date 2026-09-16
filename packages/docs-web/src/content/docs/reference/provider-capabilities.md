@@ -29,31 +29,32 @@ unsupported provider at load time and an implicitly resolved one at runtime.
 
 - `claude` — Claude (Anthropic)
 - `codex` — Codex (OpenAI)
+- `grok` — Grok (xAI)
 - `opencode` — OpenCode (community) *(community provider)*
 - `pi` — Pi (community) *(community provider)*
 - `copilot` — Copilot (GitHub) *(community provider)*
 
 ## Capabilities
 
-| Capability | `claude` | `codex` | `opencode` | `pi` | `copilot` |
-| --- | --- | --- | --- | --- | --- |
-| Session resume | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Immutable session fork (`context.resume`) | ✅ | ❌ | ❌ | ✅ | ❌ |
-| MCP servers (`mcp:`) | ✅ | ✅ | ❌ | ❌ | ✅ |
-| Hooks (`hooks:`) | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Skills (`skills:`) | ✅ | ❌ | ❌ | ✅ | ✅ |
-| Inline sub-agents (`agents:`) | ✅ | ❌ | ✅¹ | ❌ | ✅ |
-| Tool restrictions (`allowed_tools`/`denied_tools`) | ✅ | ❌ | ✅ | ✅ | ✅ |
-| Human-input requests (`human_input_request`) | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Structured output (`output_format`) | **enforced** | **enforced** | **enforced** | best-effort | best-effort |
-| Env injection (`env:`) | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Cost control (`maxBudgetUsd`) | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Effort control (`effort`) | ✅ | ✅ | ❌ | ✅ | ✅ |
-| Fallback model (`fallbackModel`) | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Sandbox (`sandbox`) | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Setting sources (`settingSources`) | ✅ | ❌ | ❌ | ❌ | ❌ |
-| In-process native tools | ✅ | ❌ | ❌ | ✅ | ❌ |
-| Container exec (folder-project container backend) | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Capability | `claude` | `codex` | `grok` | `opencode` | `pi` | `copilot` |
+| --- | --- | --- | --- | --- | --- | --- |
+| Session resume | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Immutable session fork (`context.resume`) | ✅ | ❌ | ❌ | ❌ | ✅ | ❌ |
+| MCP servers (`mcp:`) | ✅ | ✅ | ❌ | ❌ | ❌ | ✅ |
+| Hooks (`hooks:`) | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Skills (`skills:`) | ✅ | ❌ | ❌ | ❌ | ✅ | ✅ |
+| Inline sub-agents (`agents:`) | ✅ | ❌ | ❌ | ✅¹ | ❌ | ✅ |
+| Tool restrictions (`allowed_tools`/`denied_tools`) | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ |
+| Human-input requests (`human_input_request` chunks) | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Structured output (`output_format`) | **enforced** | **enforced** | **enforced** | **enforced** | best-effort | best-effort |
+| Env injection (`env:`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Cost control (`maxBudgetUsd`) | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Effort control (`effort`) | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ |
+| Fallback model (`fallbackModel`) | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Sandbox (`sandbox`) | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ |
+| Setting sources (`settingSources`) | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| In-process native tools | ✅ | ❌ | ❌ | ❌ | ✅ | ❌ |
+| Container exec (folder-project container backend) | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
 
 ## Caveats
 

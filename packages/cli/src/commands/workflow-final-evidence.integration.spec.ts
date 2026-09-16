@@ -1,4 +1,5 @@
 import { expect, test } from 'bun:test';
+import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -196,7 +197,21 @@ test('workflow final-evidence exports current Goodword managed PR metadata', asy
     },
   });
   expect(body.finalEvidence.artifacts).toBeArray();
-  expect(JSON.stringify(body)).not.toContain('run-context.json');
+  // run-context.json is bound as evidence, not read as loose side input: the
+  // headBranch and baseBranch above are derived from it, so the seal has to carry
+  // the exact bytes that derivation read.
+  const artifacts = body.finalEvidence.artifacts as {
+    path: string;
+    digest: string;
+    contentBase64: string;
+  }[];
+  const boundContext = artifacts.find(artifact => artifact.path === 'run-context.json');
+  expect(boundContext).toBeDefined();
+  const contextBytes = `${JSON.stringify(runContext)}\n`;
+  expect(Buffer.from(boundContext?.contentBase64 ?? '', 'base64').toString()).toBe(contextBytes);
+  expect(boundContext?.digest).toBe(
+    `sha256:${createHash('sha256').update(contextBytes).digest('hex')}`
+  );
 });
 
 test('workflow final-evidence reports missing run without inventing evidence', async () => {
@@ -206,23 +221,17 @@ test('workflow final-evidence reports missing run without inventing evidence', a
   expect(JSON.parse(result.stdout)).toEqual({ ok: false, code: 'final_evidence_not_found' });
 });
 
-test('workflow final-evidence emits terminal metadata for an existing completed run without pr-evidence', async () => {
+test('workflow final-evidence refuses a completed run that bound no artifacts', async () => {
   const fixture = await makeFixture();
   const seeded = await seedRun({ env: fixture.env, cwd: fixture.project, files: {} });
 
   const result = await finalEvidence(seeded.runId, fixture);
-  expect(result.code, result.stderr + result.stdout).toBe(0);
-  const body = JSON.parse(result.stdout) as { finalEvidence: Record<string, unknown> };
-  expect(body.finalEvidence).toMatchObject({
+  expect(result.code).toBe(1);
+  expect(JSON.parse(result.stdout)).toEqual({
+    ok: false,
+    code: 'final_evidence_missing_artifacts',
     runId: seeded.runId,
-    workflowId: 'portable-single-repo-feature',
-    createdAt: '2026-09-05T00:00:02.000Z',
-    revision: 1,
-    status: 'completed',
-    artifacts: [],
   });
-  expect(body.finalEvidence).not.toHaveProperty('pullRequest');
-  expect(body.finalEvidence).not.toHaveProperty('execution');
 });
 
 test('workflow final-evidence accepts verified no-change without a pull request', async () => {
@@ -277,9 +286,13 @@ test('workflow final-evidence accepts ordinary completed terminal output without
   const body = JSON.parse(result.stdout) as { finalEvidence: Record<string, unknown> };
   expect(body.finalEvidence).toMatchObject({
     runId: seeded.runId,
+    workflowId: 'portable-single-repo-feature',
+    createdAt: '2026-09-05T00:00:02.000Z',
+    revision: 1,
     status: 'publication_requires_authorization',
   });
   expect(body.finalEvidence).not.toHaveProperty('pullRequest');
+  expect(body.finalEvidence).not.toHaveProperty('execution');
 });
 
 test('workflow final-evidence rejects managed PR output when the manifest is missing or changed', async () => {
