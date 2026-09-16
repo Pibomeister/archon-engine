@@ -159,13 +159,15 @@ function makeApp(): OpenAPIHono {
     // omitted activeConversationIds, which the `as unknown as` cast below hid: GET /api/health
     // spreads that field, so the route threw and answered 500. The gate assertion only checks
     // "not 401", so a 500 sailed through while the test's own comment said it expected a 404.
-    getStats: mock(() => ({
-      active: 0,
-      queuedTotal: 0,
-      queuedByConversation: [],
-      maxConcurrent: 1,
-      activeConversationIds: [],
-    })),
+    getStats: mock(
+      (): ReturnType<ConversationLockManager['getStats']> => ({
+        active: 0,
+        queuedTotal: 0,
+        queuedByConversation: [],
+        maxConcurrent: 1,
+        activeConversationIds: [],
+      })
+    ),
   } as unknown as ConversationLockManager;
   registerApiRoutes(app, mockWebAdapter, mockLockManager);
   return app;

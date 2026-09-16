@@ -8,7 +8,7 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "type-check": "tsc --noEmit",
-    "test": "bun test src/lib/ && bun test src/stores/ && bun test src/hooks/ && bun test src/components/ && bun test src/experiments/console/",
+    "test": "bun run ../../scripts/run-isolated-tests.ts src/lib/ --- src/stores/ --- src/hooks/ --- src/components/ --- src/experiments/console/",
     "generate:types": "bun --cwd=../server run generate:api-types"
   },
   "dependencies": {

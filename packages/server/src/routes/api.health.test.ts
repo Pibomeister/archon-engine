@@ -32,13 +32,15 @@ const mockGetSchemaVersion = mock(async () => ({
 const mockIsDocker = mock(() => false);
 const mockIsWSL = mock(() => false);
 const mockGetWSLDistroName = mock((): string | undefined => undefined);
-const mockGetStats = mock(() => ({
-  active: 1,
-  queuedTotal: 2,
-  queuedByConversation: [] as { conversationId: string; queuedMessages: number }[],
-  maxConcurrent: 10,
-  activeConversationIds: [] as string[],
-}));
+const mockGetStats = mock(
+  (): ReturnType<ConversationLockManager['getStats']> => ({
+    active: 1,
+    queuedTotal: 2,
+    queuedByConversation: [] as { conversationId: string; queuedMessages: number }[],
+    maxConcurrent: 10,
+    activeConversationIds: [] as string[],
+  })
+);
 
 mock.module('@archon/core', () => ({
   handleMessage: mock(async () => {}),
