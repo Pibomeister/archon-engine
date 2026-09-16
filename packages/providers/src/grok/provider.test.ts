@@ -130,7 +130,11 @@ describe('Grok streaming-json mapping', () => {
   });
 });
 
-describe('GrokProvider factory spawn', () => {
+// Factory spawn is platform-qualified: validateFactoryProviderScope refuses anything that is
+// not darwin or linux, so on Windows every case here fails with
+// factory_provider_platform_unqualified from production rather than exercising the provider.
+// These tests assert what the factory does where it is supported.
+describe.skipIf(process.platform === 'win32')('GrokProvider factory spawn', () => {
   test('writes sandbox.toml, strips API keys, and withholds result until close', async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), 'factory-grok-provider-')));
     const previous = process.env.GROK_BIN_PATH;

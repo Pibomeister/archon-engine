@@ -17,52 +17,59 @@ import { factoryCodexConfigOverrides } from './factory-sandbox';
 
 const binary = process.env.ARCHON_TEST_CODEX_SANDBOX_BINARY;
 
-describe('factory Codex SDK configuration serialization', () => {
-  test('passes absolute filesystem permissions as one raw TOML table', async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), 'factory-sdk-config-')));
-    try {
-      const worktree = join(root, 'worktree');
-      const manual = join(root, 'manual.with dots space "quote"');
-      const capture = join(root, 'argv');
-      const recorder = join(root, 'codex-recorder');
-      mkdirSync(worktree);
-      mkdirSync(join(manual, '.git'), { recursive: true });
-      writeFileSync(
-        recorder,
-        // Drain stdin before exiting. The SDK writes the prompt into this child, and a
-        // child that exits first closes the pipe out from under that write — EPIPE in
-        // the parent. The race is only lost on Linux; macOS happens to win it.
-        '#!/bin/sh\nprintf "%s\\n" "$@" > ' +
-          JSON.stringify(capture) +
-          '\ncat >/dev/null 2>&1\nexit 1\n'
-      );
-      chmodSync(recorder, 0o700);
-      const overrides = factoryCodexConfigOverrides(
-        {
-          workspaceRoot: worktree,
-          writableRoots: [worktree],
-          readableRoots: [join(manual, '.git')],
-          deniedRoots: [manual],
-        },
-        worktree
-      );
-      const thread = new Codex({
-        codexPathOverride: recorder,
-        configOverrides: overrides,
-      }).startThread({
-        workingDirectory: worktree,
-        sandboxMode: undefined,
-      });
-      await expect(thread.run('fixture')).rejects.toThrow('Codex Exec exited');
-      const args = readFileSync(capture, 'utf8');
-      expect(args).toContain('permissions.archon-factory.filesystem={');
-      expect(args).toContain(JSON.stringify(join(manual, '.git')));
-      expect(args).not.toContain('filesystem.' + join(manual, '.git'));
-    } finally {
-      await removeTempTree(root);
-    }
-  });
-});
+// POSIX-only on two counts: the recorder is a `#!/bin/sh` script, and the fixture deliberately
+// uses a directory named with dots, a space and a double quote, which Windows forbids outright —
+// the mkdir fails with ENOENT before any serialization behaviour is reached. The sandbox describe
+// below is already gated to darwin for the same class of reason.
+describe.skipIf(process.platform === 'win32')(
+  'factory Codex SDK configuration serialization',
+  () => {
+    test('passes absolute filesystem permissions as one raw TOML table', async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), 'factory-sdk-config-')));
+      try {
+        const worktree = join(root, 'worktree');
+        const manual = join(root, 'manual.with dots space "quote"');
+        const capture = join(root, 'argv');
+        const recorder = join(root, 'codex-recorder');
+        mkdirSync(worktree);
+        mkdirSync(join(manual, '.git'), { recursive: true });
+        writeFileSync(
+          recorder,
+          // Drain stdin before exiting. The SDK writes the prompt into this child, and a
+          // child that exits first closes the pipe out from under that write — EPIPE in
+          // the parent. The race is only lost on Linux; macOS happens to win it.
+          '#!/bin/sh\nprintf "%s\\n" "$@" > ' +
+            JSON.stringify(capture) +
+            '\ncat >/dev/null 2>&1\nexit 1\n'
+        );
+        chmodSync(recorder, 0o700);
+        const overrides = factoryCodexConfigOverrides(
+          {
+            workspaceRoot: worktree,
+            writableRoots: [worktree],
+            readableRoots: [join(manual, '.git')],
+            deniedRoots: [manual],
+          },
+          worktree
+        );
+        const thread = new Codex({
+          codexPathOverride: recorder,
+          configOverrides: overrides,
+        }).startThread({
+          workingDirectory: worktree,
+          sandboxMode: undefined,
+        });
+        await expect(thread.run('fixture')).rejects.toThrow('Codex Exec exited');
+        const args = readFileSync(capture, 'utf8');
+        expect(args).toContain('permissions.archon-factory.filesystem={');
+        expect(args).toContain(JSON.stringify(join(manual, '.git')));
+        expect(args).not.toContain('filesystem.' + join(manual, '.git'));
+      } finally {
+        await removeTempTree(root);
+      }
+    });
+  }
+);
 
 describe.skipIf(!binary || process.platform !== 'darwin')(
   'actual pinned Codex native workspace sandbox (no model)',
