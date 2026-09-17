@@ -50,7 +50,7 @@ import {
   isContinueSubcommand,
   RESUME_RUN_CONFIG_CONFLICT,
 } from './dispatch-guards';
-import { resolveCliExitCode } from './utils/workflow-exit-code';
+import { resolveCliExitCode, WorkflowCommandRejectedError } from './utils/workflow-exit-code';
 import type { WorkflowRunConfigInput } from '@archon/workflows/schemas/run-config';
 installPipeSafeConsole();
 
@@ -1082,6 +1082,47 @@ async function main(): Promise<number> {
   let detachedRunConfig: WorkflowRunConfigInput | undefined;
 
   try {
+    if (
+      [values['expected-occurrence'], values['expected-evidence-digest']].some(
+        value => value !== undefined
+      ) &&
+      !(command === 'workflow' && subcommand === 'respond')
+    ) {
+      return await fail(jsonFlag, 'Conditional gate flags are only supported by workflow respond.');
+    }
+    if (
+      [
+        values['expected-node'],
+        values['expected-invocation'],
+        values['expected-request-digest'],
+        values['expected-lease'],
+        values['response-file'],
+      ].some(value => value !== undefined) &&
+      !(command === 'workflow' && subcommand === 'factory-human-input')
+    ) {
+      return await fail(
+        jsonFlag,
+        'Factory human-input flags are only supported by workflow factory-human-input.'
+      );
+    }
+    if (
+      values['command-id'] !== undefined &&
+      !(
+        command === 'workflow' &&
+        (subcommand === 'respond' || subcommand === 'factory-human-input')
+      )
+    ) {
+      return await fail(
+        jsonFlag,
+        'Command id is only supported by workflow respond and workflow factory-human-input.'
+      );
+    }
+    if (
+      [values['launch-key'], values['launch-payload-digest']].some(value => value !== undefined) &&
+      !(command === 'workflow' && subcommand === 'run')
+    ) {
+      return await fail(jsonFlag, 'Launch identity flags are only supported by workflow run.');
+    }
     const detachedRunConfigPayload = values['internal-detached-run-config'];
     if (
       command === 'workflow' &&
@@ -1099,7 +1140,11 @@ async function main(): Promise<number> {
       if (resumeFlag) throw new Error(RESUME_RUN_CONFIG_CONFLICT);
     }
 
-    const configOutsideRun = rejectConfigOutsideRun(command, subcommand, values.config);
+    const configOutsideRun = rejectConfigOutsideRun(
+      command,
+      subcommand === 'launch-intent' ? 'run' : subcommand,
+      values.config
+    );
     if (configOutsideRun) {
       console.error(configOutsideRun);
       return 1;
@@ -1173,7 +1218,14 @@ async function main(): Promise<number> {
       if (repoRoot) {
         // Use repo root as working directory (handles subdirectory case)
         effectiveCwd = repoRoot;
-      } else if (dryRunFlag && command === 'workflow' && subcommand === 'run') {
+      } else if (
+        command === 'workflow' &&
+        (subcommand === 'launch-intent' ||
+          subcommand === 'launch-status' ||
+          subcommand === 'gate-evidence' ||
+          subcommand === 'final-evidence' ||
+          (dryRunFlag && subcommand === 'run'))
+      ) {
         // Dry-run only discovers workflow files and simulates in memory. It does
         // not need project registration, a database lookup, or a git worktree.
         effectiveCwd = cwd;
@@ -1330,6 +1382,10 @@ async function main(): Promise<number> {
           workflowResetSessionsCommand,
           workflowEventEmitCommand,
           workflowInstallCommand,
+          workflowLaunchStatusCommand,
+          workflowGateEvidenceCommand,
+          workflowFinalEvidenceCommand,
+          workflowFactoryHumanInputCommand,
           isValidEventType,
         } = await loadRoute(() => import('./commands/workflow'), {
           // `resume`, `approve`, `reject`, and `respond` all reach `workflowRunCommand`,
@@ -1368,6 +1424,22 @@ async function main(): Promise<number> {
             break;
           }
 
+          case 'launch-status':
+            if (!positionals[2])
+              return await fail(jsonFlag, 'Usage: workflow launch-status <launch-key> --json');
+            return await workflowLaunchStatusCommand(positionals[2]);
+          case 'gate-evidence':
+            if (!positionals[2] || !positionals[3])
+              return await fail(
+                jsonFlag,
+                'Usage: workflow gate-evidence <run-id> <occurrence-id> --json'
+              );
+            return await workflowGateEvidenceCommand(positionals[2], positionals[3]);
+          case 'final-evidence':
+            if (!positionals[2] || positionals[3] !== undefined)
+              return await fail(jsonFlag, 'Usage: workflow final-evidence <run-id> --json');
+            return await workflowFinalEvidenceCommand(positionals[2]);
+          case 'launch-intent':
           case 'run': {
             const workflowName = positionals[2];
             if (!workflowName) {
@@ -1446,6 +1518,9 @@ async function main(): Promise<number> {
               }
             }
             const options = {
+              launchIntentOnly: subcommand === 'launch-intent',
+              launchKey: values['launch-key'] as string | undefined,
+              launchPayloadDigest: values['launch-payload-digest'] as string | undefined,
               branchName,
               fromBranch,
               baseBranch,
@@ -1655,6 +1730,46 @@ async function main(): Promise<number> {
             break;
           }
 
+          case 'factory-human-input': {
+            const inputRunId = positionals[2];
+            if (!inputRunId) {
+              return await fail(
+                jsonFlag,
+                'Usage: archon workflow factory-human-input <run-id> --json --command-id <id> --expected-node <node-id> --expected-invocation <invocation-id> --expected-request-digest <sha256> --expected-lease <lease-id> [--response-file <path|->]\n' +
+                  '  Response text is read from stdin unless --response-file is provided.'
+              );
+            }
+            const factoryValues = [
+              values['command-id'],
+              values['expected-node'],
+              values['expected-invocation'],
+              values['expected-request-digest'],
+              values['expected-lease'],
+            ];
+            if (
+              !jsonFlag ||
+              !factoryValues.every(value => typeof value === 'string' && value.length > 0)
+            ) {
+              return await fail(
+                jsonFlag,
+                'Factory human-input response requires --json, --command-id, --expected-node, --expected-invocation, --expected-request-digest and --expected-lease.'
+              );
+            }
+            await workflowFactoryHumanInputCommand(inputRunId, {
+              json: jsonFlag,
+              cwd: effectiveCwd,
+              responseFile: values['response-file'] as string | undefined,
+              binding: {
+                commandId: values['command-id'] as string,
+                expectedNodeId: values['expected-node'] as string,
+                expectedInvocationId: values['expected-invocation'] as string,
+                expectedRequestDigest: values['expected-request-digest'] as string,
+                expectedLeaseId: values['expected-lease'] as string,
+              },
+            });
+            break;
+          }
+
           case 'respond': {
             const respondRunId = positionals[2];
             const decision = positionals[3];
@@ -1669,13 +1784,34 @@ async function main(): Promise<number> {
             const rawRespondText =
               (values.text as string | undefined) || positionals.slice(4).join(' ');
             const respondText = rawRespondText.length > 0 ? rawRespondText : undefined;
+            const conditionalValues = [
+              values['command-id'],
+              values['expected-occurrence'],
+              values['expected-evidence-digest'],
+            ];
+            if (
+              conditionalValues.some(value => value !== undefined) &&
+              !conditionalValues.every(value => typeof value === 'string' && value.length > 0)
+            ) {
+              return await fail(
+                jsonFlag,
+                'Conditional respond requires --command-id, --expected-occurrence and --expected-evidence-digest together.'
+              );
+            }
             await workflowRespondCommand(
               respondRunId,
               decision,
               respondText,
               jsonFlag,
               effectiveCwd,
-              detachFlag
+              detachFlag,
+              conditionalValues[0] === undefined
+                ? undefined
+                : {
+                    commandId: values['command-id'] as string,
+                    expectedOccurrence: values['expected-occurrence'] as string,
+                    expectedEvidenceDigest: values['expected-evidence-digest'] as string,
+                  }
             );
             break;
           }
@@ -2046,6 +2182,7 @@ async function main(): Promise<number> {
     await printUpdateNotice(values.quiet as boolean | undefined);
     return 0;
   } catch (error) {
+    if (error instanceof WorkflowCommandRejectedError) return 1;
     const err = error as Error;
     // A detached child reports its run's own failure with a reserved status so its
     // launcher can tell that apart from a child that died before the run started.

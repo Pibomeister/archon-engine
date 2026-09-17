@@ -35,8 +35,10 @@ import type {
   MessageChunk,
   ExecutionContext,
   OverlayChangeSummary,
+  FactoryInvocationSignal,
 } from '@archon/providers/types';
 import { CONTAINER_ENV_DENYLIST, mergeTokenUsage } from '@archon/providers/types';
+import { getFactoryBinding, isFactoryManaged } from '@archon/providers/factory-mode';
 import type { ContainerRunContext } from './container-context';
 import { WRITEBACK_GATE_NODE_ID } from './container-context';
 import {
@@ -73,6 +75,7 @@ import type {
   WorkflowRunNodeSession,
   WorkflowRunStatus,
   WorkflowWaitContext,
+  FactoryHumanInputContext,
   ScheduledWorkflowResume,
 } from './schemas';
 import {
@@ -82,6 +85,8 @@ import {
   isGateNode,
   isWorkflowWaitContext,
   isScheduledWorkflowResume,
+  isFactoryHumanInputContext,
+  FACTORY_HUMAN_INPUT_METADATA_KEY,
   isHaltNode,
   isIncludeDirective,
   isPersistableNode,
@@ -178,6 +183,95 @@ import {
   type ResolvedAiProfile,
   type TierName,
 } from './model-validation';
+
+class FactoryHumanInputPause extends Error {
+  constructor() {
+    super('Factory human input required');
+    this.name = 'FactoryHumanInputPause';
+  }
+}
+
+function factoryHumanInputForNode(
+  workflowRun: WorkflowRun,
+  nodeId: string,
+  occurrence?: { iteration?: number; reask?: number }
+): FactoryHumanInputContext | undefined {
+  const raw = workflowRun.metadata?.[FACTORY_HUMAN_INPUT_METADATA_KEY];
+  if (!isFactoryHumanInputContext(raw) || raw.nodeId !== nodeId) return undefined;
+  if (occurrence?.iteration !== undefined && raw.iteration !== occurrence.iteration) {
+    return undefined;
+  }
+  if (occurrence?.reask !== undefined && (raw.reask ?? 0) !== occurrence.reask) return undefined;
+  return raw;
+}
+
+async function consumeAndAppendFactoryHumanInputResponse(
+  deps: WorkflowDeps,
+  prompt: string,
+  workflowRun: WorkflowRun,
+  nodeId: string,
+  occurrence?: { iteration?: number; reask?: number }
+): Promise<{ prompt: string; resumeSessionId?: string }> {
+  const context = factoryHumanInputForNode(workflowRun, nodeId, occurrence);
+  if (!context?.response) return { prompt };
+
+  // `consumedAt` means this exact continuation already reserved the bound answer.
+  // A coordinator crash can happen after that durable mark and before provider
+  // admission/effects. Dropping the answer on replay would silently resume without
+  // the operator response. Reusing the answer remains scoped by the exact node and
+  // occurrence match above.
+  if (context.response.consumedAt !== undefined) {
+    return appendFactoryHumanInputResponse(prompt, context);
+  }
+
+  if (!deps.store.consumeFactoryHumanInputResponse) {
+    throw new Error(
+      `Node '${nodeId}' has a factory human-input response but the workflow store cannot consume it.`
+    );
+  }
+  const { consumed } = await deps.store.consumeFactoryHumanInputResponse(workflowRun.id, context);
+  if (!consumed) return { prompt };
+  context.response.consumedAt = new Date().toISOString();
+  return appendFactoryHumanInputResponse(prompt, context);
+}
+
+function appendFactoryHumanInputResponse(
+  prompt: string,
+  context: FactoryHumanInputContext
+): { prompt: string; resumeSessionId?: string } {
+  return {
+    prompt:
+      `${prompt}\n\n---\n\nFactory human input response for this exact paused invocation ` +
+      `(${context.invocationId}, request ${context.requestDigest}):\n` +
+      `${context.response?.text ?? ''}\n\nContinue from the paused task using this answer. Do not treat it as gate approval, ` +
+      'merge authorization, or permission for operations outside the original workflow scope.',
+    ...(context.sessionId ? { resumeSessionId: context.sessionId } : {}),
+  };
+}
+
+function contextFromFactorySignal(
+  signal: FactoryInvocationSignal,
+  request: { message: string; reason?: string; sessionId?: string }
+): FactoryHumanInputContext {
+  return {
+    version: 'archon.factory-human-input.v1',
+    runId: signal.context.runId,
+    nodeId: signal.context.nodeId,
+    invocationId: signal.invocationId,
+    requestDigest: signal.requestDigest,
+    leaseId: signal.leaseId,
+    ...(signal.context.launchId ? { launchId: signal.context.launchId } : {}),
+    ...(signal.context.attemptId ? { attemptId: signal.context.attemptId } : {}),
+    ...(signal.context.iteration !== undefined ? { iteration: signal.context.iteration } : {}),
+    ...(signal.context.reask !== undefined ? { reask: signal.context.reask } : {}),
+    message: request.message,
+    ...(request.reason ? { reason: request.reason } : {}),
+    ...((request.sessionId ?? signal.sessionId)
+      ? { sessionId: request.sessionId ?? signal.sessionId }
+      : {}),
+    requestedAt: new Date().toISOString(),
+  };
+}
 
 /**
  * Closed-set node type for telemetry — mirrors the DagNode discriminators.
@@ -1561,6 +1655,21 @@ function collectLoopBodyNodeIds(
   return into;
 }
 
+function completedLoopGroupBodyNodesForIteration(
+  completedNodeOutputs: ReadonlyMap<string, PersistedNodeOutput> | undefined,
+  bodyStepNamePrefix: string,
+  iteration: number
+): Map<string, PersistedNodeOutput> | undefined {
+  if (completedNodeOutputs === undefined) return undefined;
+  const scoped = new Map<string, PersistedNodeOutput>();
+  for (const [stepName, output] of completedNodeOutputs) {
+    if (!stepName.startsWith(bodyStepNamePrefix)) continue;
+    if (output.iteration !== iteration) continue;
+    scoped.set(stepName.slice(bodyStepNamePrefix.length), output);
+  }
+  return scoped.size > 0 ? scoped : undefined;
+}
+
 /**
  * Resolve `$LOOP_PREV.<nodeId>.output` and `$LOOP_PREV.<nodeId>.output.<field>` references
  * against a loop_group body's *prior-iteration* node outputs.
@@ -1843,6 +1952,17 @@ async function resolveNodeProviderAndModel(
 
   // Build universal base options
   const baseOptions: SendQueryOptions = {};
+  if (isFactoryManaged()) {
+    const binding = getFactoryBinding();
+    baseOptions.factoryInvocation = {
+      runId: workflowRunId,
+      nodeId: node.id,
+      ...(binding?.attemptId ? { attemptId: binding.attemptId } : {}),
+      ...((binding?.launchId ?? binding?.logicalChainId)
+        ? { launchId: binding.launchId ?? binding.logicalChainId }
+        : {}),
+    };
+  }
   if (model) baseOptions.model = model;
   // Only annotate options with the execution context when running in a container
   // (Phase B). Host is the default/absent case, so host runs produce byte-identical
@@ -2266,7 +2386,7 @@ async function executeNodeInternal(
   }
 
   // Substitute upstream node output references
-  const finalPrompt = substituteNodeOutputRefs(substitutedPrompt, nodeOutputs);
+  const baseFinalPrompt = substituteNodeOutputRefs(substitutedPrompt, nodeOutputs);
 
   const aiClient = deps.getAgentProvider(provider);
   const streamingMode = platform.getStreamingMode();
@@ -2289,6 +2409,15 @@ async function executeNodeInternal(
     ...nodeOptions,
     abortSignal: nodeAbortController.signal,
     ...(shouldForkSession ? { forkSession: true } : {}),
+    ...(nodeOptions?.factoryInvocation
+      ? {
+          factoryInvocation: {
+            ...nodeOptions.factoryInvocation,
+            nodeId: stepName,
+            ...(iteration !== undefined ? { iteration } : {}),
+          },
+        }
+      : {}),
   };
   let nodeIdleTimedOut = false;
   let lastWatchdogReset: WatchdogReset | undefined;
@@ -2550,6 +2679,42 @@ async function executeNodeInternal(
         if (streamingMode === 'stream' && platform.sendStructuredEvent) {
           await platform.sendStructuredEvent(conversationId, msg);
         }
+      } else if (msg.type === 'factory_observation') {
+        await deps.store.createWorkflowEvent({
+          workflow_run_id: workflowRun.id,
+          event_type: 'factory_observation',
+          step_name: stepName,
+          data: { signal: msg.signal },
+        });
+      } else if (msg.type === 'human_input_request') {
+        if (!msg.signal) {
+          getLog().warn(
+            { workflowRunId: workflowRun.id, nodeId: node.id, reason: msg.reason },
+            'workflow_unsigned_human_input_request_ignored'
+          );
+          if (platform.sendMessage) {
+            await platform.sendMessage(
+              conversationId,
+              `Node '${node.id}' requested human input, but this workflow was not admitted through the factory control plane. The request was recorded as provider tool output and cannot pause or resume this run without exact factory identity.`
+            );
+          }
+          continue;
+        }
+        if (!deps.store.pauseWorkflowRunForFactoryHumanInput) {
+          throw new Error(
+            `Node '${node.id}' requested factory human input but the workflow store cannot persist it.`
+          );
+        }
+        await deps.store.pauseWorkflowRunForFactoryHumanInput(
+          workflowRun.id,
+          contextFromFactorySignal(msg.signal, {
+            message: msg.message,
+            ...(msg.reason ? { reason: msg.reason } : {}),
+            ...(msg.sessionId ? { sessionId: msg.sessionId } : {}),
+          })
+        );
+        nodeAbortController.abort();
+        throw new FactoryHumanInputPause();
       } else if (msg.type === 'result') {
         // A terminal result closes every outstanding lifecycle.
         for (const [toolCallId, prevTool] of runningTools) {
@@ -2926,7 +3091,7 @@ async function executeNodeInternal(
   // (best-effort providers add their own JSON-only instruction), so this only
   // appends the per-attempt feedback.
   const buildReaskPrompt = (errors: string[]): string =>
-    `${finalPrompt}\n\n--- CORRECTION ---\n` +
+    `${baseFinalPrompt}\n\n--- CORRECTION ---\n` +
     `Your previous response did not satisfy the required JSON schema: ${errors.join('; ')}. ` +
     'Respond again with ONLY a JSON object matching the schema — no prose, no code fences.';
 
@@ -2952,8 +3117,19 @@ async function executeNodeInternal(
     // (maxReasks = 0). A best-effort node whose structured output is missing or
     // schema-invalid is re-run with the errors appended, up to maxReasks times;
     // exhaustion (or a non-best-effort failure) throws → failed node.
-    let reaskAttempt = 0;
-    let reaskPrompt = finalPrompt;
+    const initialFactoryContext = factoryHumanInputForNode(
+      workflowRun,
+      stepName,
+      iteration !== undefined ? { iteration } : undefined
+    );
+    let reaskAttempt = initialFactoryContext?.response ? (initialFactoryContext.reask ?? 0) : 0;
+    let reaskPrompt =
+      reaskAttempt === 0
+        ? baseFinalPrompt
+        : buildReaskPrompt([
+            initialFactoryContext?.reason ??
+              'factory human-input request interrupted the structured-output correction pass',
+          ]);
     // Set up the next reask attempt (increment, augment the prompt, notify).
     const scheduleReask = async (errors: string[]): Promise<void> => {
       reaskAttempt++;
@@ -2964,10 +3140,26 @@ async function executeNodeInternal(
       // Legacy reasks use a fresh throwaway session so an invalid turn is not carried
       // forward. Named resume is stricter: every accepted pass must independently fork
       // the declared source rather than inheriting stale attestation from an earlier pass.
+      const factoryHumanInputResume = await consumeAndAppendFactoryHumanInputResponse(
+        deps,
+        reaskPrompt,
+        workflowRun,
+        stepName,
+        {
+          ...(iteration !== undefined ? { iteration } : {}),
+          reask: reaskAttempt,
+        }
+      );
       const reaskResumeSessionId =
-        namedResumeSourceNodeId !== undefined || reaskAttempt === 0 ? resumeSessionId : undefined;
+        factoryHumanInputResume.resumeSessionId ??
+        (namedResumeSourceNodeId !== undefined || reaskAttempt === 0 ? resumeSessionId : undefined);
+      if (nodeOptionsWithAbort?.factoryInvocation)
+        nodeOptionsWithAbort.factoryInvocation = {
+          ...nodeOptionsWithAbort.factoryInvocation,
+          reask: reaskAttempt,
+        };
       try {
-        await runStreamPass(reaskPrompt, reaskResumeSessionId);
+        await runStreamPass(factoryHumanInputResume.prompt, reaskResumeSessionId);
       } finally {
         await watchdogResetLog;
         if (nodeCostUsd !== undefined) {
@@ -3224,6 +3416,11 @@ async function executeNodeInternal(
       ...(nodeResumed !== undefined ? { resumed: nodeResumed } : {}),
     };
   } catch (error) {
+    if (error instanceof FactoryHumanInputPause) {
+      lastNodeCancelCheck.delete(`${workflowRun.id}:${node.id}`);
+      lastNodeActivityUpdate.delete(`${workflowRun.id}:${node.id}`);
+      return { state: 'completed', output: nodeOutputText };
+    }
     const err = error as Error;
 
     const cancelled = nodeAbortController.signal.aborted && !nodeIdleTimedOut;
@@ -4700,10 +4897,29 @@ async function executeLoopGroupNode(
     loopGateMeta.nodeId === node.id &&
     loopGateMeta.bodyGateId !== undefined;
   const isEscalatedWaitResume = loopOwnedWaitMeta?.nodeId === node.id;
+  const rawFactoryHumanInput = workflowRun.metadata?.[FACTORY_HUMAN_INPUT_METADATA_KEY];
+  const factoryGroupResumeContext =
+    isFactoryHumanInputContext(rawFactoryHumanInput) &&
+    rawFactoryHumanInput.response !== undefined &&
+    rawFactoryHumanInput.nodeId.startsWith(bodyStepNamePrefix)
+      ? rawFactoryHumanInput
+      : undefined;
+  const isFactoryGroupResume = factoryGroupResumeContext !== undefined;
   const isLoopResume =
-    isLegacyInteractiveLoopResume || isEscalatedGateResume || isEscalatedWaitResume;
-  const resumeIteration = loopGateMeta?.iteration ?? loopOwnedWaitMeta?.iteration ?? 0;
-  const startIteration = isLoopResume ? resumeIteration + 1 : 1;
+    isLegacyInteractiveLoopResume ||
+    isEscalatedGateResume ||
+    isEscalatedWaitResume ||
+    isFactoryGroupResume;
+  const resumeIteration =
+    factoryGroupResumeContext?.iteration ??
+    loopGateMeta?.iteration ??
+    loopOwnedWaitMeta?.iteration ??
+    0;
+  const startIteration = isFactoryGroupResume
+    ? Math.max(1, resumeIteration)
+    : isLoopResume
+      ? resumeIteration + 1
+      : 1;
   // max_iterations bounds autonomous work. An attention wait contributes no work while
   // paused, so each explicit resume authorizes one fresh iteration even after that bound.
   // This keeps manual recovery resumable without turning a concluded-red wait into polling.
@@ -4711,6 +4927,22 @@ async function executeLoopGroupNode(
     isEscalatedWaitResume && loopOwnedWaitMeta?.kind === 'attention'
       ? Math.max(group.max_iterations, startIteration)
       : group.max_iterations;
+  let factoryGroupResumeSnapshot: DagResumeSnapshot | undefined;
+  if (isFactoryGroupResume) {
+    if (!deps.store.getDagResumeSnapshot) {
+      return {
+        state: 'failed',
+        output: '',
+        error: `Loop-group '${node.id}' cannot resume factory human input without a resume snapshot store.`,
+      };
+    }
+    try {
+      factoryGroupResumeSnapshot = await deps.store.getDagResumeSnapshot(workflowRun.id);
+    } catch (error) {
+      const err = error as Error;
+      return { state: 'failed', output: '', error: err.message };
+    }
+  }
   const loopGateRunMeta = (workflowRun.metadata ?? {}) as LoopGateRunMetadata;
   const loopUserInput = isLegacyInteractiveLoopResume
     ? (loopGateRunMeta.loop_user_input ?? '')
@@ -5078,6 +5310,23 @@ async function executeLoopGroupNode(
     // upstream outputs so body nodes can reference outer context via $nodeId.output if
     // needed (the body is sealed against depends_on, but prompt refs remain valid).
     const scopedNodeOutputs = new Map<string, NodeOutput>(outerNodeOutputs);
+    const priorCompletedBodyNodes =
+      isFactoryGroupResume && i === startIteration
+        ? completedLoopGroupBodyNodesForIteration(
+            factoryGroupResumeSnapshot?.completedNodeOutputs,
+            bodyStepNamePrefix,
+            i
+          )
+        : undefined;
+    for (const [bodyNodeId, prior] of priorCompletedBodyNodes ?? []) {
+      scopedNodeOutputs.set(bodyNodeId, {
+        state: 'completed',
+        output: prior.output,
+        ...(prior.structuredOutput !== undefined
+          ? { structuredOutput: prior.structuredOutput }
+          : {}),
+      });
+    }
 
     const iterCtx: RunLayersContext = {
       deps: ctx.deps,
@@ -5121,7 +5370,7 @@ async function executeLoopGroupNode(
       scopeArtifactsDir: undefined,
       layers: iterBodyLayers,
       nodeOutputs: scopedNodeOutputs,
-      priorCompletedNodes: undefined, // body re-runs in full each iteration (v1)
+      priorCompletedNodes: priorCompletedBodyNodes,
       claimedWorkPausePolicy: ctx.claimedWorkPausePolicy,
       // Thread the loop-level session cursor: fresh_context (or the loop's true first
       // iteration) starts fresh; otherwise carry the prior iteration's last sequential
@@ -5844,10 +6093,18 @@ async function executeLoopNode(
   const rawApproval = workflowRun.metadata?.approval;
   const loopGateMeta = isApprovalContext(rawApproval) ? rawApproval : undefined;
   const isLoopResume = loopGateMeta?.type === 'interactive_loop' && loopGateMeta.nodeId === node.id;
-  const startIteration = isLoopResume ? (loopGateMeta.iteration ?? 0) + 1 : 1;
+  const factoryResumeContext = factoryHumanInputForNode(workflowRun, stepName);
+  const isFactoryInputResume = factoryResumeContext?.response !== undefined;
+  const startIteration = isFactoryInputResume
+    ? (factoryResumeContext.iteration ?? 1)
+    : isLoopResume
+      ? (loopGateMeta.iteration ?? 0) + 1
+      : 1;
   let currentSessionId: string | undefined = isLoopResume
     ? (loopGateMeta.sessionId ?? undefined)
-    : undefined;
+    : isFactoryInputResume
+      ? factoryResumeContext.sessionId
+      : undefined;
   const loopGateRunMeta = (workflowRun.metadata ?? {}) as LoopGateRunMetadata;
   const loopUserInput = isLoopResume ? (loopGateRunMeta.loop_user_input ?? '') : '';
   const persistedUsageContext = { workflowRunId: workflowRun.id, nodeId: node.id };
@@ -6164,7 +6421,8 @@ async function executeLoopNode(
       // survives past the attempt loop.
       // Raw structured payload seen on the current attempt, before validation.
       let attemptStructured: unknown;
-      let reaskAttempt = 0;
+      let reaskAttempt =
+        isFactoryInputResume && i === startIteration ? (factoryResumeContext.reask ?? 0) : 0;
       let reaskErrors: string[] = [];
       const wantsStructured = resolvedOptions?.outputFormat !== undefined;
       const maxReasks =
@@ -6216,14 +6474,32 @@ async function executeLoopNode(
           const basePrompt = substituteNodeOutputRefs(substitutedPrompt, nodeOutputs);
           // A reask re-runs this iteration's prompt with the schema errors appended, so
           // the model is told WHAT was wrong rather than silently asked again.
-          const finalPrompt =
+          const finalPromptBase =
             reaskAttempt === 0
               ? basePrompt
               : `${basePrompt}\n\n---\n\nYour previous response did not match the required output schema:\n${reaskErrors.map(e => `- ${e}`).join('\n')}\n\nRespond again with output that satisfies the schema exactly.`;
+          const factoryHumanInputResume = await consumeAndAppendFactoryHumanInputResponse(
+            deps,
+            finalPromptBase,
+            workflowRun,
+            stepName,
+            { iteration: i, reask: reaskAttempt }
+          );
+          const finalPrompt = factoryHumanInputResume.prompt;
 
           const iterationOptions: SendQueryOptions | undefined = {
             ...resolvedOptions,
             abortSignal: iterationAbortController.signal,
+            ...(resolvedOptions?.factoryInvocation
+              ? {
+                  factoryInvocation: {
+                    ...resolvedOptions.factoryInvocation,
+                    nodeId: stepName,
+                    iteration: i,
+                    reask: reaskAttempt,
+                  },
+                }
+              : {}),
           };
 
           // Reask attempts start a FRESH session (mirrors runStreamPass in
@@ -6231,7 +6507,8 @@ async function executeLoopNode(
           const generator = aiClient.sendQuery(
             finalPrompt,
             cwd,
-            reaskAttempt === 0 ? resumeSessionId : undefined,
+            factoryHumanInputResume.resumeSessionId ??
+              (reaskAttempt === 0 ? resumeSessionId : undefined),
             iterationOptions
           );
           const runningTools = new Map<string, RunningTool>();
@@ -6453,6 +6730,48 @@ async function executeLoopNode(
             } else if (msg.type === 'background_tasks') {
               // Level signal (REPLACE semantics): swap the live set for the payload.
               backgroundTasks.update(msg.tasks);
+            } else if (msg.type === 'factory_observation') {
+              await deps.store.createWorkflowEvent({
+                workflow_run_id: workflowRun.id,
+                event_type: 'factory_observation',
+                step_name: stepName,
+                data: { signal: msg.signal, iteration: i, reask: reaskAttempt },
+              });
+            } else if (msg.type === 'human_input_request') {
+              if (!msg.signal) {
+                getLog().warn(
+                  {
+                    workflowRunId: workflowRun.id,
+                    nodeId: node.id,
+                    iteration: i,
+                    reask: reaskAttempt,
+                    reason: msg.reason,
+                  },
+                  'loop_node.unsigned_human_input_request_ignored'
+                );
+                await safeSendMessage(
+                  platform,
+                  conversationId,
+                  `Loop node '${node.id}' requested human input, but this workflow was not admitted through the factory control plane. The request was recorded as provider tool output and cannot pause or resume this run without exact factory identity.`,
+                  msgContext
+                );
+                continue;
+              }
+              if (!deps.store.pauseWorkflowRunForFactoryHumanInput) {
+                throw new Error(
+                  `Loop node '${node.id}' requested factory human input but the workflow store cannot persist it.`
+                );
+              }
+              await deps.store.pauseWorkflowRunForFactoryHumanInput(
+                workflowRun.id,
+                contextFromFactorySignal(msg.signal, {
+                  message: msg.message,
+                  ...(msg.reason ? { reason: msg.reason } : {}),
+                  ...(msg.sessionId ? { sessionId: msg.sessionId } : {}),
+                })
+              );
+              iterationAbortController.abort();
+              throw new FactoryHumanInputPause();
             } else if (msg.type === 'tool' && msg.toolName) {
               const now = Date.now();
               const toolCallId = msg.toolCallId ?? `anonymous-${String(++anonymousToolSequence)}`;
@@ -6634,6 +6953,15 @@ async function executeLoopNode(
             });
           }
         } catch (error) {
+          if (error instanceof FactoryHumanInputPause) {
+            return {
+              state: 'completed',
+              output: lastIterationOutput,
+              costUsd: loopTotalCostUsd,
+              ...(loopTotalTokens !== undefined ? { tokens: loopTotalTokens } : {}),
+              loopIterations: i,
+            };
+          }
           foldIterationUsage();
           const err = error as Error;
           const duration = Date.now() - iterationStart;
@@ -9787,6 +10115,8 @@ interface RunLayersContext extends RunInputs, RunDerived {
   claimedWorkPausePolicy?: ClaimedWorkPausePolicy;
   /** Resume cache: node ids that completed in a prior run (top-level only; undefined for body). */
   priorCompletedNodes?: Map<string, PersistedNodeOutput>;
+  /** Durable starts with no later terminal event, used to quarantine uncertain factory continuations. */
+  unresolvedNodeStarts?: Set<string>;
   /**
    * Private provider session handles produced by completed top-level nodes. Undefined
    * inside loop_group bodies because repeated local IDs have no addressable lineage
@@ -9989,6 +10319,55 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
       (node): (() => Promise<LayerNodeResult>) =>
         async (): Promise<LayerNodeResult> => {
           try {
+            // Include nodes are expanded away at discovery time (include-expander.ts): one
+            // must never reach the executor. This guard is FIRST in the per-node body — before
+            // resume-skip, `when:`, and trigger-rule handling — so an unexpanded include node
+            // cannot slip through by matching a prior-completed entry, a false `when:`, or a
+            // failing trigger rule. If one gets here, discovery was bypassed; fail loud rather
+            // than silently accepting an invalid runtime DAG.
+            if (isIncludeDirective(node as DagNode | IncludeDirective)) {
+              const includeNode = node as unknown as IncludeDirective;
+              throw new Error(
+                `Internal error: include node '${includeNode.id}' reached the executor unexpanded. ` +
+                  'Include nodes must be resolved by expandWorkflowIncludes() during discovery.'
+              );
+            }
+
+            const stepName = ctx.stepNamePrefix + node.id;
+            const factoryHumanInputContext = factoryHumanInputForNode(
+              ctx.workflowRun,
+              stepName,
+              iteration !== undefined ? { iteration } : undefined
+            );
+            if (
+              ctx.unresolvedNodeStarts?.has(stepName) === true &&
+              factoryHumanInputContext?.response?.consumedAt !== undefined &&
+              ctx.priorCompletedNodes?.has(node.id) !== true
+            ) {
+              const error =
+                `Node '${stepName}' has an unsettled factory human-input continuation after ` +
+                'the operator response was consumed. Refusing to re-admit the provider until ' +
+                'the prior effects are reconciled.';
+              await ctx.deps.store.createWorkflowEvent({
+                workflow_run_id: ctx.workflowRun.id,
+                event_type: 'node_failed',
+                step_name: stepName,
+                data: {
+                  error,
+                  reason: 'factory_human_input_continuation_uncertain',
+                  invocation_id: factoryHumanInputContext.invocationId,
+                  request_digest: factoryHumanInputContext.requestDigest,
+                  ...(factoryHumanInputContext.iteration !== undefined
+                    ? { iteration: factoryHumanInputContext.iteration }
+                    : {}),
+                  ...(factoryHumanInputContext.reask !== undefined
+                    ? { reask: factoryHumanInputContext.reask }
+                    : {}),
+                },
+              });
+              return { nodeId: node.id, output: { state: 'failed' as const, output: '', error } };
+            }
+
             const checkpointSessionForProvider = (
               provider: string
             ): SessionCheckpoint | undefined => {
@@ -11705,12 +12084,33 @@ export async function executeDagWorkflow(
   };
   const layers = workflow.plan.layers;
   const nodeOutputs = new Map<string, NodeOutput>();
+  let effectivePriorCompletedNodes = priorCompletedNodes;
+  let effectivePriorUsage = priorUsage;
+  let unresolvedNodeStarts: Set<string> | undefined;
+  if (effectivePriorCompletedNodes === undefined && deps.store.getDagResumeSnapshot) {
+    const resumeSnapshot = await deps.store.getDagResumeSnapshot(workflowRun.id);
+    const hasPriorLifecycleState =
+      resumeSnapshot.completedNodeOutputs.size > 0 || resumeSnapshot.unresolvedNodeStarts.size > 0;
+    if (resumeSnapshot.completedNodeOutputs.size > 0) {
+      effectivePriorCompletedNodes = resumeSnapshot.completedNodeOutputs;
+    }
+    if (resumeSnapshot.unresolvedNodeStarts.size > 0) {
+      unresolvedNodeStarts = resumeSnapshot.unresolvedNodeStarts;
+    }
+    if (effectivePriorUsage === undefined && hasPriorLifecycleState) {
+      effectivePriorUsage = {
+        tokens: resumeSnapshot.tokens,
+        costUsd: resumeSnapshot.costUsd,
+      };
+    }
+  }
 
   // Pre-populate nodeOutputs from prior run so already-completed nodes are
   // treated as done for trigger-rule and $nodeId.output substitution purposes.
   // Nodes flagged `always_run: true` are excluded — they re-execute on resume
   // and downstream consumers must see the fresh output, not the cached one.
-  if (priorCompletedNodes && priorCompletedNodes.size > 0) {
+  if (effectivePriorCompletedNodes && effectivePriorCompletedNodes.size > 0) {
+    const priorCompletedNodes = effectivePriorCompletedNodes;
     const nodesById = new Map(workflow.nodes.map(n => [n.id, n]));
     let prepopulatedCount = 0;
     for (const [nodeId, prior] of priorCompletedNodes) {
@@ -11850,13 +12250,14 @@ export async function executeDagWorkflow(
     layers,
     nodeOutputs,
     afterLayer: persistAuthoredOutcome,
-    priorCompletedNodes,
+    priorCompletedNodes: effectivePriorCompletedNodes,
+    unresolvedNodeStarts,
     nodeSessionHandles,
     namedResumeSourceIds,
     lastSequentialSession: undefined,
     warnedProviderConflicts: new Set<string>(),
-    totalCostUsd: priorUsage?.costUsd ?? 0,
-    totalTokens: priorUsage?.tokens,
+    totalCostUsd: effectivePriorUsage?.costUsd ?? 0,
+    totalTokens: effectivePriorUsage?.tokens,
     totalLoopIterations: 0,
     stepNamePrefix: '',
     loopGroupPath: [],
