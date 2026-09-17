@@ -15,15 +15,20 @@ import type {
 } from './types';
 import { ClaudeProvider } from './claude/provider';
 import { CodexProvider } from './codex/provider';
+import { GrokProvider } from './grok/provider';
 import { parseClaudeRunConfig } from './claude/config';
 import { parseCodexRunConfig } from './codex/config';
+import { parseGrokRunConfig } from './grok/config';
 import { CLAUDE_CAPABILITIES } from './claude/capabilities';
 import { CODEX_CAPABILITIES } from './codex/capabilities';
+import { GROK_CAPABILITIES } from './grok/capabilities';
 import { registerCopilotProvider } from './community/copilot/registration';
 import { registerOpencodeProvider } from './community/opencode/registration';
 import { registerPiProvider } from './community/pi/registration';
 import { InvalidProviderRunConfigError, UnknownProviderError } from './errors';
 import { createLogger } from '@archon/paths';
+import { isFactoryManaged, getFactoryBroker } from './factory-mode';
+import { createAdmittedProvider } from './factory-admission';
 import { EFFORT_LADDER } from '@archon/paths/effort';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -64,6 +69,7 @@ export function getAgentProvider(id: string): IAgentProvider {
     throw new UnknownProviderError(id, [...registry.keys()]);
   }
   getLog().debug({ provider: id }, 'provider_selected');
+  if (isFactoryManaged()) return createAdmittedProvider(entry, getFactoryBroker());
   return entry.factory();
 }
 
@@ -124,7 +130,7 @@ export function isRegisteredProvider(id: string): boolean {
 }
 
 /**
- * Register built-in providers (Claude, Codex). Idempotent — skips already-registered IDs.
+ * Register built-in providers (Claude, Codex, Grok). Idempotent — skips already-registered IDs.
  * Must be called at process entrypoints (server, CLI) before any provider lookups.
  */
 export function registerBuiltinProviders(): void {
@@ -163,6 +169,24 @@ export function registerBuiltinProviders(): void {
             vendor: 'openai',
             displayName: 'OpenAI',
             kinds: ['api_key', 'subscription'],
+          },
+        ],
+      },
+    },
+    {
+      id: 'grok',
+      displayName: 'Grok (xAI)',
+      factory: () => new GrokProvider(),
+      capabilities: GROK_CAPABILITIES,
+      builtIn: true,
+      parseRunConfig: parseGrokRunConfig,
+      credentials: {
+        kind: 'static',
+        specs: [
+          {
+            vendor: 'xai',
+            displayName: 'xAI',
+            kinds: ['subscription'],
           },
         ],
       },

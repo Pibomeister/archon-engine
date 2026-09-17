@@ -17,6 +17,13 @@ export type {
   ProviderCredentialCatalog,
 } from './types';
 export { CREDENTIAL_KINDS } from './types';
+export {
+  readFactoryAdvisoryFile,
+  type FactoryAdvisoryObservation,
+  type FactoryAdvisoryReadOptions,
+  type FactoryAdvisoryReadResult,
+  type FactoryAdvisoryStatus,
+} from './factory-advisory-file';
 
 // Provider config types (canonical definitions in ./types, re-exported via config modules)
 // Import from ./types directly or from the config modules — both work.
@@ -51,6 +58,7 @@ export {
 // Provider classes
 export { ClaudeProvider } from './claude/provider';
 export { CodexProvider } from './codex/provider';
+export { GrokProvider } from './grok/provider';
 
 // Config parsers
 export {
@@ -60,6 +68,7 @@ export {
   type ParsedSettingSources,
 } from './claude/config';
 export { parseCodexConfig, type CodexProviderDefaults } from './codex/config';
+export { parseGrokConfig, parseGrokRunConfig, type GrokProviderDefaults } from './grok/config';
 
 // Utilities (needed by consumers)
 export { resetCodexSingleton } from './codex/provider';
