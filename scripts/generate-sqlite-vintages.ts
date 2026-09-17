@@ -87,6 +87,9 @@ function extractSchemaSql(tag: string): string {
   return sql;
 }
 
+/** A shipped release tag, the only kind a vintage can come from. */
+const RELEASE_TAG = /^v[\w.-]+$/;
+
 /**
  * Every DISTINCT schema ever shipped in a release tag, oldest tag per version.
  *
@@ -99,7 +102,25 @@ function vintages(): Map<string, string> {
   if (!tagResult.ok) {
     throw new Error(`git tag failed: ${tagResult.stderr.trim() || '(no stderr)'}`);
   }
-  const tags = tagResult.stdout.split('\n').filter(Boolean);
+  const allTags = tagResult.stdout.split('\n').filter(Boolean);
+  // Vintages come from releases. The repository also carries tags that pin a commit for an
+  // outside consumer rather than shipping it -- fluxkeep-campaign-2026-09-15 pins the engine
+  // revision a downstream qualification campaign was frozen against -- and those are not
+  // releases: no install ever ran them as a version. They used to reach fixtureName and abort
+  // the whole check on the first one. Filtering here also keeps the seenAdapter tripwire below
+  // honest, since it reasons about "every release since the adapter was introduced" and an
+  // interleaved non-release tag is not a counterexample to that.
+  const tags = allTags.filter((tag): boolean => RELEASE_TAG.test(tag));
+  const skipped = allTags.length - tags.length;
+  if (skipped > 0) {
+    console.log(`note: ${skipped} non-release tag(s) skipped`);
+  }
+  if (allTags.length > 0 && tags.length === 0) {
+    throw new Error(
+      `git tag listed ${allTags.length} tag(s) but none are release-shaped — cannot regenerate ` +
+        'vintage fixtures'
+    );
+  }
   if (tags.length === 0) {
     // An empty tag set would make write mode delete every checked-in fixture
     // while exiting 0; no release history means this script cannot run.
@@ -144,9 +165,9 @@ function vintages(): Map<string, string> {
   return oldestTagPerSchema;
 }
 
-/** Fixture filename for a tag. Tags are `vX.Y.Z`, so the name is injection-safe. */
+/** Fixture filename for a tag. Release tags are `vX.Y.Z`, so the name is injection-safe. */
 function fixtureName(tag: string): string {
-  if (!/^v[\w.-]+$/.test(tag)) throw new Error(`unexpected tag shape: ${tag}`);
+  if (!RELEASE_TAG.test(tag)) throw new Error(`unexpected tag shape: ${tag}`);
   return `${tag}.sql`;
 }
 

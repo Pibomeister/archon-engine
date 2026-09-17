@@ -83,8 +83,37 @@ function readRootTestConfig(): { testScript: string; workspaces: string[] } {
   return { testScript: manifest.testScript, workspaces: manifest.workspaces };
 }
 
+const ISOLATED_RUNNER = 'scripts/run-isolated-tests.ts';
+const LEG_SEPARATOR = '---';
+
+/**
+ * Test scripts run their legs through scripts/run-isolated-tests.ts, which runs every leg and then
+ * fails if any failed. They used to be joined with `&&`, where the first red leg stopped the rest
+ * and a green run only proved that nothing failed before the first thing that did.
+ *
+ * The legs themselves are unchanged -- still one process per group, because `mock.module()` state
+ * is process-global -- so undo the join and hand the guards below the `&&` chain they have always
+ * read. Each leg carries its own command, which is what lets the root script's workspace-wide
+ * `bun --filter '*' --parallel test` leg through this same path; the quoting survives because this
+ * reads the script text, where `'*'` is still written out.
+ */
+function normalizeTestScript(testScript: string): string {
+  const tokens = testScript.trim().split(/\s+/);
+  if (tokens[0] !== 'bun' || tokens[1] !== 'run' || tokens[2]?.endsWith(ISOLATED_RUNNER) !== true) {
+    return testScript;
+  }
+  return tokens
+    .slice(3)
+    .join(' ')
+    .split(LEG_SEPARATOR)
+    .map((leg): string => leg.trim())
+    .filter((leg): boolean => leg.length > 0)
+    .join(' && ');
+}
+
 function sourceSelectors(testScript: string | undefined): SelectorParseResult {
   if (testScript === undefined) return { selectors: [], unsupportedCommands: [] };
+  testScript = normalizeTestScript(testScript);
 
   const selectors: string[] = [];
   const unsupportedCommands: string[] = [];
@@ -113,25 +142,29 @@ function sourceSelectors(testScript: string | undefined): SelectorParseResult {
 }
 
 function directTestSelectors(testScript: string): string[] {
-  return testScript.split('&&').flatMap((command): string[] => {
-    const tokens = command.trim().split(/\s+/);
-    return tokens[0] === 'bun' && tokens[1] === 'test'
-      ? tokens.slice(2).filter((token): boolean => !token.startsWith('-'))
-      : [];
-  });
+  return normalizeTestScript(testScript)
+    .split('&&')
+    .flatMap((command): string[] => {
+      const tokens = command.trim().split(/\s+/);
+      return tokens[0] === 'bun' && tokens[1] === 'test'
+        ? tokens.slice(2).filter((token): boolean => !token.startsWith('-'))
+        : [];
+    });
 }
 
 function runsAllWorkspaceTests(testScript: string): boolean {
-  return testScript.split('&&').some((command): boolean => {
-    const tokens = command.trim().split(/\s+/);
-    const filterIndex = tokens.indexOf('--filter');
-    return (
-      tokens[0] === 'bun' &&
-      filterIndex !== -1 &&
-      tokens[filterIndex + 1] === "'*'" &&
-      tokens.at(-1) === 'test'
-    );
-  });
+  return normalizeTestScript(testScript)
+    .split('&&')
+    .some((command): boolean => {
+      const tokens = command.trim().split(/\s+/);
+      const filterIndex = tokens.indexOf('--filter');
+      return (
+        tokens[0] === 'bun' &&
+        filterIndex !== -1 &&
+        tokens[filterIndex + 1] === "'*'" &&
+        tokens.at(-1) === 'test'
+      );
+    });
 }
 
 function selectorCollects(selector: string, testPath: string, baseDirectory: string): boolean {

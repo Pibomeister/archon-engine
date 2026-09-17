@@ -1,5 +1,12 @@
 import { describe, expect, test } from 'bun:test';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { removeTempTree } from '@archon/paths/test-utils';
@@ -123,7 +130,11 @@ describe('Grok streaming-json mapping', () => {
   });
 });
 
-describe('GrokProvider factory spawn', () => {
+// Factory spawn is platform-qualified: validateFactoryProviderScope refuses anything that is
+// not darwin or linux, so on Windows every case here fails with
+// factory_provider_platform_unqualified from production rather than exercising the provider.
+// These tests assert what the factory does where it is supported.
+describe.skipIf(process.platform === 'win32')('GrokProvider factory spawn', () => {
   test('writes sandbox.toml, strips API keys, and withholds result until close', async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), 'factory-grok-provider-')));
     const previous = process.env.GROK_BIN_PATH;
@@ -141,13 +152,18 @@ describe('GrokProvider factory spawn', () => {
       chmodSync(binary, 0o755);
       process.env.GROK_BIN_PATH = binary;
       const recorded: { argv: string[]; env: NodeJS.ProcessEnv }[] = [];
-      let resolveRun: ((value: { exitCode: number; stdout: string; stderr: string; nativeClosed: boolean }) => void) | undefined;
+      let resolveRun:
+        | ((value: {
+            exitCode: number;
+            stdout: string;
+            stderr: string;
+            nativeClosed: boolean;
+          }) => void)
+        | undefined;
       const runner: GrokCommandRunner = async input => {
         recorded.push({ argv: [...input.argv], env: { ...input.env } });
         input.onLine('{"type":"text","data":"wrote marker"}');
-        input.onLine(
-          `{"type":"end","sessionId":"${RESUME_ID}","stopReason":"end_turn"}`
-        );
+        input.onLine(`{"type":"end","sessionId":"${RESUME_ID}","stopReason":"end_turn"}`);
         return await new Promise(resolve => {
           resolveRun = resolve;
         });
@@ -301,9 +317,9 @@ describe('GrokProvider factory spawn', () => {
 
   test('refuses unmanaged construction without factory scope', async () => {
     const provider = new GrokProvider();
-    await expect(consume(provider.sendQuery('hi', '/tmp', undefined, { model: 'grok-4.6' }))).rejects.toThrow(
-      'grok_factory_scope_required'
-    );
+    await expect(
+      consume(provider.sendQuery('hi', '/tmp', undefined, { model: 'grok-4.6' }))
+    ).rejects.toThrow('grok_factory_scope_required');
   });
 
   test('factory env omits API key variables and disables key auth and vendor MCP scan', () => {

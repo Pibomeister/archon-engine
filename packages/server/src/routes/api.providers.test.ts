@@ -156,13 +156,15 @@ function makeApp(): Hono {
       await fn();
       return { status: 'started' };
     }),
-    getStats: mock(() => ({
-      active: 0,
-      queuedTotal: 0,
-      queuedByConversation: [],
-      maxConcurrent: 10,
-      activeConversationIds: [],
-    })),
+    getStats: mock(
+      (): ReturnType<ConversationLockManager['getStats']> => ({
+        active: 0,
+        queuedTotal: 0,
+        queuedByConversation: [],
+        maxConcurrent: 10,
+        activeConversationIds: [],
+      })
+    ),
   } as unknown as ConversationLockManager;
   registerApiRoutes(app, mockWebAdapter, mockLockManager);
   return app;

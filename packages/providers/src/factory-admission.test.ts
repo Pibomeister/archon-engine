@@ -416,4 +416,27 @@ describe('factory provider exclusive stream admission', () => {
     );
     expect(f.settled).toEqual(['quarantined']);
   });
+
+  test('a lease already lapsed on acquisition is refused as an expired admission', async () => {
+    const f = fixture();
+    const acquire = f.broker.acquire;
+    f.broker.acquire = async request => ({
+      ...(await acquire(request)),
+      leaseExpiresAt: '2000-01-01T00:00:00.000Z',
+    });
+    let constructed = 0;
+    const realFactory = f.entry.factory;
+    f.entry.factory = () => {
+      constructed += 1;
+      return realFactory();
+    };
+
+    // Distinct from the mid-flight expiry above, which aborts an admitted invocation and reports
+    // transport uncertainty. Here the lease was already dead when acquired, so no provider is
+    // constructed at all and the failure names the admission.
+    await expect(consume(createAdmittedProvider(f.entry, f.broker))).rejects.toThrow(
+      'factory_provider_admission_expired'
+    );
+    expect(constructed).toBe(0);
+  });
 });
