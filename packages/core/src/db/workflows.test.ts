@@ -570,7 +570,13 @@ describe('workflows database', () => {
 
   describe('pauseWorkflowRun', () => {
     test('replaces the approval object rather than merging into it', async () => {
-      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+      mockQuery
+        .mockResolvedValueOnce(
+          createQueryResult([{ ...mockWorkflowRun, status: 'running', output_root: null }])
+        )
+        .mockResolvedValueOnce(createQueryResult([]))
+        .mockResolvedValueOnce(createQueryResult([], 1))
+        .mockResolvedValueOnce(createQueryResult([], 1));
 
       await pauseWorkflowRun('workflow-run-123', {
         nodeId: 'review',
@@ -578,7 +584,7 @@ describe('workflows database', () => {
         type: 'approval',
       });
 
-      const [query, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      const [query, params] = mockQuery.mock.calls[3] as [string, unknown[]];
       expect(query).toContain("status = 'paused'");
       expect(query).toContain("AND status = 'running'");
       // The approval object is SET wholesale, never folded into the stored one —
@@ -595,6 +601,8 @@ describe('workflows database', () => {
       // this gate leaves unset is absent, which is what makes a prior gate's value
       // unable to survive at any depth.
       expect(JSON.parse(params[2] as string)).toEqual({
+        occurrenceId: expect.any(String),
+        evidenceDigest: expect.stringMatching(/^[a-f0-9]{64}$/),
         nodeId: 'review',
         message: 'Please review',
         type: 'approval',
@@ -602,7 +610,13 @@ describe('workflows database', () => {
     });
 
     test('preserves interactive-loop signal and usage fields when the gate provides them', async () => {
-      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+      mockQuery
+        .mockResolvedValueOnce(
+          createQueryResult([{ ...mockWorkflowRun, status: 'running', output_root: null }])
+        )
+        .mockResolvedValueOnce(createQueryResult([]))
+        .mockResolvedValueOnce(createQueryResult([], 1))
+        .mockResolvedValueOnce(createQueryResult([], 1));
 
       await pauseWorkflowRun('workflow-run-123', {
         nodeId: 'refine',
@@ -616,7 +630,7 @@ describe('workflows database', () => {
         commandSnapshot: 'Loaded command body',
       });
 
-      const [, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      const [, params] = mockQuery.mock.calls[3] as [string, unknown[]];
       const approval = JSON.parse(params[2] as string) as Record<string, unknown>;
       expect(approval.completionSignaled).toBe(true);
       expect(approval.signaledOutput).toBe('REPORT');
@@ -632,7 +646,13 @@ describe('workflows database', () => {
     });
 
     test('folds caller-supplied run metadata into the same write', async () => {
-      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+      mockQuery
+        .mockResolvedValueOnce(
+          createQueryResult([{ ...mockWorkflowRun, status: 'running', output_root: null }])
+        )
+        .mockResolvedValueOnce(createQueryResult([]))
+        .mockResolvedValueOnce(createQueryResult([], 1))
+        .mockResolvedValueOnce(createQueryResult([], 1));
 
       await pauseWorkflowRun(
         'workflow-run-123',
@@ -640,7 +660,7 @@ describe('workflows database', () => {
         { pending_writeback: true }
       );
 
-      const [, params] = mockQuery.mock.calls[0] as [string, unknown[]];
+      const [, params] = mockQuery.mock.calls[3] as [string, unknown[]];
       // Same atomic UPDATE, so there is no window where the run is paused
       // without the marker (M3) — it merges at the top level, beside `approval`.
       expect(JSON.parse(params[1] as string)).toEqual({ pending_writeback: true });
