@@ -1008,6 +1008,41 @@ export async function respondToWorkflow(
   return respondToWorkflowWithDeclaredDecision(runId, decision, text);
 }
 
+export async function respondToWorkflowConditionally(
+  runId: string,
+  decision: string,
+  text: string | undefined,
+  binding: import('../db/workflow-commands').GateCommandBinding
+): Promise<import('../db/workflow-commands').CommandReceipt> {
+  const { gateCommandReceipt } = await import('../db/workflow-commands');
+  const command = {
+    ...binding,
+    runId,
+    decision,
+    ...(text === undefined ? {} : { text }),
+  };
+  const prior = await gateCommandReceipt(command);
+  if (prior) return prior;
+  await respondToWorkflow(runId, decision, text);
+  const receipt = await gateCommandReceipt(command);
+  if (!receipt) throw new Error('Gate resolution did not persist its command receipt.');
+  return receipt;
+}
+
+export async function respondToFactoryHumanInputConditionally(
+  runId: string,
+  text: string,
+  binding: import('../db/workflow-commands').FactoryHumanInputCommandBinding
+): Promise<import('../db/workflow-commands').CommandReceipt> {
+  const { factoryHumanInputCommandReceipt, resolveFactoryHumanInputWithCommand } =
+    await import('../db/workflow-commands');
+  const command = { ...binding, runId, text };
+  const prior = await factoryHumanInputCommandReceipt(command);
+  if (prior) return prior;
+  const respondedAt = new Date().toISOString();
+  return await resolveFactoryHumanInputWithCommand(command, respondedAt);
+}
+
 /**
  * Reset persisted per-node provider sessions for a workflow.
  *

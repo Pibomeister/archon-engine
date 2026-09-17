@@ -20,6 +20,7 @@
     "./community/copilot": "./src/community/copilot/index.ts",
     "./community/copilot/binary-resolver": "./src/community/copilot/binary-resolver.ts",
     "./community/grok": "./src/community/grok/index.ts",
+    "./factory-mode": "./src/factory-mode.ts",
     "./community/opencode/runtime": "./src/community/opencode/runtime.ts",
     "./errors": "./src/errors.ts",
     "./registry": "./src/registry.ts"

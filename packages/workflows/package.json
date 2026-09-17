@@ -9,6 +9,7 @@
     "./deprecation": "./src/deprecation.ts",
     "./router": "./src/router.ts",
     "./store": "./src/store.ts",
+    "./factory-human-input": "./src/factory-human-input.ts",
     "./terminal-record": "./src/terminal-record.ts",
     "./terminal-status-write": "./src/terminal-status-write.ts",
     "./deps": "./src/deps.ts",

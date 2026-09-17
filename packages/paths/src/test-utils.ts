@@ -6,6 +6,23 @@
  */
 import { afterEach } from 'bun:test';
 import { rm } from 'node:fs/promises';
+import { closeSync, openSync, unlinkSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
+
+/** Test-only inherited data FD. Unlink before any child can observe a path. */
+export function openAnonymousFixtureFd(root: string, content: string): number {
+  const path = join(root, `fixture-fd-${randomUUID()}.json`);
+  writeFileSync(path, content, { flag: 'wx', mode: 0o600 });
+  const fd = openSync(path, 'r');
+  try {
+    unlinkSync(path);
+    return fd;
+  } catch (error) {
+    closeSync(fd);
+    throw error;
+  }
+}
 
 /** Attempts before a stuck tree is reported as a leak rather than retried again. */
 const MAX_ATTEMPTS = 10;

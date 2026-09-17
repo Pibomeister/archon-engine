@@ -13,6 +13,8 @@ import { buildGrokEnv } from './env';
 import { buildGrokArgv } from './argv';
 import { parseGrokOutput } from './stream';
 import { runGrokCommand, type GrokCommandRunner } from './transport';
+import { sendFactoryGrokQuery } from '../../factory/grok-send';
+import { runGrokCommand as runFactoryGrokCommand } from '../../factory/grok-transport';
 
 type ResultChunk = Extract<MessageChunk, { type: 'result' }>;
 
@@ -97,6 +99,16 @@ export class GrokProvider implements IAgentProvider {
     resumeSessionId?: string,
     options?: SendQueryOptions
   ): AsyncGenerator<MessageChunk> {
+    if (options?.factoryScope) {
+      yield* sendFactoryGrokQuery(
+        runFactoryGrokCommand,
+        prompt,
+        cwd,
+        resumeSessionId,
+        options
+      );
+      return;
+    }
     const config = parseGrokConfig(options?.assistantConfig ?? {});
     const model = options?.model?.trim() || config.model?.trim() || DEFAULT_GROK_MODEL;
     const effort = resolveGrokEffort(options?.nodeConfig?.effort, config.modelReasoningEffort);

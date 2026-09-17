@@ -118,3 +118,12 @@ export {
   type GrokProviderDefaults,
 } from './community/grok';
 export { resolveGrokBinaryPath } from './community/grok/binary-resolver';
+export {
+  isFactoryManaged,
+  getFactoryBroker,
+  factoryRunMarker,
+  assertFactoryRunMode,
+  assertFactoryWorkingPath,
+  assertFactorySuccessorMode,
+  factorySuccessorRecord,
+} from './factory-mode';

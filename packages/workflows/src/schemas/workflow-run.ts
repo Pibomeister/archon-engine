@@ -96,6 +96,13 @@ export function workflowWaitStepName(wait: WorkflowWaitContext): string {
   return wait.owner === 'loop_group' ? `${wait.nodeId}.${wait.bodyWaitId}` : wait.nodeId;
 }
 
+export {
+  FACTORY_HUMAN_INPUT_METADATA_KEY,
+  factoryHumanInputContextSchema,
+  isFactoryHumanInputContext,
+  type FactoryHumanInputContext,
+} from '../factory-human-input';
+
 export const scheduledWorkflowResumeSchema = z
   .object({
     reason: z.literal('quota'),
@@ -589,6 +596,8 @@ export function isRecognizedSuspendReason(type: string | undefined): boolean {
 
 /** Approval context stored in workflow run metadata when paused for human review. */
 export interface ApprovalContext {
+  occurrenceId?: string;
+  evidenceDigest?: string;
   nodeId: string;
   message: string;
   /**

@@ -382,6 +382,8 @@ export type MessageChunk =
       outcome: 'success' | 'error' | 'cancelled';
       exitCode?: number;
     }
+  | import('./factory-types').FactoryHumanInputRequest
+  | import('./factory-types').FactoryObservationChunk
   | { type: 'workflow_dispatch'; workerConversationId: string; workflowName: string };
 
 /**

@@ -228,7 +228,8 @@ export interface GateResolutionEvent {
 export async function resolveApprovalGate(
   id: string,
   metadata: Record<string, unknown>,
-  events: GateResolutionEvent[]
+  events: GateResolutionEvent[],
+  _command?: unknown
 ): Promise<{ resolved: boolean }> {
   const dialect = getDialect();
   try {
@@ -2274,3 +2275,9 @@ export async function deleteWorkflowRun(id: string): Promise<void> {
     throw new Error(`Failed to delete workflow run: ${err.message}`);
   }
 }
+
+export {
+  pauseWorkflowRunForFactoryHumanInput,
+  resolveFactoryHumanInput,
+  consumeFactoryHumanInputResponse,
+} from './workflow-factory';

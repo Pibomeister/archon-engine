@@ -63,4 +63,12 @@ export const cliArgOptions: CliArgOptions = {
   'internal-detached-run-config': { type: 'string' },
   // Private handoff: the run row the detached parent created before forking (#2872).
   'internal-detached-run-id': { type: 'string' },
+  'factory-provider-broker-fd': { type: 'string' },
+  'factory-provider-offline': { type: 'boolean' },
+  'command-id': { type: 'string' },
+  'expected-node': { type: 'string' },
+  'expected-invocation': { type: 'string' },
+  'expected-request-digest': { type: 'string' },
+  'expected-lease': { type: 'string' },
+  'response-file': { type: 'string' },
 };

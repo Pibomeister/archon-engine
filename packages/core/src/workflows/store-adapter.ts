@@ -59,7 +59,7 @@ function collectOAuthCredentialValues(
 }
 
 export function createWorkflowStore(): IWorkflowStore {
-  return {
+  const store: IWorkflowStore = {
     createWorkflowRun: workflowDb.createWorkflowRun,
     getWorkflowRun: workflowDb.getWorkflowRun,
     findChildRuns: workflowDb.findChildRuns,
@@ -110,6 +110,12 @@ export function createWorkflowStore(): IWorkflowStore {
     listWorkflowRunNodeSessions,
     upsertWorkflowRunNodeSession,
   };
+  Object.assign(store, {
+    pauseWorkflowRunForFactoryHumanInput: workflowDb.pauseWorkflowRunForFactoryHumanInput,
+    resolveFactoryHumanInput: workflowDb.resolveFactoryHumanInput,
+    consumeFactoryHumanInputResponse: workflowDb.consumeFactoryHumanInputResponse,
+  });
+  return store;
 }
 
 /**

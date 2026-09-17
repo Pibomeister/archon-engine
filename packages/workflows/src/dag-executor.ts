@@ -46,6 +46,7 @@ import {
   isRegisteredProvider,
   validateStructuredOutput,
 } from '@archon/providers';
+import { isFactoryManaged } from '@archon/providers/factory-mode';
 import type {
   DagNode,
   IncludeDirective,
@@ -1821,6 +1822,7 @@ async function resolveNodeProviderAndModel(
 
   // Build universal base options
   const baseOptions: SendQueryOptions = {};
+  if (isFactoryManaged()) baseOptions.factoryInvocation = { runId: workflowRunId, nodeId: node.id };
   if (model) baseOptions.model = model;
   // Only annotate options with the execution context when running in a container
   // (Phase B). Host is the default/absent case, so host runs produce byte-identical
