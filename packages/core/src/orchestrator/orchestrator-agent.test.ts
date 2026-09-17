@@ -317,6 +317,7 @@ const DEFAULT_PROVIDER_CAPS: ProviderCapabilities = {
   settingSources: false,
   nativeTools: false,
   containerExec: false,
+  humanInputRequests: false,
 };
 
 mock.module('@archon/providers', () => ({

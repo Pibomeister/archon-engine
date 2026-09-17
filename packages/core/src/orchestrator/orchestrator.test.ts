@@ -209,6 +209,7 @@ const providerCapabilities: ProviderCapabilities = {
   settingSources: true,
   nativeTools: true,
   containerExec: true,
+  humanInputRequests: false,
 };
 const mockGetProviderCapabilities = mock<typeof Providers.getProviderCapabilities>(
   () => providerCapabilities

@@ -212,14 +212,31 @@ describe('DiscordAdapter', () => {
   });
 
   describe('message handler registration', () => {
-    test('should allow registering a message handler', async () => {
+    test('invokes a handler registered before start', async () => {
       const adapter = new DiscordAdapter('fake-token-for-testing');
-      const mockHandler = mock(() => Promise.resolve(undefined));
+      const mockHandler = mock(async (_ctx: DiscordMessageContext) => undefined);
 
       adapter.onMessage(mockHandler);
       await adapter.start();
 
-      expect(true).toBe(true);
+      // `expect(true).toBe(true)` stood here, so the test passed whether or not onMessage wired
+      // anything up. Registration is only observable by dispatching through the handler the
+      // adapter registered with the client, so that is what this asserts.
+      const registered = (
+        mockClientOn as unknown as Mock<(evt: string, fn: unknown) => void>
+      ).mock.calls.filter(c => c[0] === 'messageCreate');
+      expect(registered.length).toBe(1);
+      const handler = registered[0][1] as (msg: import('discord.js').Message) => void;
+
+      handler({
+        author: { id: 'snowflake-1', username: 'Registrant', bot: false },
+        content: 'ping',
+        channelId: 'chan-1',
+        guild: { id: 'guild-1' },
+        mentions: { has: () => false },
+      } as unknown as import('discord.js').Message);
+
+      expect(mockHandler).toHaveBeenCalledTimes(1);
     });
   });
 

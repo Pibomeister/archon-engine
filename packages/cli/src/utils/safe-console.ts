@@ -163,14 +163,25 @@ export function installPipeSafeConsole(): void {
     // R5 regression test in `safe-console.test.ts`.
     // The promise is tracked in `pendingWrites` so `flushPendingWrites()`
     // can drain it before `process.exit()`.
-    const p = writeStdout(text).finally(() => {
-      pendingWrites.delete(p);
-    });
+    // Record the failure inside the tracked promise rather than on a sibling branch of it.
+    // Ordering is currently safe either way -- the recorder is registered at write time, so it
+    // runs before the drain's own reactions, and `await flushPendingWrites()` yields several
+    // microtasks besides -- so this is not a bug fix. It removes the dependence on that: the
+    // recorder used to sit on `p.catch(...)` while `finally` removed `p` from `pendingWrites`,
+    // so the invariant "the error is recorded before the drain can read it" held only because
+    // of promise-reaction registration order. Chained, `writeError` is assigned before `p`
+    // settles and `p` leaves `pendingWrites` only after that, so the invariant holds by
+    // construction. Chaining also leaves `p` resolved rather than rejected, so no
+    // unhandled-rejection trap is involved on any platform.
+    const p = writeStdout(text)
+      .catch((err: unknown) => {
+        const e = err as NodeJS.ErrnoException;
+        if (writeError === null) writeError = e;
+      })
+      .finally(() => {
+        pendingWrites.delete(p);
+      });
     pendingWrites.add(p);
-    p.catch((err: unknown) => {
-      const e = err as NodeJS.ErrnoException;
-      if (writeError === null) writeError = e;
-    });
   }
 
   // Preserve the original symbol name so logs / stack traces still read
