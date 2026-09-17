@@ -45,7 +45,12 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { consumeWriteError, installPipeSafeConsole, restoreConsole } from './safe-console';
+import {
+  consumeWriteError,
+  flushPendingWrites,
+  installPipeSafeConsole,
+  restoreConsole,
+} from './safe-console';
 import { exitWithDrain } from './exit-with-drain';
 
 const CLI_ENTRY = join(import.meta.dir, '..', 'cli.ts');
@@ -599,5 +604,49 @@ describe('safe-console + exit-with-drain — EPIPE unit contract (R5)', () => {
         }
       });
     });
+  }, 30_000);
+
+  /**
+   * The invariant `consumeWriteError()` depends on: a failed write must be recorded and still
+   * observable once the drain reports the write finished. Removing the recorder entirely makes
+   * this test fail, which is what it guards.
+   *
+   * What it does NOT distinguish is where the recorder is attached. It passes with the recorder
+   * chained into the tracked promise and with it on a sibling `p.catch(...)`, because the
+   * recorder is registered at write time -- ahead of the drain's own reactions -- and the drain's
+   * awaits yield several microtasks besides. So the ordering window is not reachable from here,
+   * and this is not a reproduction of the real-pipe EPIPE flake above; that cause is still open.
+   *
+   * The microtask sweep is kept because it costs nothing and does not encode how many ticks any
+   * one runtime takes to settle a rejected chain.
+   */
+  it('records a failed write before the drain can observe it, at any microtask offset', async () => {
+    for (const ticks of [0, 1, 2, 3, 4, 5]) {
+      const originalWrite = process.stdout.write;
+      const failure: NodeJS.ErrnoException = Object.assign(new Error('forced write failure'), {
+        code: 'EPIPE',
+      });
+      (
+        process.stdout as unknown as {
+          write: (text: string, cb?: (error?: Error | null) => void) => boolean;
+        }
+      ).write = (_text, cb) => {
+        cb?.(failure);
+        return true;
+      };
+      installPipeSafeConsole();
+      try {
+        console.log('payload');
+        for (let i = 0; i < ticks; i++) await Promise.resolve();
+        await flushPendingWrites();
+        expect({ ticks, recorded: consumeWriteError() !== null }).toEqual({
+          ticks,
+          recorded: true,
+        });
+      } finally {
+        restoreConsole();
+        (process.stdout as unknown as { write: typeof process.stdout.write }).write = originalWrite;
+      }
+    }
   }, 30_000);
 });
