@@ -137,9 +137,15 @@ nodes:
       child.stderr.on('data', chunk => {
         stderr += String(chunk);
       });
+      // `close`, not `exit`: exit fires when the process ends, close only once its stdio
+      // streams have been closed and flushed. Resolving on exit let this return before the
+      // data handlers above had received anything, so a caller asserting on stdout/stderr
+      // could read "" from a process that had in fact printed. Standalone the flush usually
+      // landed first and it passed; under the parallel workspace run the gap widened and the
+      // successor-binding assertion read empty output roughly every time.
       const code = await new Promise<number | null>((accept, reject) => {
         child.once('error', reject);
-        child.once('exit', accept);
+        child.once('close', accept);
       });
       expect(stdout + stderr).not.toContain('"module":"provider.codex"');
       expect(stdout + stderr).not.toContain('"module":"provider.claude"');
@@ -293,5 +299,13 @@ nodes:
     expect(existsSync(join(project, 'after-successor.txt'))).toBe(true);
     expect(existsSync(join(project, 'internal-child.txt'))).toBe(true);
   },
-  30000
+  // Measured on an idle machine, this case needs 28.2-30.1s: it spawns the real CLI six times
+  // and each run drives a whole workflow, including bash effects. Against the previous 30000ms
+  // allowance that is zero margin, and it failed roughly one run in three even with nothing else
+  // running -- then essentially every run under `bun --filter '*' --parallel test`, where eight
+  // packages compete. The budget was the thing failing, not the behaviour under test: the
+  // workflow reports success and every assertion before the cutoff passes. Sized to match the
+  // heaviest sibling integration specs in this repository, which use 120-180s, so the allowance
+  // stops being the variable.
+  180_000
 );

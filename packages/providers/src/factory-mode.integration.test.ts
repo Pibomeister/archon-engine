@@ -120,9 +120,11 @@ console.log(JSON.stringify({constructed,fdClosed,capabilityInEnv:JSON.stringify(
       child.stderr!.on('data', chunk => {
         stderr += String(chunk);
       });
+      // `close`, not `exit`: the assertions below parse the last line of stdout, and exit fires
+      // before the stdio streams are flushed. On exit this could parse an empty string.
       const code = await new Promise<number | null>((accept, reject) => {
         child.once('error', reject);
-        child.once('exit', accept);
+        child.once('close', accept);
       });
       expect(code, stdout + stderr).toBe(0);
       expect(JSON.parse(stdout.trim().split('\n').at(-1)!)).toEqual({
