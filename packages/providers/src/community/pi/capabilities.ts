@@ -23,6 +23,7 @@ export const PI_CAPABILITIES: ProviderCapabilities = {
   hooks: false,
   skills: true,
   agents: false,
+  humanInputRequests: false,
   toolRestrictions: true,
   structuredOutput: 'best-effort', // prompt-augment + repair + validate + reask×3 (no SDK grammar)
   envInjection: true,

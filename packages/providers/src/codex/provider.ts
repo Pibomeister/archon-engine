@@ -30,6 +30,7 @@ import {
   normalizeJsonSchemaForOpenAiStrict,
 } from '../shared/structured-output';
 import { withResumedOutcome, resumedOutcome } from '../shared/resumed';
+import { factoryCodexConfigOverrides, factoryCodexScope } from '../factory-sandbox';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -461,8 +462,10 @@ async function* streamCodexEvents(
   hasOutputFormat: boolean,
   threadId: string | null | undefined,
   abortSignal?: AbortSignal,
-  surfaceMcpClientErrors = false
+  surfaceMcpClientErrors = false,
+  onTransportClosed?: () => void
 ): AsyncGenerator<MessageChunk> {
+  let pendingTerminal: Extract<MessageChunk, { type: 'result' }> | undefined;
   const state: CodexStreamState = {
     startedToolItemIds: new Set<string>(),
     completedToolItemIds: new Set<string>(),
@@ -568,13 +571,18 @@ async function* streamCodexEvents(
       const errorObj = (event as { error?: { message?: string } }).error;
       const errorMessage = errorObj?.message ?? 'Unknown error';
       getLog().error({ errorMessage }, 'turn_failed');
-      yield {
+      const result: Extract<MessageChunk, { type: 'result' }> = {
         type: 'result',
         sessionId: resolvedThreadId ?? undefined,
         isError: true,
         errorSubtype: 'codex_turn_failed',
         errors: [errorMessage],
       };
+      if (onTransportClosed) {
+        pendingTerminal = result;
+        continue;
+      }
+      yield result;
       return;
     }
 
@@ -806,14 +814,28 @@ async function* streamCodexEvents(
         }
       }
 
-      yield {
+      const result: Extract<MessageChunk, { type: 'result' }> = {
         type: 'result',
         sessionId: resolvedThreadId ?? undefined,
         tokens: usage,
         ...(structuredOutput !== undefined ? { structuredOutput } : {}),
       };
+      if (onTransportClosed) {
+        pendingTerminal = result;
+        continue;
+      }
+      yield result;
       return;
     }
+  }
+
+  if (pendingTerminal && onTransportClosed) {
+    // A terminal event arrives before the native child exits. Only natural
+    // SDK iterator exhaustion has awaited its exitPromise. Keep the terminal
+    // result private until then so an early-returning DAG consumer is safe.
+    onTransportClosed();
+    yield pendingTerminal;
+    return;
   }
 
   // Reaching here means the iterator closed without yielding turn.completed
@@ -889,9 +911,14 @@ export class CodexProvider implements IAgentProvider {
   private async createCodexClient(
     configCodexBinaryPath: string | undefined,
     requestEnv?: Record<string, string>,
-    codexConfigOverrides?: CodexConfigOverrides
+    codexConfigOverrides?: CodexConfigOverrides,
+    rawConfigOverrides?: string[]
   ): Promise<Codex> {
-    if ((!requestEnv || Object.keys(requestEnv).length === 0) && !codexConfigOverrides) {
+    if (
+      (!requestEnv || Object.keys(requestEnv).length === 0) &&
+      !codexConfigOverrides &&
+      (!rawConfigOverrides || rawConfigOverrides.length === 0)
+    ) {
       return getCodex(configCodexBinaryPath);
     }
 
@@ -902,6 +929,7 @@ export class CodexProvider implements IAgentProvider {
           ? { env: buildCodexEnv(requestEnv) }
           : {}),
         ...(codexConfigOverrides ? { config: codexConfigOverrides } : {}),
+        ...(rawConfigOverrides?.length ? { configOverrides: rawConfigOverrides } : {}),
       };
       return new Codex(codexOptions);
     } catch (error) {
@@ -948,9 +976,12 @@ export class CodexProvider implements IAgentProvider {
     }
 
     const suppressWorkflowSkillCatalog = isWorkflowNode(requestOptions);
-    const initialConfigOverrides = suppressWorkflowSkillCatalog
+    const workflowConfigOverrides = suppressWorkflowSkillCatalog
       ? withWorkflowSkillCatalogDisabled(declaredMcpConfigOverrides)
       : declaredMcpConfigOverrides;
+    const factoryConfigOverrides = requestOptions?.factoryScope
+      ? factoryCodexConfigOverrides(requestOptions.factoryScope, cwd)
+      : undefined;
 
     for (const warning of providerWarnings) {
       yield { type: 'system', content: `⚠️ ${warning.message}` };
@@ -960,7 +991,8 @@ export class CodexProvider implements IAgentProvider {
     let codex = await this.createCodexClient(
       codexConfig.codexBinaryPath,
       requestOptions?.env,
-      initialConfigOverrides
+      workflowConfigOverrides,
+      factoryConfigOverrides
     );
     const threadOptions = buildThreadOptions(
       cwd,
@@ -968,6 +1000,8 @@ export class CodexProvider implements IAgentProvider {
       assistantConfig,
       requestOptions?.nodeConfig
     );
+    if (requestOptions?.factoryScope)
+      Object.assign(threadOptions, factoryCodexScope(requestOptions.factoryScope, cwd));
 
     if (requestOptions?.abortSignal?.aborted) {
       throw new Error('Query aborted');
@@ -1073,7 +1107,8 @@ export class CodexProvider implements IAgentProvider {
                   hasOutputFormat,
                   thread.id,
                   attemptController.signal,
-                  Boolean(requestOptions?.nodeConfig?.mcp)
+                  Boolean(requestOptions?.nodeConfig?.mcp),
+                  requestOptions?.factoryTransportClosed
                 ),
                 // Stamp from the attempt that produced the result: any retry
                 // (attempt > 0) re-runs on a fresh startThread (cold), so the prior
@@ -1095,6 +1130,7 @@ export class CodexProvider implements IAgentProvider {
                 throw error;
               }
 
+              if (requestOptions?.factoryScope) throw error;
               skillCatalogCompatibilityFallbackUsed = true;
               getLog().warn(
                 { err, nodeId: requestOptions?.nodeConfig?.nodeId },
