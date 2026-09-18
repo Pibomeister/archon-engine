@@ -4,12 +4,15 @@
 
 ## Branches
 
-| Branch | Rule |
+This fork keeps **three** branches. Older factory tips are **tags** (`archive/*`), not branches.
+
+| Ref | Rule |
 |---|---|
 | `dev` | Always identical to `coleam00/Archon` `dev`. Never merge factory into it. |
-| `feat/community-grok-provider` | Vanilla community Grok only. PR to coleam00. |
-| `factory/dev` | This overlay: vanilla `dev` + community Grok (until coleam00 merges it) + factory hooks. Rebase onto `origin/dev` after every upstream catch-up. |
-| Historical `factory-grok-implementer`, `archon/task-*` | Archaeology. Do not use as default. |
+| `feat/community-grok-provider` | Vanilla community Grok only. PR to coleam00 (#3341). |
+| `factory/dev` | The factory overlay: vanilla `dev` + community Grok (until coleam00 merges it) + factory hooks. Rebase onto `origin/dev` after every upstream catch-up. |
+
+Archive tags (commits only, not working branches): `archive/factory-grok-implementer`, `archive/factory-pin-2026-09-17`, `archive/factory-series-83e906e0`, `archive/fix-codex-factory-permissions`.
 
 ## Hooks, not forks of the executor
 
